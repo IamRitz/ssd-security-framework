@@ -8,6 +8,11 @@
 # Note what is NOT here: no container-build, no image-security, no ECR. Those
 # controls are not skipped silently — the conformance job below declares
 # `artifact_type: library`, so they are reported N/A WITH A REASON.
+#
+# FIRST ONBOARDING: a brand-new repo has no Semgrep baseline, and the gate
+# requires one. Run the bootstrap once to produce it — see
+# docs/onboarding.md § "Bootstrap the first baseline". Until the baseline is
+# committed, keep `gate_mode: log-only`.
 name: Security checks
 
 on:
@@ -29,8 +34,12 @@ jobs:
     with:
       toolkit_ref: v1
       # START HERE on a new repo. Move to `enforce` only after you have generated
-      # a Semgrep baseline — see docs/onboarding.md § rollout.
+      # and committed a Semgrep baseline — see docs/onboarding.md § rollout.
       gate_mode: ${{ vars.GATE_MODE || 'log-only' }}
+      # ONE-TIME: set this repository variable to `true` for a single run to
+      # produce the first baseline, then unset it. It refuses to run unless
+      # gate_mode is log-only, and refuses outright if a baseline already exists.
+      bootstrap_baseline: ${{ vars.BOOTSTRAP_BASELINE == 'true' }}
       semgrep_configs: |
         p/owasp-top-ten
         p/javascript
