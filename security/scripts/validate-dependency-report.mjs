@@ -1,48 +1,128 @@
+// Validates that a dependency scanner actually produced an interpretable report.
+//
+// This runs BEFORE the gate, and its entire job is to distinguish three states
+// that look alike from the outside:
+//
+//   a real report with zero findings   -> clean, proceed
+//   a report the scanner never wrote   -> UNKNOWN, fail closed
+//   a report we cannot parse           -> UNKNOWN, fail closed
+//
+// The second case is the dangerous one. A scanner that exits early writes
+// nothing, the shell redirect still creates the file, and a naive reader sees an
+// empty file. Parsing that with a bare JSON.parse throws
+// `SyntaxError: Unexpected end of JSON input` — a stack trace that says nothing
+// about which scanner failed or why. Worse, any handling that treated empty as
+// "no vulnerabilities" would be a false clean: zero findings from a scan that
+// never happened is not the same as zero findings from a scan that did.
+//
+// So every failure below names the scanner, names the file, and says what the
+// state actually means.
 import { readFile } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
+import { resolve } from 'node:path';
 
-const [scanner, reportPath] = process.argv.slice(2);
-
-if (!scanner || !reportPath) {
-  throw new Error('usage: validate-dependency-report.mjs <scanner> <report.json>');
+function assert(condition, message) {
+  if (!condition) {
+    throw new Error(message);
+  }
 }
 
-const report = JSON.parse(await readFile(reportPath, 'utf8'));
-
-if (scanner === 'npm-audit') {
-  if (report.error) {
-    throw new Error(`npm audit failed: ${report.error.summary ?? 'unknown error'}`);
+async function readReport(scanner, reportPath) {
+  let raw;
+  try {
+    raw = await readFile(reportPath, 'utf8');
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      throw new Error(
+        `${scanner} report ${reportPath} does not exist. The scanner did not run, or it failed ` +
+          'before writing anything. A missing report is UNKNOWN, not zero findings.'
+      );
+    }
+    throw new Error(`${scanner} report ${reportPath} could not be read: ${error.message}`);
   }
 
-  if (!report.auditReportVersion || !report.metadata?.vulnerabilities) {
-    throw new Error('npm audit report does not have the expected schema');
+  if (raw.trim() === '') {
+    throw new Error(
+      `${scanner} report ${reportPath} is empty (${raw.length} bytes). The scanner exited ` +
+        'without writing a report, so the findings list is UNKNOWN, not clean. Check the ' +
+        "scanner step's own exit code and stderr in the job log — an empty report is never " +
+        'treated as a pass.'
+    );
   }
 
-  console.log(`npm-audit vulnerabilities=${report.metadata.vulnerabilities.total}`);
-} else if (scanner === 'pip-audit') {
-  if (!Array.isArray(report.dependencies)) {
-    throw new Error('pip-audit report does not have a dependencies array');
+  try {
+    return JSON.parse(raw);
+  } catch (error) {
+    throw new Error(
+      `${scanner} report ${reportPath} is not valid JSON: ${error.message}. ` +
+        `First 120 bytes: ${JSON.stringify(raw.slice(0, 120))}`
+    );
+  }
+}
+
+// Returns a short human-readable summary. Throws on anything that means the
+// report cannot be trusted; the caller's non-zero exit is the fail-closed signal.
+export async function validateDependencyReport(scanner, reportPath) {
+  assert(scanner && reportPath, 'usage: validate-dependency-report.mjs <scanner> <report.json>');
+
+  const report = await readReport(scanner, reportPath);
+
+  if (scanner === 'npm-audit') {
+    if (report.error) {
+      throw new Error(`npm audit failed: ${report.error.summary ?? 'unknown error'}`);
+    }
+    assert(
+      report.auditReportVersion && report.metadata?.vulnerabilities,
+      'npm audit report does not have the expected schema'
+    );
+    return `npm-audit vulnerabilities=${report.metadata.vulnerabilities.total}`;
   }
 
-  const vulnCount = report.dependencies
-    .flatMap((dependency) => dependency.vulns ?? [])
-    .filter((vulnerability) => typeof vulnerability.id === 'string').length;
-
-  console.log(`pip-audit vulnerabilities=${vulnCount}`);
-} else if (scanner === 'osv-scanner') {
-  if (!Array.isArray(report.results)) {
-    throw new Error('OSV-Scanner report does not have a results array');
+  if (scanner === 'pip-audit') {
+    assert(Array.isArray(report.dependencies), 'pip-audit report does not have a dependencies array');
+    const vulnerabilityCount = report.dependencies
+      .flatMap((dependency) => dependency.vulns ?? [])
+      .filter((vulnerability) => typeof vulnerability.id === 'string').length;
+    return `pip-audit vulnerabilities=${vulnerabilityCount}`;
   }
 
-  const advisoryIds = report.results
-    .flatMap((result) => result.packages ?? [])
-    .flatMap((dependency) => dependency.vulnerabilities ?? [])
-    .map((advisory) => advisory.id)
-    .filter(Boolean);
-  const maliciousAdvisories = advisoryIds.filter((id) => id.startsWith('MAL-'));
+  if (scanner === 'osv-scanner') {
+    // `{ "results": [] }` is the legitimate shape for a repository with no
+    // dependencies, and is what OSV-Scanner emits under --allow-no-lockfiles.
+    // It is accepted here precisely BECAUSE the scanner wrote it: the scanner
+    // is asserting "I looked and found nothing", which an empty file cannot.
+    assert(Array.isArray(report.results), 'OSV-Scanner report is missing its results array');
 
-  console.log(
-    `osv-scanner advisories=${advisoryIds.length} malicious=${maliciousAdvisories.length}`
-  );
-} else {
+    const advisoryIds = report.results
+      .flatMap((result) => result.packages ?? [])
+      .flatMap((dependency) => dependency.vulnerabilities ?? [])
+      .map((advisory) => advisory.id)
+      .filter(Boolean);
+    const maliciousAdvisories = advisoryIds.filter((id) => id.startsWith('MAL-'));
+
+    return (
+      `osv-scanner advisories=${advisoryIds.length} malicious=${maliciousAdvisories.length}` +
+      (report.results.length === 0 ? ' (no package sources — repository has no dependencies)' : '')
+    );
+  }
+
   throw new Error(`unsupported scanner: ${scanner}`);
+}
+
+async function main() {
+  const [scanner, reportPath] = process.argv.slice(2);
+  try {
+    console.log(await validateDependencyReport(scanner, reportPath));
+  } catch (error) {
+    // The message is the product here, not the stack. A developer reading a
+    // failed job needs to know which scanner produced nothing and why that
+    // blocks, not which line of this file threw.
+    console.error(`DEPENDENCY REPORT INVALID: ${error.message}`);
+    process.exitCode = 1;
+  }
+}
+
+const isMain = process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1]);
+if (isMain) {
+  await main();
 }

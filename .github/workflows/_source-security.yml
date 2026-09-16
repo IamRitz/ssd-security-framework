@@ -438,12 +438,29 @@ jobs:
         # Pipfile.lock, ...) rather than a single hard-coded file. Runs even when
         # neither npm nor Python is detected, so a Go/Rust/Java consumer repo is
         # still covered rather than silently unscanned.
+        #
+        # --allow-no-lockfiles is REQUIRED for portability, not a relaxation.
+        # Without it OSV-Scanner exits 128 ("No package sources found") and writes
+        # NOTHING to stdout, so the redirect below leaves a 0-byte file that no
+        # reader can parse. That fires in two entirely legitimate cases:
+        #   - a repository with no dependency manifests at all (a Go/static-site
+        #     consumer, which is exactly who this backstop exists for), and
+        #   - a lockfile that parses fine but declares zero dependencies.
+        # Verified against this pinned digest (v2.4.0): with the flag, both emit
+        # a valid `{"results": []}` and exit 0, while a lockfile holding a
+        # vulnerable package still exits 1 with the advisory present — the flag
+        # changes the empty case only, and suppresses no finding.
+        #
+        # `continue-on-error` is kept because exit 1 means "vulnerabilities
+        # found", which the GATE judges rather than the scanner. That does mask a
+        # genuine scanner crash, which is precisely why the validate step below
+        # is fail-closed on an empty or unparseable report.
         continue-on-error: true
         run: |
           docker run --rm \
             -v "$GITHUB_WORKSPACE:/repo:ro" \
             ghcr.io/google/osv-scanner@sha256:5116601dedc01c1c580eb92371883ec052fc4c13c3fbc109d621a63ac416d475 \
-            scan source --recursive /repo --format=json \
+            scan source --recursive --allow-no-lockfiles /repo --format=json \
             > reports/osv-scanner.json
 
       - name: Validate OSV-Scanner report
