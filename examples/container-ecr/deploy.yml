@@ -1,0 +1,286 @@
+# EXAMPLE CALLER — the DELIVERY phase for a container repo that lets the
+# framework push, scan, gate, and deploy.
+#
+# This is the canonical framework-gated delivery pipeline, and it exists to show
+# the trust boundaries explicitly. Each stage holds the least it can:
+#
+#   source-security     no cloud credentials (break-glass invoker only, after
+#                       eligibility is confirmed)
+#   container-build     no cloud credentials — untrusted build/install code runs
+#                       here, so it must never share a job with a cloud role
+#   image-security      no cloud credentials, scans a tarball, records the image
+#                       config digest Trivy actually scanned
+#   ecr-collect         THE ONLY job holding the registry push role. Asserts the
+#                       loaded image is the one that was scanned, pushes, and
+#                       records the immutable manifest digest
+#   artifact-gate       no cloud credentials at all — judges the report
+#   deploy              the SSM role ONLY, no ECR access, pulls by digest
+#
+# The digest chain, unbroken:
+#   build -> Trivy ImageID -> assert loaded image == scanned image -> push
+#         -> immutable manifest digest -> registry scan BY THAT DIGEST
+#         -> artifact gate re-asserts the digest -> deploy repo@sha256:...
+#
+# No mutable tag is ever the trust anchor.
+#
+# TRIGGER OWNERSHIP: this file owns `push` to main and `workflow_dispatch`;
+# security.yml owns `pull_request` and `schedule`.
+name: Deploy
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source-security:
+    # Re-run on the delivery commit rather than trusting the PR result: what
+    # merged may not be what was reviewed.
+    uses: IamRitz/ssd-security-framework/.github/workflows/_source-security.yml@v1
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+    with:
+      toolkit_ref: v1
+      gate_mode: ${{ vars.GATE_MODE || 'enforce' }}
+      semgrep_configs: |
+        p/owasp-top-ten
+        p/javascript
+      semgrep_paths: src
+      slack_notify_url: ${{ vars.SECURITY_NOTIFY_SLACK_URL }}
+      break_glass_enabled: true
+      break_glass_transport: lambda
+      break_glass_lambda_role_arn: ${{ vars.BREAK_GLASS_LAMBDA_ROLE_ARN }}
+      break_glass_lambda_function: ${{ vars.BREAK_GLASS_LAMBDA_FUNCTION }}
+      break_glass_aws_region: ${{ vars.AWS_REGION }}
+
+  container-build:
+    # ZERO cloud credentials. This is where `npm ci` / `pip install` run other
+    # people's code; it must not be able to reach AWS.
+    name: Container build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - name: Build the image that will actually ship
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          load: true
+          # no-cache on the release build: a poisoned Actions cache entry must
+          # never be baked into the image that ships.
+          no-cache: true
+          tags: your-app:${{ github.sha }}
+      - name: Export image tarball
+        run: docker save -o application-image.tar "your-app:$GITHUB_SHA"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: application-image-${{ github.sha }}
+          path: application-image.tar
+          if-no-files-found: error
+          retention-days: 1
+
+  image-security:
+    # Pre-push gate. A BLOCK_DEPLOY here fails this job, so every job below —
+    # all of which `needs` it transitively — is skipped and nothing is pushed.
+    needs: container-build
+    uses: IamRitz/ssd-security-framework/.github/workflows/_image-scan-prepush.yml@v1
+    permissions:
+      contents: read
+      pull-requests: write
+    with:
+      toolkit_ref: v1
+      image_artifact: application-image-${{ github.sha }}
+      gate_mode: ${{ vars.GATE_MODE || 'enforce' }}
+      slack_notify_url: ${{ vars.SECURITY_NOTIFY_SLACK_URL }}
+
+  aws-configuration:
+    name: AWS configuration
+    # Detection only, no credentials. Lets a repo adopt the source controls
+    # before its AWS delivery exists: the AWS stages visibly skip instead of
+    # failing confusingly.
+    needs:
+      - source-security
+      - image-security
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      needs.source-security.result == 'success' &&
+      needs.image-security.result == 'success'
+    runs-on: ubuntu-latest
+    outputs:
+      configured: ${{ steps.detect.outputs.configured }}
+    steps:
+      - name: Detect AWS delivery configuration
+        id: detect
+        env:
+          AWS_PUSH_SCAN_ROLE_ARN: ${{ vars.AWS_PUSH_SCAN_ROLE_ARN }}
+          AWS_DEPLOY_ROLE_ARN: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+          EC2_INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+        run: |
+          missing=()
+          for name in AWS_PUSH_SCAN_ROLE_ARN AWS_DEPLOY_ROLE_ARN AWS_REGION ECR_REPOSITORY EC2_INSTANCE_ID; do
+            if [ -z "${!name:-}" ]; then
+              missing+=("$name")
+            fi
+          done
+          if [ "${#missing[@]}" -eq 0 ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::AWS not configured — delivery skipped. Missing: ${missing[*]}"
+          fi
+
+  ecr-collect:
+    # THE FIRST job to hold a registry credential, and the only one that does.
+    # It asserts the loaded image is byte-identical to what Trivy scanned before
+    # pushing, then records the immutable manifest digest everything downstream
+    # pins to. It makes NO policy decision.
+    needs:
+      - source-security
+      - container-build
+      - image-security
+      - aws-configuration
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      needs.source-security.result == 'success' &&
+      needs.image-security.result == 'success' &&
+      needs.aws-configuration.outputs.configured == 'true'
+    uses: IamRitz/ssd-security-framework/.github/workflows/_ecr-collect.yml@v1
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      toolkit_ref: v1
+      image_artifact: application-image-${{ github.sha }}
+      local_image_ref: your-app:${{ github.sha }}
+      # Digest chain: the image config digest Trivy actually scanned. A mismatch
+      # means a different image slipped in between scan and push — fail closed.
+      expected_image_id: ${{ needs.image-security.outputs.image_id }}
+      role_arn: ${{ vars.AWS_PUSH_SCAN_ROLE_ARN }}
+      aws_region: ${{ vars.AWS_REGION }}
+      ecr_repository: ${{ vars.ECR_REPOSITORY }}
+      immutable_tag: ${{ github.sha }}
+
+  artifact-gate:
+    # Holds NO cloud credentials and names no registry. A Critical/High finding,
+    # a digest mismatch, or a missing/malformed report fails this job, which
+    # skips `deploy` entirely — it never starts.
+    needs: ecr-collect
+    uses: IamRitz/ssd-security-framework/.github/workflows/_artifact-gate.yml@v1
+    permissions:
+      contents: read
+    with:
+      toolkit_ref: v1
+      report_artifact: ${{ needs.ecr-collect.outputs.report_artifact }}
+      report_path: ${{ needs.ecr-collect.outputs.report_path }}
+      # Re-assert the exact manifest digest that was pushed and scanned.
+      expected_digest: ${{ needs.ecr-collect.outputs.image_digest }}
+      gate_mode: ${{ vars.GATE_MODE || 'enforce' }}
+      slack_notify_url: ${{ vars.SECURITY_NOTIFY_SLACK_URL }}
+
+  deploy:
+    name: Deploy
+    # Runs ONLY when artifact-gate succeeded. Because this job `needs` it, a
+    # failed gate skips this job — a stronger guarantee than an in-job early exit.
+    #
+    # Holds the SSM deploy role and nothing else: no ECR access at all. The
+    # instance pulls the image with its OWN read-only ECR role, so the runner's
+    # push credentials never reach the box, and no inbound port is required.
+    needs:
+      - artifact-gate
+      - ecr-collect
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out the consumer repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check out the framework toolkit for the deploy script
+        # The deploy target is repo-specific, so the deploy job stays in the
+        # consumer's own workflow — but `ssm-deploy.mjs` is a framework script,
+        # and a consumer holds no framework files. Checking it out here keeps
+        # that true. No scanner runs in this job, so unlike the scanning
+        # workflows it does not need relocating out of the workspace.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: IamRitz/ssd-security-framework
+          ref: v1
+          path: .ssd-toolkit
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24.21.0'
+          package-manager-cache: false
+
+      - name: Assume the SSM deploy role (SSM only)
+        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: ssd-deploy
+
+      - name: Deploy the approved digest over SSM
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          ECR_REGISTRY: ${{ needs.ecr-collect.outputs.registry }}
+          ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+          EC2_INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+          EC2_APP_PORT: ${{ vars.EC2_APP_PORT || '3000' }}
+          # The last link: pull the exact manifest that was scanned and gated,
+          # by digest. Never a mutable tag.
+          IMAGE_DIGEST: ${{ needs.ecr-collect.outputs.image_digest }}
+        run: |
+          node .ssd-toolkit/security/scripts/ssm-deploy.mjs \
+            --instance-id "$EC2_INSTANCE_ID" \
+            --region "$AWS_REGION" \
+            --registry "$ECR_REGISTRY" \
+            --repository "$ECR_REPOSITORY" \
+            --image-digest "$IMAGE_DIGEST" \
+            --app-port "$EC2_APP_PORT"
+
+  conformance:
+    # The DELIVERY phase report. This is the run that proves the registry,
+    # artifact-gate and deploy controls — and it supplies real job results as
+    # evidence rather than a hard-coded "pass".
+    needs:
+      - source-security
+      - image-security
+      - ecr-collect
+      - artifact-gate
+      - deploy
+    if: ${{ always() && github.ref == 'refs/heads/main' }}
+    uses: IamRitz/ssd-security-framework/.github/workflows/_conformance.yml@v1
+    with:
+      toolkit_ref: v1
+      phase: delivery
+      artifact_type: container
+      registry: ecr
+      deploy_target: framework-gated
+      break_glass_enabled: true
+      observed: >-
+        {"secret-scan":{"status":"${{ needs.source-security.result }}","evidence":"source-security job"},
+         "dependency-scan":{"status":"${{ needs.source-security.result }}","evidence":"source-security job"},
+         "sast":{"status":"${{ needs.source-security.result }}","evidence":"source-security job"},
+         "source-gate":{"status":"${{ needs.source-security.result }}","evidence":"source-security job"},
+         "image-scan-prepush":{"status":"${{ needs.image-security.result }}","evidence":"pre-push Trivy gate"},
+         "break-glass":{"status":"pass","evidence":"lambda transport configured for this repo"},
+         "registry-scan-collect":{"status":"${{ needs.ecr-collect.result }}","evidence":"ECR push + scan polled by digest"},
+         "artifact-gate":{"status":"${{ needs.artifact-gate.result }}","evidence":"normalized report gated at the pushed digest"},
+         "gated-deploy":{"status":"${{ needs.deploy.result }}","evidence":"SSM deploy pinned to the gated digest"}}

@@ -14,7 +14,8 @@ import {
   CONTROLS,
   buildConformance,
   renderMarkdown,
-  resolveCapabilities
+  resolveCapabilities,
+  resolvePhase
 } from '../security/scripts/conformance.mjs';
 
 const CONTAINER_REPO = {
@@ -266,7 +267,166 @@ describe('applicable controls must produce evidence', () => {
   });
 });
 
-describe('the rendered report keeps the four outcomes visually distinct', () => {
+describe('lifecycle: a control that did not run in this phase never reports pass', () => {
+  // The bug this prevents: a PR conformance report claiming
+  // `gated-deploy: pass, evidence: "runs on push to main"`. That control did not
+  // execute in that workflow, so the claim is fabricated — but it is also not
+  // N/A, because the repository genuinely requires it.
+  const DELIVERY_CONTROLS = ['registry-scan-collect', 'artifact-gate', 'gated-deploy'];
+
+  // Everything a PR run can actually prove for a container repo.
+  const SOURCE_OBSERVED = {
+    'secret-scan': { status: 'pass' },
+    'dependency-scan': { status: 'pass' },
+    sast: { status: 'pass' },
+    'source-gate': { status: 'pass' },
+    'image-scan-prepush': { status: 'pass' }
+  };
+  // Where break-glass is ENABLED it is an ordinary PR-phase control and needs
+  // evidence like any other — omitting it is a `failed`, not a free pass.
+  const prObserved = { ...SOURCE_OBSERVED, 'break-glass': { status: 'pass' } };
+
+  it('defers delivery controls on a PR instead of passing or N/A-ing them', () => {
+    const report = buildConformance({
+      capabilities: resolveCapabilities(CONTAINER_REPO),
+      observed: prObserved,
+      breakGlassEnabled: true,
+      phase: 'pr'
+    });
+
+    for (const id of DELIVERY_CONTROLS) {
+      const control = statusOf(report, id);
+      assert.equal(control.status, 'deferred', `${id} must be deferred on a PR`);
+      // Still required of this repository — that is the difference from N/A.
+      assert.equal(control.appliesToRepository, true);
+      assert.match(control.reason, /delivery phase/);
+    }
+    assert.equal(report.summary.failed, 0, 'a deferred control is not a failure');
+    assert.equal(report.summary.deferred, DELIVERY_CONTROLS.length);
+  });
+
+  it('answers "what does this repo require" independently of this run', () => {
+    const report = buildConformance({
+      capabilities: resolveCapabilities(CONTAINER_REPO),
+      observed: prObserved,
+      breakGlassEnabled: true,
+      phase: 'pr'
+    });
+
+    // 9 controls, all applicable to a full framework-gated container repo.
+    assert.equal(report.summary.requiredByRepository, CONTROLS.length);
+    assert.equal(
+      report.summary.applied + report.summary.deferred,
+      CONTROLS.length,
+      'every required control is either proven here or proven in the delivery run'
+    );
+  });
+
+  it('requires real evidence for delivery controls in the delivery phase', () => {
+    const report = buildConformance({
+      capabilities: resolveCapabilities(CONTAINER_REPO),
+      observed: prObserved, // no delivery evidence supplied
+      breakGlassEnabled: true,
+      phase: 'delivery'
+    });
+
+    for (const id of DELIVERY_CONTROLS) {
+      const control = statusOf(report, id);
+      assert.equal(control.status, 'failed', `${id} must fail without delivery evidence`);
+      assert.match(control.reason, /reported no result/);
+    }
+    assert.equal(report.summary.failed, DELIVERY_CONTROLS.length);
+  });
+
+  it('marks delivery controls applied when the delivery run proves them', () => {
+    const report = buildConformance({
+      capabilities: resolveCapabilities(CONTAINER_REPO),
+      observed: {
+        ...prObserved,
+        'registry-scan-collect': { status: 'success', evidence: 'ecr-collect job' },
+        'artifact-gate': { status: 'success', evidence: 'artifact-gate job' },
+        'gated-deploy': { status: 'success', evidence: 'deploy job, digest-pinned' }
+      },
+      breakGlassEnabled: true,
+      phase: 'delivery'
+    });
+
+    assert.equal(report.summary.failed, 0);
+    assert.equal(report.summary.deferred, 0);
+    assert.equal(report.summary.applied, CONTROLS.length);
+    assert.equal(statusOf(report, 'gated-deploy').evidence, 'deploy job, digest-pinned');
+  });
+
+  it('warns when a caller claims a result for a control this phase does not run', () => {
+    // Exactly the old container-ecr example: "gated-deploy: pass, runs on push to main".
+    const report = buildConformance({
+      capabilities: resolveCapabilities(CONTAINER_REPO),
+      observed: {
+        ...prObserved,
+        'gated-deploy': { status: 'pass', evidence: 'runs on push to main' }
+      },
+      breakGlassEnabled: true,
+      phase: 'pr'
+    });
+
+    assert.equal(statusOf(report, 'gated-deploy').status, 'deferred', 'the claim is not honoured');
+    assert.ok(
+      report.warnings.some((warning) => /gated-deploy/.test(warning) && /did not execute/.test(warning)),
+      'a fabricated result must be surfaced as a warning'
+    );
+  });
+
+  it('a self-managed container repo defers nothing it does not own', () => {
+    const report = buildConformance({
+      capabilities: resolveCapabilities({
+        artifact_type: 'container',
+        registry: 'none',
+        deploy_target: 'self-managed'
+      }),
+      // break-glass is disabled here, so it is N/A and deliberately gets no
+      // evidence — claiming a result for an N/A control would be a warning.
+      observed: SOURCE_OBSERVED,
+      phase: 'pr'
+    });
+
+    // Registry/deploy are N/A (not this repo's), so nothing is deferred to a
+    // delivery run this framework never performs.
+    for (const id of DELIVERY_CONTROLS) {
+      assert.equal(statusOf(report, id).status, 'not-applicable', `${id} must be N/A`);
+    }
+    assert.equal(report.summary.deferred, 0);
+    assert.equal(report.summary.failed, 0);
+    // The pre-push image scan still applies and still ran.
+    assert.equal(statusOf(report, 'image-scan-prepush').status, 'applied');
+  });
+
+  it('a source-only repo requires only source controls', () => {
+    const report = buildConformance({
+      capabilities: resolveCapabilities({ artifact_type: 'library' }),
+      observed: {
+        'secret-scan': { status: 'pass' },
+        'dependency-scan': { status: 'pass' },
+        sast: { status: 'pass' },
+        'source-gate': { status: 'pass' }
+      },
+      phase: 'pr'
+    });
+
+    assert.equal(report.summary.failed, 0);
+    assert.equal(report.summary.deferred, 0);
+    assert.equal(report.summary.requiredByRepository, 4);
+    assert.equal(report.summary.applied, 4);
+  });
+
+  it('rejects an unrecognized phase rather than defaulting to pr', () => {
+    // Defaulting would defer every delivery control and report a green run.
+    assert.throws(() => resolvePhase('deploy'), /phase 'deploy' is not one of/);
+    assert.equal(resolvePhase(''), 'pr');
+    assert.equal(resolvePhase('delivery'), 'delivery');
+  });
+});
+
+describe('the rendered report keeps the outcomes visually distinct', () => {
   it('renders N/A and exempt differently, and shows the exemption owner', () => {
     const future = '2999-01-01';
     const markdown = renderMarkdown(

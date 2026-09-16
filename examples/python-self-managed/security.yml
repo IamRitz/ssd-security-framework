@@ -141,13 +141,16 @@ jobs:
     uses: IamRitz/ssd-security-framework/.github/workflows/_conformance.yml@v1
     with:
       toolkit_ref: v1
+      # Every control this repository requires runs in this phase: the registry
+      # and deploy controls are N/A (not this framework's), not deferred.
+      phase: pr
       artifact_type: container
       registry: none
       deploy_target: self-managed
       break_glass_enabled: false
       observed: >-
-        {"secret-scan":{"status":"${{ needs.source-security.result }}"},
-         "dependency-scan":{"status":"${{ needs.source-security.result }}"},
-         "sast":{"status":"${{ needs.source-security.result }}"},
-         "source-gate":{"status":"${{ needs.source-security.result }}"},
-         "image-scan-prepush":{"status":"${{ needs.image-security.result }}"}}
+        {"secret-scan":{"status":"${{ needs.source-security.result }}","evidence":"source-security job"},
+         "dependency-scan":{"status":"${{ needs.source-security.result }}","evidence":"source-security job"},
+         "sast":{"status":"${{ needs.source-security.result }}","evidence":"source-security job"},
+         "source-gate":{"status":"${{ needs.source-security.result }}","evidence":"security-gate check"},
+         "image-scan-prepush":{"status":"${{ needs.image-security.result }}","evidence":"security-gate check"}}

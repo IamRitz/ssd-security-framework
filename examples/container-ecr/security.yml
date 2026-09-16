@@ -1,5 +1,9 @@
-# EXAMPLE CALLER — a repo that ships a container image to ECR and lets the
-# framework gate its deploy.
+# EXAMPLE CALLER — PR phase for a repo that ships a container image to ECR and
+# lets the framework gate its deploy.
+#
+# This file proves the PR-phase controls: source security and the PRE-PUSH image
+# scan. The registry scan, the artifact gate and the deploy are proven by
+# deploy.yml, on the delivery run. Neither file claims the other's controls.
 #
 # Copy this to .github/workflows/security.yml in the consumer repo and change:
 #   - the image name in `container-build`
@@ -174,17 +178,15 @@ jobs:
     uses: IamRitz/ssd-security-framework/.github/workflows/_conformance.yml@v1
     with:
       toolkit_ref: v1
+      phase: pr
       artifact_type: container
       registry: ecr
       deploy_target: framework-gated
       break_glass_enabled: true
       observed: >-
-        {"secret-scan":{"status":"${{ needs.source-security.result }}"},
-         "dependency-scan":{"status":"${{ needs.source-security.result }}"},
-         "sast":{"status":"${{ needs.source-security.result }}"},
-         "source-gate":{"status":"${{ needs.source-security.result }}"},
-         "image-scan-prepush":{"status":"${{ needs.image-security.result }}"},
-         "break-glass":{"status":"pass","evidence":"configured"},
-         "registry-scan-collect":{"status":"pass","evidence":"runs on push to main"},
-         "artifact-gate":{"status":"pass","evidence":"runs on push to main"},
-         "gated-deploy":{"status":"pass","evidence":"runs on push to main"}}
+        {"secret-scan":{"status":"${{ needs.source-security.result }}","evidence":"source-security job"},
+         "dependency-scan":{"status":"${{ needs.source-security.result }}","evidence":"source-security job"},
+         "sast":{"status":"${{ needs.source-security.result }}","evidence":"source-security job"},
+         "source-gate":{"status":"${{ needs.source-security.result }}","evidence":"security-gate check"},
+         "image-scan-prepush":{"status":"${{ needs.image-security.result }}","evidence":"security-gate check"},
+         "break-glass":{"status":"pass","evidence":"lambda transport configured for this repo"}}

@@ -42,6 +42,13 @@ jobs:
       - name: Prove a consumer needs zero framework files
         run: ./tools/verify-consumer-isolation.sh
 
+      - name: Prove every consumer profile onboards, including from no baseline
+        # Walks a brand-new library repo from NO Semgrep baseline through
+        # bootstrap, generation, and a normal gate run — the deadlock that
+        # blocked the first real consumer — plus the PR/delivery lifecycle split
+        # for the container profiles.
+        run: ./tools/verify-onboarding-profiles.sh
+
       - name: The toolkit must stay dependency-free
         # Every script imports only Node builtins. That is what lets the toolkit
         # be dropped into any consumer's runner with nothing installed, and it is
