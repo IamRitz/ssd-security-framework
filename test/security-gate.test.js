@@ -49,6 +49,26 @@ describe('security gate', () => {
     assert.deepEqual(exceptions.exceptions, []);
   });
 
+  it('treats an OSV report with results:null as a clean scan, not a malformed one', async () => {
+    // Captured verbatim from OSV-Scanner 2.4.0 under --allow-no-lockfiles: Go
+    // marshals an empty slice as `null`, so a successful scan of a repository
+    // with no package sources emits `{"results": null, ...}` and exits 0.
+    //
+    // Asserting Array.isArray on that turned the scanner's own "I found
+    // nothing" into a report-integrity BLOCK, which broke every
+    // dependency-free consumer — the exact portability case the
+    // cross-ecosystem backstop exists to serve.
+    const { result } = await evaluate({
+      osv: join(FIXTURES, 'osv-no-sources/osv-scanner.json')
+    });
+
+    assert.equal(result.verdict, 'PASS');
+    assert.deepEqual(result.summary, { block: 0, exception: 0, log: 0 });
+    // Clean because the scanner SAID so, and trusted for the same reason. An
+    // absent report, or an empty file, must never reach this state.
+    assert.equal(result.integrity.trusted, true);
+  });
+
   it('blocks a verified secret', async () => {
     const { result } = await evaluate({
       trufflehog: join(FIXTURES, 'verified-secret/trufflehog.json')

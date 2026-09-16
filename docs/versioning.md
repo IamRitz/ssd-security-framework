@@ -28,6 +28,41 @@ Contracts are treated as a published API: **add inputs with defaults, never
 rename or repurpose an existing one.** An input whose meaning changes under a
 consumer is a silent breakage, which is worse than a loud one.
 
+## Machine-readable schemas are contracts too
+
+Workflow inputs and outputs are the obvious contract, but they are not the only
+one. Anything this framework **documents** as machine-readable — the normalized
+registry report a collector emits, the gate result, the conformance report, the
+Semgrep baseline file — is consumed by something, and is therefore subject to
+the same rules:
+
+| Change | Compatibility |
+| --- | --- |
+| Adding an **optional** field | **compatible** — a reader that ignores it is unaffected |
+| Adding a new **enum value** to an existing field | **breaking** for any reader that exhaustively switches on it; treat as breaking unless the field is documented as open |
+| Removing or renaming a field | **breaking** |
+| Changing the **meaning**, type, or units of an existing field | **breaking**, and the worst kind — it fails silently |
+| Tightening validation so previously accepted input is rejected | **breaking** for producers |
+
+"Nobody reads that field" is an assumption, not a fact. If a field is documented,
+assume it is parsed.
+
+**Report schemas carry their own `schemaVersion`, independent of the framework
+tag.** A report is data that outlives the run that produced it: it gets stored,
+diffed, and read by tooling that was not necessarily built against the same
+framework release. So:
+
+- A reader must check `schemaVersion` before interpreting a report, and refuse a
+  major it does not understand rather than guessing at the fields it recognises.
+- Bumping a report's `schemaVersion` is **not** automatically a framework major.
+  The framework's version tracks its *workflow* contract; a report schema tracks
+  its own shape. They move independently and on purpose.
+- Conversely, a framework major does **not** implicitly bump a report schema.
+
+The producing side must fail closed on a schema it does not recognise. This is
+already how `image-gate.mjs` treats the normalized registry report: an unknown
+`source` is a report-integrity `BLOCK_DEPLOY`, never a best-effort parse.
+
 ## The `toolkit_ref` duplication, and why it exists
 
 A consumer pins the version in **two** places:

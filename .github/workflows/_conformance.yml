@@ -34,6 +34,14 @@ on:
         description: Whether an approval channel is configured for this repository.
         type: boolean
         default: false
+      phase:
+        description: >-
+          Execution phase of THIS run: `pr` (pull request / scheduled sweep) or `delivery`
+          (push to the release branch). Controls that apply to the repository but do not run
+          in this phase are reported `deferred` — required, proven by another run — never
+          `pass`. An unrecognized value fails closed rather than defaulting.
+        type: string
+        default: pr
       observed:
         description: >-
           JSON object mapping control id to {"status": "...", "evidence": "..."}. Callers
@@ -74,6 +82,11 @@ on:
       not_applicable:
         description: Number of controls the declared capabilities exclude.
         value: ${{ jobs.conformance.outputs.not_applicable }}
+      deferred:
+        description: >-
+          Number of controls this repository REQUIRES but which do not run in this phase —
+          proven by the other run, never counted as coverage here.
+        value: ${{ jobs.conformance.outputs.deferred }}
       exempt:
         description: Number of controls carrying a live exemption. This is debt, not coverage.
         value: ${{ jobs.conformance.outputs.exempt }}
@@ -94,6 +107,7 @@ jobs:
       failed: ${{ steps.report.outputs.failed }}
       not_applicable: ${{ steps.report.outputs.not_applicable }}
       exempt: ${{ steps.report.outputs.exempt }}
+      deferred: ${{ steps.report.outputs.deferred }}
     steps:
       - name: Check out the consumer repository
         # Only for the consumer-owned exemptions file.
@@ -153,6 +167,7 @@ jobs:
           REGISTRY: ${{ inputs.registry }}
           DEPLOY_TARGET: ${{ inputs.deploy_target }}
           BREAK_GLASS_ENABLED: ${{ inputs.break_glass_enabled }}
+          PHASE: ${{ inputs.phase }}
         run: |
           mkdir -p reports
           set +e
@@ -161,6 +176,7 @@ jobs:
             --registry "$REGISTRY" \
             --deploy-target "$DEPLOY_TARGET" \
             --break-glass "$BREAK_GLASS_ENABLED" \
+            --phase "$PHASE" \
             --exemptions "$EXEMPTIONS_PATH" \
             --observed "$OBSERVED" \
             --repository "$GITHUB_REPOSITORY" \
@@ -171,10 +187,12 @@ jobs:
           failed="$(node -e 'try{process.stdout.write(String(require("./reports/conformance.json").summary.failed))}catch{process.stdout.write("1")}')"
           na="$(node -e 'try{process.stdout.write(String(require("./reports/conformance.json").summary.notApplicable))}catch{process.stdout.write("0")}')"
           exempt="$(node -e 'try{process.stdout.write(String(require("./reports/conformance.json").summary.exempt))}catch{process.stdout.write("0")}')"
+          deferred="$(node -e 'try{process.stdout.write(String(require("./reports/conformance.json").summary.deferred))}catch{process.stdout.write("0")}')"
           {
             echo "failed=$failed"
             echo "not_applicable=$na"
             echo "exempt=$exempt"
+            echo "deferred=$deferred"
           } >> "$GITHUB_OUTPUT"
           exit "$status"
 

@@ -163,10 +163,15 @@ jobs:
       - name: Evaluate artifact policy (fail-closed)
         id: evaluate
         continue-on-error: true
+        env:
+          # Crosses into the shell as an environment variable rather than being
+          # interpolated into the command line, so a crafted input cannot be
+          # spliced into the script before bash ever parses it.
+          REPORT_PATH: ${{ inputs.report_path }}
         run: >-
           node "$SSD_TOOLKIT/scripts/image-gate.mjs"
           --policy "$SSD_POLICY"
-          --report "${{ inputs.report_path }}"
+          --report "$REPORT_PATH"
           --output reports/image-gate.json
 
       - name: Publish artifact gate verdict

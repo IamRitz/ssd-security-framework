@@ -1,4 +1,4 @@
-// Capability-aware conformance reporting.
+// Capability-aware, LIFECYCLE-AWARE conformance reporting.
 //
 // Consumer repositories differ in what they SHIP, not just in how they are
 // configured. A library has no container to scan; a repo with its own delivery
@@ -6,20 +6,36 @@
 // makes a conformance report useless, because it cannot be distinguished from a
 // control that was switched off.
 //
-// So every control resolves to exactly one of:
+// They also differ in WHEN a control runs. A pull request cannot execute a
+// registry scan or a deploy — those happen on the delivery run. Reporting them
+// as `pass` on a PR is a fabricated result; reporting them as N/A is a lie of a
+// different kind, because they ARE required of that repository.
 //
-//   applied         the control ran, and its observed result is recorded
+// So the model answers two separate questions:
+//
+//   1. What security controls does this repository require?
+//      -> every control whose `appliesToRepository` is true.
+//   2. Which required controls actually executed successfully in THIS run?
+//      -> every control whose status is `applied`.
+//
+// Every control resolves to exactly one of:
+//
+//   applied         the control ran in this phase, and its result is recorded
+//   deferred        applies to the repo, but is not expected in THIS phase.
+//                   Required by the delivery lifecycle, proven by another run.
 //   not-applicable  the repo's declared capabilities mean the control has no
 //                   subject. A STABLE FACT about what this repo is. Carries a
 //                   reason naming the capability that made it so.
 //   exempt          the control applies and is deliberately not being enforced.
 //                   DEBT: carries an owner and an expiry, and expires closed.
-//   failed          the control applies, is not exempt, and did not pass.
+//   failed          the control applies, is expected now, is not exempt, and did
+//                   not pass — including "produced no evidence at all".
 //
-// `not-applicable` and `exempt` are deliberately different words for deliberately
-// different things. A library will never grow an image to scan; a repo that
-// exempted its image gate is carrying risk someone agreed to revisit. A report
-// that renders both as "skipped" tells a reviewer nothing.
+// `not-applicable`, `deferred` and `exempt` are deliberately different words for
+// deliberately different things. A library will never grow an image to scan; a
+// PR simply has not reached the deploy yet; an exempted image gate is risk
+// somebody agreed to revisit. A report that renders them all as "skipped" tells
+// a reviewer nothing.
 import { readFile, mkdir, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -45,36 +61,58 @@ export const CAPABILITY_DEFAULTS = {
   deploy_target: 'none'
 };
 
-// Controls the framework can perform, and the capability predicate that decides
-// whether each has a subject in this repository.
+// Execution phases. A phase is WHEN a run happens in the delivery lifecycle, not
+// what the repository is.
+//
+//   pr        a pull request / scheduled sweep: source controls and the
+//             pre-push image scan. Nothing is published and nothing is deployed.
+//   delivery  a push to the release branch: everything in `pr`, plus registry
+//             collection, the artifact gate, and the gated deploy.
+export const PHASES = ['pr', 'delivery'];
+export const DEFAULT_PHASE = 'pr';
+
+const SOURCE_PHASES = ['pr', 'delivery'];
+const DELIVERY_ONLY = ['delivery'];
+
+// Controls the framework can perform.
 //
 // `appliesWhen` returns either true, or a STRING REASON explaining which
 // declared capability removed the control's subject. The reason is the whole
 // point: "N/A" with no reason is indistinguishable from an unexplained skip.
+//
+// `phases` lists the execution phases in which the control is EXPECTED to run.
+// Outside those phases it is `deferred`, never `pass`.
 export const CONTROLS = [
   {
     id: 'secret-scan',
     name: 'Secret scanning (Gitleaks + TruffleHog)',
+    phases: SOURCE_PHASES,
     appliesWhen: () => true
   },
   {
     id: 'dependency-scan',
     name: 'Dependency scanning (npm audit / pip-audit / OSV-Scanner)',
+    phases: SOURCE_PHASES,
     appliesWhen: () => true
   },
   {
     id: 'sast',
     name: 'SAST (Semgrep)',
+    phases: SOURCE_PHASES,
     appliesWhen: () => true
   },
   {
     id: 'source-gate',
     name: 'Source security gate',
+    phases: SOURCE_PHASES,
     appliesWhen: () => true
   },
   {
     id: 'image-scan-prepush',
     name: 'Pre-push image scan (Trivy) and image gate',
+    // Runs on the PR too: the whole point is catching an image problem BEFORE
+    // the image is pushed anywhere.
+    phases: SOURCE_PHASES,
     appliesWhen: ({ artifact_type: artifactType }) =>
       artifactType === 'container' ||
       `artifact_type=${artifactType}: this repository ships no container image, so there is no image to scan before push.`
@@ -82,6 +120,7 @@ export const CONTROLS = [
   {
     id: 'registry-scan-collect',
     name: 'Registry scan collection (push, poll by digest, normalize)',
+    phases: DELIVERY_ONLY,
     appliesWhen: ({ artifact_type: artifactType, registry }) => {
       if (artifactType !== 'container') {
         return `artifact_type=${artifactType}: this repository ships no container image, so nothing is pushed to a registry.`;
@@ -95,6 +134,7 @@ export const CONTROLS = [
   {
     id: 'artifact-gate',
     name: 'Artifact gate over the normalized registry report',
+    phases: DELIVERY_ONLY,
     appliesWhen: ({ artifact_type: artifactType, registry }) => {
       if (artifactType !== 'container') {
         return `artifact_type=${artifactType}: there is no registry artifact to gate.`;
@@ -108,6 +148,7 @@ export const CONTROLS = [
   {
     id: 'gated-deploy',
     name: 'Deploy gated on the artifact verdict',
+    phases: DELIVERY_ONLY,
     appliesWhen: ({ deploy_target: deployTarget }) => {
       if (deployTarget === 'self-managed') {
         return 'deploy_target=self-managed: this repository deploys through its own pipeline, which this framework does not gate.';
@@ -121,6 +162,7 @@ export const CONTROLS = [
   {
     id: 'break-glass',
     name: 'Break-glass approval for an eligible BLOCK',
+    phases: SOURCE_PHASES,
     appliesWhen: (_capabilities, { breakGlassEnabled }) =>
       breakGlassEnabled === true ||
       'break_glass_enabled=false: this repository has no approval channel configured, so an eligible BLOCK simply stays blocked.'
@@ -179,6 +221,16 @@ export function resolveCapabilities(declared = {}) {
   return capabilities;
 }
 
+// An unknown phase fails closed rather than defaulting: silently treating a
+// typo as `pr` would defer every delivery control and report a green run.
+export function resolvePhase(value) {
+  if (value === undefined || value === null || value === '') {
+    return DEFAULT_PHASE;
+  }
+  assert(PHASES.includes(value), `phase '${value}' is not one of ${PHASES.join(' | ')}`);
+  return value;
+}
+
 // An exemption is debt with an owner and a deadline. A missing field makes it
 // unusable ON PURPOSE: an exemption nobody owns, or one that never expires, is
 // how a temporary decision becomes permanent silently.
@@ -218,7 +270,7 @@ export async function loadExemptions(path) {
   try {
     parsed = JSON.parse(raw);
   } catch (error) {
-    throw new Error(`exemptions file ${path} is not valid JSON: ${error.message}`);
+    throw new Error(`exemptions file ${path} is not valid JSON: ${error.message}`, { cause: error });
   }
   const entries = Array.isArray(parsed) ? parsed : parsed?.exemptions;
   assert(
@@ -231,13 +283,14 @@ export async function loadExemptions(path) {
 // Builds the conformance report.
 //
 // `observed` maps control id -> { status: 'pass'|'fail'|..., evidence: string }.
-// A control that applies but was never observed is `failed`, not `applied`:
-// absence of evidence is not evidence the control ran.
+// A control that applies AND is expected in this phase but was never observed is
+// `failed`: absence of evidence is not evidence the control ran.
 export function buildConformance({
   capabilities,
   observed = {},
   exemptions = [],
   breakGlassEnabled = false,
+  phase = DEFAULT_PHASE,
   now = Date.now(),
   repository = null
 }) {
@@ -247,6 +300,11 @@ export function buildConformance({
   for (const control of CONTROLS) {
     const applicability = control.appliesWhen(capabilities, { breakGlassEnabled });
     const result = observed[control.id];
+    const base = {
+      id: control.id,
+      name: control.name,
+      phases: control.phases
+    };
 
     if (applicability !== true) {
       // A control the capabilities say cannot exist, yet which produced a
@@ -259,10 +317,32 @@ export function buildConformance({
         );
       }
       controls.push({
-        id: control.id,
-        name: control.name,
+        ...base,
+        appliesToRepository: false,
         status: 'not-applicable',
         reason: applicability
+      });
+      continue;
+    }
+
+    // From here the control IS required of this repository. The only question
+    // left is whether this particular run was supposed to execute it.
+    if (!control.phases.includes(phase)) {
+      // A PR claiming a deploy control passed is a fabricated result, and the
+      // most likely way for one to appear is a caller hard-coding "pass".
+      if (result) {
+        warnings.push(
+          `control '${control.id}' does not run in the '${phase}' phase but reported a result ` +
+            `('${result.status}'); a control that did not execute cannot have passed.`
+        );
+      }
+      controls.push({
+        ...base,
+        appliesToRepository: true,
+        status: 'deferred',
+        reason:
+          `required by this repository, but runs in the ${control.phases.join('/')} phase; ` +
+          `this run is the '${phase}' phase`
       });
       continue;
     }
@@ -277,8 +357,8 @@ export function buildConformance({
         );
       } else {
         controls.push({
-          id: control.id,
-          name: control.name,
+          ...base,
+          appliesToRepository: true,
           status: 'exempt',
           reason: exemption.reason,
           owner: exemption.owner,
@@ -290,10 +370,10 @@ export function buildConformance({
 
     if (!result) {
       controls.push({
-        id: control.id,
-        name: control.name,
+        ...base,
+        appliesToRepository: true,
         status: 'failed',
-        reason: 'the control applies to this repository but reported no result'
+        reason: `the control applies and runs in the '${phase}' phase but reported no result`
       });
       continue;
     }
@@ -302,8 +382,8 @@ export function buildConformance({
       String(result.status).toLowerCase()
     );
     controls.push({
-      id: control.id,
-      name: control.name,
+      ...base,
+      appliesToRepository: true,
       status: passed ? 'applied' : 'failed',
       reason: passed ? undefined : `observed result '${result.status}'`,
       evidence: result.evidence ?? undefined
@@ -313,18 +393,23 @@ export function buildConformance({
   const count = (status) => controls.filter((control) => control.status === status).length;
 
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     generatedAt: new Date(now).toISOString(),
     repository: repository ?? undefined,
+    phase,
     capabilities,
     breakGlassEnabled,
     controls,
     warnings,
     summary: {
+      // "Which required controls executed successfully in THIS run?"
       applied: count('applied'),
+      deferred: count('deferred'),
       notApplicable: count('not-applicable'),
       exempt: count('exempt'),
-      failed: count('failed')
+      failed: count('failed'),
+      // "What does this repository require, regardless of phase?"
+      requiredByRepository: controls.filter((control) => control.appliesToRepository).length
     }
   };
 }
@@ -332,6 +417,7 @@ export function buildConformance({
 export function renderMarkdown(report) {
   const symbol = {
     applied: '✅ applied',
+    deferred: '⏳ deferred',
     'not-applicable': '➖ N/A',
     exempt: '⚠️ exempt',
     failed: '❌ failed'
@@ -339,9 +425,15 @@ export function renderMarkdown(report) {
   const lines = [
     '## Conformance',
     '',
+    `Phase: \`${report.phase}\``,
+    '',
     `Declared: \`artifact_type=${report.capabilities.artifact_type}\` ` +
       `\`registry=${report.capabilities.registry}\` ` +
       `\`deploy_target=${report.capabilities.deploy_target}\``,
+    '',
+    `This repository requires **${report.summary.requiredByRepository}** controls; ` +
+      `**${report.summary.applied}** executed successfully in this run, ` +
+      `**${report.summary.deferred}** run in another phase.`,
     '',
     '| Control | Status | Why |',
     '| --- | --- | --- |'
@@ -369,6 +461,7 @@ function parseArguments(argv) {
     exemptions: null,
     output: 'reports/conformance.json',
     breakGlassEnabled: false,
+    phase: DEFAULT_PHASE,
     repository: null
   };
 
@@ -388,6 +481,9 @@ function parseArguments(argv) {
         break;
       case '--break-glass':
         options.breakGlassEnabled = value === 'true';
+        break;
+      case '--phase':
+        options.phase = value;
         break;
       case '--exemptions':
         options.exemptions = value;
@@ -412,6 +508,7 @@ function parseArguments(argv) {
 async function main() {
   const options = parseArguments(process.argv.slice(2));
   const capabilities = resolveCapabilities(options.capabilities);
+  const phase = resolvePhase(options.phase);
   const exemptions = await loadExemptions(options.exemptions);
 
   const report = buildConformance({
@@ -419,6 +516,7 @@ async function main() {
     observed: options.observed,
     exemptions,
     breakGlassEnabled: options.breakGlassEnabled,
+    phase,
     repository: options.repository
   });
 
@@ -428,8 +526,8 @@ async function main() {
 
   console.log(renderMarkdown(report));
 
-  // A failed control fails this script. N/A and a live exemption do not — that
-  // is the entire distinction this report exists to make.
+  // A failed control fails this script. N/A, deferred, and a live exemption do
+  // not — that is the entire set of distinctions this report exists to make.
   if (report.summary.failed > 0) {
     console.error(`\n${report.summary.failed} applicable control(s) did not pass.`);
     process.exitCode = 1;

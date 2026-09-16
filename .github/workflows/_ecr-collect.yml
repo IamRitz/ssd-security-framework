@@ -154,7 +154,12 @@ jobs:
           name: ${{ inputs.image_artifact }}
 
       - name: Load application image
-        run: docker load -i "${{ inputs.image_tarball }}"
+        env:
+          # Via env rather than interpolated into the command line: the same
+          # discipline every other step here follows, so no caller-supplied
+          # value is ever spliced into a script before bash parses it.
+          IMAGE_TARBALL: ${{ inputs.image_tarball }}
+        run: docker load -i "$IMAGE_TARBALL"
 
       - name: Assume the ECR push+scan role
         uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4

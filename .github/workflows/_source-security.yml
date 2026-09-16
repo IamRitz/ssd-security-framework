@@ -119,10 +119,38 @@ on:
         description: How long to wait for a verified break-glass decision.
         type: string
         default: ''
+      bootstrap_baseline:
+        description: >-
+          ONBOARDING ONLY. Evaluate SAST against an EMPTY accepted set because this repository
+          has no committed Semgrep baseline yet, then generate a candidate baseline from this
+          run and upload it. Requires `gate_mode: log-only`, and REFUSES to run if a baseline
+          already exists — a repo whose baseline disappeared must restore it, not re-accept its
+          findings. See docs/onboarding.md § bootstrap.
+        type: boolean
+        default: false
       synthetic_block_fixture:
-        description: 'Demo only: `sast` or `dependency` injects a synthetic ELIGIBLE BLOCK fixture. Requires both break-glass URLs to be passed explicitly.'
+        description: >-
+          Demo only: `sast` or `dependency` injects a synthetic ELIGIBLE BLOCK fixture. Requires
+          an ISOLATED break-glass configuration — dev URLs for `http`, or the
+          synthetic_break_glass_* inputs for `lambda`. It can never fall through to production.
         type: string
         default: none
+      synthetic_break_glass_lambda_function:
+        description: >-
+          Test broker Lambda used ONLY when synthetic_block_fixture is set and the transport is
+          `lambda`. Must differ from break_glass_lambda_function.
+        type: string
+        default: ''
+      synthetic_break_glass_lambda_role_arn:
+        description: >-
+          Test invoker role assumed ONLY for a synthetic Lambda run. Must differ from
+          break_glass_lambda_role_arn, so a synthetic BLOCK cannot assume the production role.
+        type: string
+        default: ''
+      synthetic_break_glass_aws_region:
+        description: AWS region of the test broker. Defaults to break_glass_aws_region when empty.
+        type: string
+        default: ''
     secrets:
       break_glass_shared_secret:
         description: HMAC shared secret for the break-glass request/decision channel. Not a cloud credential; required only when break_glass_enabled is true.
@@ -730,14 +758,69 @@ jobs:
           name: sast-reports
           path: reports
 
-      - name: Require explicit dev endpoints for a synthetic demo run
-        # A synthetic BLOCK must never fall back to the production endpoints.
-        # If synthetic_block_fixture is set, both URLs must be provided explicitly.
-        if: ${{ inputs.synthetic_block_fixture != 'none' && (inputs.break_glass_notify_url == '' || inputs.break_glass_status_url == '') }}
+      - name: Require an isolated break-glass configuration for a synthetic run
+        # A synthetic BLOCK is a FABRICATED finding. It must never reach the real
+        # approval channel, where it would page real approvers and record a real
+        # decision against a finding that does not exist.
+        #
+        # This runs BEFORE the gate evaluates, and therefore before any OIDC role
+        # assumption and before any Lambda invocation — the isolation is proven
+        # by ordering, not by hoping the later steps behave.
+        #
+        # Isolation is required per transport, and is never inferred from a name:
+        # a function called "break-glass-test" is not evidence of anything. The
+        # test identifiers must be supplied explicitly AND must differ from the
+        # production ones, so "just reuse the prod ARN" cannot happen silently.
+        if: ${{ inputs.synthetic_block_fixture != 'none' }}
+        env:
+          TRANSPORT: ${{ inputs.break_glass_transport }}
+          NOTIFY_URL: ${{ inputs.break_glass_notify_url }}
+          STATUS_URL: ${{ inputs.break_glass_status_url }}
+          SYNTH_FUNCTION: ${{ inputs.synthetic_break_glass_lambda_function }}
+          SYNTH_ROLE: ${{ inputs.synthetic_break_glass_lambda_role_arn }}
+          SYNTH_REGION: ${{ inputs.synthetic_break_glass_aws_region }}
+          PROD_FUNCTION: ${{ inputs.break_glass_lambda_function }}
+          PROD_ROLE: ${{ inputs.break_glass_lambda_role_arn }}
+          PROD_REGION: ${{ inputs.break_glass_aws_region }}
         run: |
-          echo "A synthetic_block_fixture run must set BOTH break_glass_notify_url and break_glass_status_url." >&2
-          echo "Refusing to fall back to the production BREAK_GLASS_* endpoints for a synthetic BLOCK." >&2
-          exit 1
+          set -euo pipefail
+          case "$TRANSPORT" in
+            http)
+              if [ -z "$NOTIFY_URL" ] || [ -z "$STATUS_URL" ]; then
+                echo "A synthetic run on the http transport must set BOTH break_glass_notify_url and break_glass_status_url." >&2
+                echo "Refusing to fall back to the production BREAK_GLASS_* endpoints for a synthetic BLOCK." >&2
+                exit 1
+              fi
+              ;;
+            lambda)
+              if [ -z "$SYNTH_FUNCTION" ] || [ -z "$SYNTH_ROLE" ]; then
+                echo "A synthetic run on the lambda transport must set BOTH" >&2
+                echo "  synthetic_break_glass_lambda_function" >&2
+                echo "  synthetic_break_glass_lambda_role_arn" >&2
+                echo "Refusing to invoke the production break-glass broker with a fabricated finding." >&2
+                exit 1
+              fi
+              if [ -n "$PROD_FUNCTION" ] && [ "$SYNTH_FUNCTION" = "$PROD_FUNCTION" ]; then
+                echo "synthetic_break_glass_lambda_function is the production function ($PROD_FUNCTION)." >&2
+                echo "Synthetic isolation means a SEPARATE broker, not the same one renamed." >&2
+                exit 1
+              fi
+              if [ -n "$PROD_ROLE" ] && [ "$SYNTH_ROLE" = "$PROD_ROLE" ]; then
+                echo "synthetic_break_glass_lambda_role_arn is the production role ($PROD_ROLE)." >&2
+                echo "A synthetic BLOCK must not be able to assume the production invoker role." >&2
+                exit 1
+              fi
+              if [ -z "${SYNTH_REGION:-}" ] && [ -z "${PROD_REGION:-}" ]; then
+                echo "A synthetic lambda run needs a region: set synthetic_break_glass_aws_region." >&2
+                exit 1
+              fi
+              ;;
+            *)
+              echo "Unsupported break-glass transport for a synthetic run: $TRANSPORT" >&2
+              exit 1
+              ;;
+          esac
+          echo "Synthetic break-glass configuration is isolated from production."
 
       - name: Apply synthetic eligible BLOCK for a manual demo
         # The fixtures travel with the TOOLKIT, so a consumer repo needs no
@@ -761,13 +844,39 @@ jobs:
           esac
           echo "Applied synthetic $DEMO_TYPE BLOCK input; no live vulnerable fixture was activated"
 
+      - name: Refuse baseline bootstrap outside onboarding
+        # Bootstrap evaluates SAST against an EMPTY accepted set, so every
+        # pre-existing finding reports as unbaselined. In `enforce` that would
+        # block the build on the very backlog the baseline exists to accept —
+        # and, worse, invite someone to "fix" it by weakening the gate.
+        # Bootstrap is an onboarding operation and is confined to onboarding mode.
+        if: ${{ inputs.bootstrap_baseline && inputs.gate_mode != 'log-only' }}
+        env:
+          GATE_MODE: ${{ inputs.gate_mode }}
+        run: |
+          echo "bootstrap_baseline requires gate_mode: log-only (got '$GATE_MODE')." >&2
+          echo "Bootstrap is a first-onboarding operation: it evaluates against an empty" >&2
+          echo "accepted set, which is only meaningful while the gate is not enforcing." >&2
+          exit 1
+
       - name: Evaluate security policy
         id: evaluate
         continue-on-error: true
-        run: >-
-          node "$SSD_TOOLKIT/scripts/security-gate.mjs"
-          --policy "$SSD_POLICY"
-          --baseline "${{ inputs.semgrep_baseline_path }}"
+        env:
+          # Values cross into the shell as environment variables rather than being
+          # interpolated into the command line, so a crafted input cannot become shell.
+          BASELINE_PATH: ${{ inputs.semgrep_baseline_path }}
+          BOOTSTRAP: ${{ inputs.bootstrap_baseline }}
+        run: |
+          set -euo pipefail
+          args=(--policy "$SSD_POLICY" --baseline "$BASELINE_PATH")
+          if [ "$BOOTSTRAP" = "true" ]; then
+            # An empty accepted set, on purpose and on the record. The gate
+            # refuses this if a baseline already exists.
+            args+=(--bootstrap)
+            echo "::notice::Baseline bootstrap: evaluating SAST against an empty accepted set."
+          fi
+          node "$SSD_TOOLKIT/scripts/security-gate.mjs" "${args[@]}"
 
       - name: Publish gate verdict
         id: verdict
@@ -782,32 +891,98 @@ jobs:
           echo "integrity_trusted=$trusted" >> "$GITHUB_OUTPUT"
           echo "SECURITY GATE: $verdict (break-glass eligible: $eligible, scan trusted: $trusted)"
 
+      - name: Generate the first Semgrep baseline (bootstrap only)
+        # The bootstrap deadlock resolved: a brand-new repo could not produce a
+        # baseline because the gate needed one to report a trusted run.
+        #
+        # This still refuses an untrusted run. `integrity_trusted` is false when a
+        # scanner could not interpret its input — including a malformed Semgrep
+        # report, one carrying scan errors, or a missing one — so a bootstrap
+        # cannot accept findings from a scan that never really happened. The
+        # generator re-checks the same flag itself; this condition only avoids
+        # running it pointlessly.
+        if: ${{ inputs.bootstrap_baseline && steps.verdict.outputs.integrity_trusted == 'true' }}
+        env:
+          SEMGREP_CONFIGS: ${{ inputs.semgrep_configs }}
+          BASELINE_PATH: ${{ inputs.semgrep_baseline_path }}
+        run: |
+          set -euo pipefail
+          # Recorded in the baseline so a later scan with different rules cannot
+          # silently compare against a baseline that never saw them.
+          rulesets="$(printf '%s' "$SEMGREP_CONFIGS" | tr '\n' ' ' | xargs)"
+          node "$SSD_TOOLKIT/scripts/generate-semgrep-baseline.mjs" \
+            --report reports/semgrep.json \
+            --gate reports/security-gate.json \
+            --rulesets "$rulesets" \
+            --output reports/semgrep-baseline.candidate.json
+          {
+            echo "## Semgrep baseline candidate generated"
+            echo
+            echo "Download the \`security-gate-results\` artifact, then commit the candidate as:"
+            echo
+            echo '```'
+            echo "$BASELINE_PATH"
+            echo '```'
+            echo
+            echo "Review it first — it is the set of findings this repository formally accepts."
+            echo "Then remove \`bootstrap_baseline\` from the caller and move to \`enforce\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail a bootstrap run whose scans could not be trusted
+        # Loud rather than silent. In log-only nothing else fails, so without this
+        # a bootstrap that produced no baseline would look like a successful run.
+        if: ${{ inputs.bootstrap_baseline && steps.verdict.outputs.integrity_trusted != 'true' }}
+        run: |
+          echo "Baseline bootstrap FAILED: this run's scans could not be trusted." >&2
+          echo "A baseline generated from an uninterpretable scan would permanently accept" >&2
+          echo "findings that were never actually computed. Fix the scanner failure above" >&2
+          echo "and re-run the bootstrap." >&2
+          exit 1
+
       - name: Confirm the BLOCK is eligible before loading any approval credential
         if: ${{ steps.evaluate.outcome == 'failure' && inputs.gate_mode != 'log-only' && inputs.break_glass_enabled }}
         run: node "$SSD_TOOLKIT/scripts/break-glass-notify.mjs" --check-only
 
-      - name: Validate break-glass transport configuration
+      - name: Validate break-glass transport and resolve the effective broker
+        # Runs only AFTER eligibility is confirmed by the step above, and resolves
+        # which broker this run may talk to. A synthetic run resolves to the
+        # isolated test broker; everything else resolves to production. The
+        # synthetic identifiers were already proven present and distinct before
+        # the gate ran, so there is no path where `synthetic` silently falls back.
         if: ${{ steps.evaluate.outcome == 'failure' && inputs.gate_mode != 'log-only' && inputs.break_glass_enabled }}
         env:
           BREAK_GLASS_TRANSPORT: ${{ inputs.break_glass_transport }}
-          BREAK_GLASS_FUNCTION_NAME: ${{ inputs.break_glass_lambda_function }}
-          BREAK_GLASS_AWS_REGION: ${{ inputs.break_glass_aws_region }}
-          BREAK_GLASS_ROLE_ARN: ${{ inputs.break_glass_lambda_role_arn }}
+          SYNTHETIC: ${{ inputs.synthetic_block_fixture }}
+          PROD_FUNCTION: ${{ inputs.break_glass_lambda_function }}
+          PROD_REGION: ${{ inputs.break_glass_aws_region }}
+          PROD_ROLE: ${{ inputs.break_glass_lambda_role_arn }}
+          SYNTH_FUNCTION: ${{ inputs.synthetic_break_glass_lambda_function }}
+          SYNTH_REGION: ${{ inputs.synthetic_break_glass_aws_region }}
+          SYNTH_ROLE: ${{ inputs.synthetic_break_glass_lambda_role_arn }}
         run: |
+          set -euo pipefail
+          if [ "$SYNTHETIC" != "none" ]; then
+            FUNCTION="$SYNTH_FUNCTION"
+            ROLE="$SYNTH_ROLE"
+            REGION="${SYNTH_REGION:-$PROD_REGION}"
+            echo "::warning::Synthetic break-glass run — using the ISOLATED test broker."
+          else
+            FUNCTION="$PROD_FUNCTION"
+            ROLE="$PROD_ROLE"
+            REGION="$PROD_REGION"
+          fi
+
           case "$BREAK_GLASS_TRANSPORT" in
             lambda)
-              test -n "$BREAK_GLASS_FUNCTION_NAME" || {
-                echo "Lambda transport requires a function name" >&2
+              test -n "$FUNCTION" || { echo "Lambda transport requires a function name" >&2; exit 1; }
+              test -n "$REGION" || { echo "Lambda transport requires an AWS region" >&2; exit 1; }
+              test -n "$ROLE" || { echo "Lambda transport requires an IAM role ARN" >&2; exit 1; }
+              # Belt and braces: the synthetic guard already proved these differ,
+              # but this is the step that hands the ARN to the OIDC action.
+              if [ "$SYNTHETIC" != "none" ] && [ -n "$PROD_ROLE" ] && [ "$ROLE" = "$PROD_ROLE" ]; then
+                echo "Refusing to assume the production invoker role for a synthetic BLOCK." >&2
                 exit 1
-              }
-              test -n "$BREAK_GLASS_AWS_REGION" || {
-                echo "Lambda transport requires an AWS region" >&2
-                exit 1
-              }
-              test -n "$BREAK_GLASS_ROLE_ARN" || {
-                echo "Lambda transport requires an IAM role ARN" >&2
-                exit 1
-              }
+              fi
               ;;
             http)
               ;;
@@ -817,20 +992,28 @@ jobs:
               ;;
           esac
 
+          {
+            echo "SSD_BG_FUNCTION=$FUNCTION"
+            echo "SSD_BG_REGION=$REGION"
+            echo "SSD_BG_ROLE=$ROLE"
+          } >> "$GITHUB_ENV"
+
       - name: Assume the break-glass invoker role (OIDC)
         if: ${{ steps.evaluate.outcome == 'failure' && inputs.gate_mode != 'log-only' && inputs.break_glass_enabled && inputs.break_glass_transport == 'lambda' }}
         uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
         with:
-          role-to-assume: ${{ inputs.break_glass_lambda_role_arn }}
-          aws-region: ${{ inputs.break_glass_aws_region }}
+          # The EFFECTIVE role resolved above — the isolated test role on a
+          # synthetic run, the production role otherwise. Never the raw input.
+          role-to-assume: ${{ env.SSD_BG_ROLE }}
+          aws-region: ${{ env.SSD_BG_REGION }}
           role-session-name: break-glass-gate
 
       - name: Request break-glass decision
         if: ${{ steps.evaluate.outcome == 'failure' && inputs.gate_mode != 'log-only' && inputs.break_glass_enabled }}
         env:
           BREAK_GLASS_TRANSPORT: ${{ inputs.break_glass_transport }}
-          BREAK_GLASS_FUNCTION_NAME: ${{ inputs.break_glass_lambda_function }}
-          AWS_REGION: ${{ inputs.break_glass_aws_region }}
+          BREAK_GLASS_FUNCTION_NAME: ${{ env.SSD_BG_FUNCTION }}
+          AWS_REGION: ${{ env.SSD_BG_REGION }}
 
           BREAK_GLASS_NOTIFY_URL: ${{ inputs.break_glass_notify_url }}
           BREAK_GLASS_SHARED_SECRET: ${{ secrets.break_glass_shared_secret }}
@@ -848,8 +1031,8 @@ jobs:
         if: ${{ steps.evaluate.outcome == 'failure' && inputs.gate_mode != 'log-only' && inputs.break_glass_enabled }}
         env:
           BREAK_GLASS_TRANSPORT: ${{ inputs.break_glass_transport }}
-          BREAK_GLASS_FUNCTION_NAME: ${{ inputs.break_glass_lambda_function }}
-          AWS_REGION: ${{ inputs.break_glass_aws_region }}
+          BREAK_GLASS_FUNCTION_NAME: ${{ env.SSD_BG_FUNCTION }}
+          AWS_REGION: ${{ env.SSD_BG_REGION }}
 
           BREAK_GLASS_STATUS_URL: ${{ inputs.break_glass_status_url }}
           BREAK_GLASS_SHARED_SECRET: ${{ secrets.break_glass_shared_secret }}
@@ -905,6 +1088,7 @@ jobs:
             reports/gate-exceptions.json
             reports/break-glass-request.json
             reports/break-glass-decision.json
+            reports/semgrep-baseline.candidate.json
             reports/DO-NOT-BASELINE.txt
           if-no-files-found: error
           retention-days: 14

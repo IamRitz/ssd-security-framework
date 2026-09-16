@@ -39,46 +39,114 @@ conformance report says so in words rather than leaving a hole.
 
 ## Part 1 — The repository **[REPO]**
 
-### 1.1 Generate the Semgrep baseline FIRST
+### 1.1 Bootstrap the first Semgrep baseline
 
-Do this before you enable anything. A repo that has never had SAST has a
-backlog. If you turn on a blocking gate cold, the first PR fails on hundreds of
-pre-existing findings its author did not write, and the team's correct
-conclusion is that the tool is broken.
+**Start here on a brand-new repository.** Everything else in Part 1 assumes this
+is done.
 
-The baseline records the current state as *known*, so the gate blocks only what
-a change **introduces**.
+A repo that has never had SAST has a backlog. Turn on a blocking gate cold and
+the first PR fails on hundreds of pre-existing findings its author did not write
+— and the team's correct conclusion is that the tool is broken. The baseline
+records the current state as *known*, so the gate blocks only what a change
+**introduces**.
 
-```sh
-semgrep scan \
-  --config p/owasp-top-ten \
-  --config p/javascript \
-  --json-output=semgrep.json \
-  src
+#### Why a new repo needs an explicit bootstrap
+
+You cannot simply "generate one first", because the two halves deadlock:
+
+```
+no baseline -> the source gate reports a report-integrity BLOCK
+            -> integrity.trusted = false
+            -> generate-semgrep-baseline.mjs refuses (correctly)
+            -> no baseline can ever be produced
 ```
 
-Then generate the baseline through the framework's own generator, not by hand:
+The generator's refusal is not a bug to work around. A scan whose input could
+not be interpreted reports zero findings because it understood nothing, and
+baselining that writes "no findings" into permanently accepted state.
+
+`bootstrap_baseline` breaks the deadlock without relaxing that: it makes a
+**missing** baseline an expected condition for one explicitly-requested run,
+while every scanner-integrity check stays exactly as strict.
+
+#### Run it once
+
+1. Add the caller workflow (§1.2) with `gate_mode: log-only`.
+2. Set the repository variable **`BOOTSTRAP_BASELINE=true`**
+   (the source-only example already wires this to the `bootstrap_baseline`
+   input; add the same line to any other caller).
+3. Run the workflow — open a PR, or dispatch it.
+4. Download the **`security-gate-results`** artifact from that run.
+5. **Review `semgrep-baseline.candidate.json`.** This is the set of findings the
+   repository is about to formally accept. Read it; do not rubber-stamp it.
+6. Commit it as `security/baseline/semgrep-baseline.json`
+   (or whatever `semgrep_baseline_path` says).
+7. **Unset `BOOTSTRAP_BASELINE`.** Leaving it set is caught anyway — see below —
+   but the variable should not linger.
+
+From here the gate runs normally: your accepted findings log, and anything new
+blocks. Proceed to §1.5 and the rollout in Part 4.
+
+#### What bootstrap does NOT relax
+
+Exactly one thing changes: a **missing** baseline stops being an integrity
+failure, and SAST findings are evaluated against an empty accepted set and
+reported with `baselineState: "unbaselined"` — reported, not waved through.
+
+Everything that makes a scan trustworthy still applies:
+
+| Still enforced during bootstrap | Consequence if it fails |
+| --- | --- |
+| The Semgrep report must parse | integrity BLOCK; no baseline generated |
+| It must match the expected schema | integrity BLOCK; no baseline generated |
+| It must carry **zero scan errors** | integrity BLOCK — a scan that did not finish looking is not a clean scan |
+| The report must exist at all | integrity BLOCK |
+| Every other scanner is evaluated normally | a malformed OSV or npm report still makes the whole run untrusted |
+| The run must end `integrity.trusted: true` | the generator refuses, and the job **fails loudly** rather than silently producing nothing |
+
+That last row matters in `log-only`, where nothing else fails: a bootstrap run
+that could not produce a baseline is an explicit job failure, not a green run
+with a missing artifact.
+
+#### Bootstrap refuses to run twice
+
+If a baseline **already exists** at `semgrep_baseline_path`, bootstrap fails:
+
+```
+bootstrap refused: a Semgrep baseline already exists at <path>. Baseline
+bootstrap is for first onboarding only.
+```
+
+This is deliberate, and it is the reason bootstrap is an explicit input rather
+than an automatic fallback. Two situations look identical on disk:
+
+- **A.** a first onboarding, where no baseline exists yet, and
+- **B.** an onboarded repository whose baseline was deleted or lost.
+
+Auto-detecting "baseline missing ⇒ bootstrap" would make **B** silently
+re-accept every finding the missing baseline used to gate. So **B keeps failing
+closed**, and the only way to get bootstrap behaviour is to ask for it, in a way
+that is visible in the workflow run and in the gate result
+(`bootstrap: { active: true, reason: … }`).
+
+If you genuinely need to rebuild a baseline, delete the old one in a reviewed
+pull request — where a CODEOWNER can see it (§1.4) — and then bootstrap.
+
+#### Generating locally instead
+
+The CI route above is the supported one, because it uses the same scanners and
+the same integrity checks the gate uses. If you must do it by hand, the
+generator takes the gate result as evidence and will refuse without it:
 
 ```sh
 node <toolkit>/security/scripts/generate-semgrep-baseline.mjs \
-  --report semgrep.json \
+  --report reports/semgrep.json \
   --gate reports/security-gate.json \
   --rulesets "p/owasp-top-ten p/javascript" \
   --output security/baseline/semgrep-baseline.json
 ```
 
-Commit `security/baseline/semgrep-baseline.json`.
-
-> **The generator refuses to run from an untrusted scan.** It hard-fails unless
-> every supplied gate result reports `integrity.trusted: true`. A scan whose
-> input could not be interpreted reports zero findings, and baselining that
-> writes "no findings" into permanently accepted state. This is why you generate
-> the baseline from a real `log-only` CI run rather than from a partial local
-> scan — and why a run that produced `reports/DO-NOT-BASELINE.txt` must not be
-> used.
-
-The easier route is to run the pipeline in `log-only` first (§1.5), download the
-`security-gate-results` artifact, and generate from that.
+A run that produced `reports/DO-NOT-BASELINE.txt` must never be used.
 
 `--baseline-commit` (which controls what Semgrep *scans*) is a different thing
 from this baseline file (which controls what the gate *blocks*). Keep both.
@@ -112,12 +180,32 @@ Nothing else is copied. No scripts, no policy — see
 Add the `conformance` job from your example and set the three values from the
 table at the top of this document.
 
-Controls that do not apply are reported **N/A with a reason**. This is not the
-same as skipping them, and deliberately not the same as exempting them:
+You also declare the **phase** each caller runs in: `pr` for pull requests and
+the scheduled sweep, `delivery` for the push-to-main run that publishes and
+deploys. The conformance report then answers two separate questions:
 
+1. *What security controls does this repository require?* — every control marked
+   `appliesToRepository`.
+2. *Which required controls actually executed successfully in this run?* — every
+   control with status `applied`.
+
+Each control resolves to exactly one of five outcomes, and the distinctions are
+the entire point:
+
+- **applied** — ran in this phase, with a real result recorded.
+- **deferred** — required by this repository, but does not run in *this* phase.
+  A pull request cannot execute a deploy, so the deploy control is `deferred`
+  there and proven by the delivery run. It is never reported as a pass.
 - **N/A** — a stable fact about what this repo is. A library has no image.
-- **Exempt** — a control that *applies*, deliberately not enforced. It is debt:
+- **exempt** — a control that *applies*, deliberately not enforced. It is debt:
   it needs an owner and an expiry, and it expires closed.
+- **failed** — applies, was expected now, and did not pass. A control that
+  applies and produced no evidence at all is `failed`, never absent: absence of
+  evidence is not evidence a control ran.
+
+A caller that hard-codes `"gated-deploy": {"status": "pass"}` on a pull request
+does not get a pass — the control is still reported `deferred`, and the report
+carries a warning that a control which did not execute cannot have passed.
 
 To exempt something, add `security/exemptions.json`:
 
@@ -184,8 +272,15 @@ Verify:
 gh api repos/<org>/<repo>/branches/main/protection/required_status_checks
 ```
 
-Two caveats worth knowing:
+Three caveats worth knowing:
 
+- **`security-gate` must represent every control that gates the PR.** For a
+  container repository that is source security **and** the pre-push image gate.
+  The shipped examples aggregate both: a PR whose image gate reported
+  `BLOCK_DEPLOY` fails the check, because the name promises "this PR is secure"
+  and has to mean it. A source-only repo has no image control to aggregate, so
+  its aggregate is source-only. Requiring a check that covers only half the
+  controls is worse than requiring none, because it looks like coverage.
 - **The required check name is a constant.** `security-gate` is republished by a
   thin job in the caller because a reusable workflow reports its inner jobs as
   `caller-job / inner-job`. If you rename that job, the rule matches nothing and
@@ -553,12 +648,17 @@ findings they did not introduce.
 
 | Phase | Setting | Leave when |
 | --- | --- | --- |
+| **0. Bootstrap** | `gate_mode: log-only` + `bootstrap_baseline: true`, once | the candidate baseline is reviewed and committed, and the variable is unset (§1.1) |
 | **1. Log-only** | `gate_mode: log-only` | you have seen a few real PRs' worth of findings |
-| **2. Tune / baseline** | still `log-only` | the Semgrep baseline is committed from a **trusted** run, and rule noise is tuned |
+| **2. Tune / baseline** | still `log-only` | rule noise is tuned and the baseline is regenerated from a **trusted** run if needed |
 | **3. Enforce on PRs** | `gate_mode: enforce`, `security-gate` required | the team is merging green without heroics for a week or two |
-| **4. Enforce on main** | add the deploy-side gates | steady state |
+| **4. Enforce on main** | add the delivery caller (`deploy.yml`) and its gates | steady state |
 
 Phase 2 is the one people skip, and it is the one that makes phase 3 survivable.
+
+Phase 4 is where the `delivery` phase starts being proven: until then a
+container repo's conformance report honestly shows the registry, artifact-gate
+and deploy controls as **deferred** — required, not yet demonstrated.
 
 **Do not leave a repo in log-only after tuning.** The `gate-mode` check goes red
 (without blocking the merge) whenever log-only is actually suppressing
@@ -574,7 +674,12 @@ being "in rollout" and started being "unprotected".
 | --- | --- |
 | `not authorized to perform: sts:AssumeRoleWithWebIdentity` | The `sub` condition does not match. Print the real claims from the job. Check for a wildcard under `StringEquals` (§2.2). |
 | `AccessDeniedException … inspector2:ListCoverage` | Enhanced scanning without the Inspector statement (§2.2). |
-| The gate BLOCKs on a repo with no findings | Missing Semgrep baseline. A missing baseline is a fail-closed report-integrity BLOCK, not a pass (§1.1). |
+| The gate BLOCKs on a repo with no findings | Missing Semgrep baseline. A missing baseline is a fail-closed report-integrity BLOCK, not a pass. Bootstrap it (§1.1). |
+| `bootstrap refused: a Semgrep baseline already exists` | Bootstrap is for first onboarding only. If the baseline genuinely needs rebuilding, delete it in a reviewed PR first (§1.1). |
+| `Baseline bootstrap FAILED: this run's scans could not be trusted` | A scanner could not interpret its input, so nothing may be baselined from it. Fix the scanner failure reported above it (§1.1). |
+| Bootstrap ran but no candidate appeared | It refuses outside `gate_mode: log-only`, and refuses when a baseline exists (§1.1). |
+| A container PR merged with a failing image gate | The required check aggregated only source security. Use the shipped example's `security-gate` job, which aggregates both (§1.6). |
+| Conformance shows `deferred` controls | Correct on a pull request: those controls run in the `delivery` phase. They are required, and proven by the `deploy.yml` run (§1.3). |
 | Deploy hangs, then fails | `ssm:GetCommandInvocation` scoped to the instance ARN. It must be `*` (§2.2). |
 | `chat.postMessage` returns `not_in_channel` | The bot was never invited to the channel (§3.3). |
 | Slack rejects the Request URL | The endpoint was not live when you saved it (§3.3). |

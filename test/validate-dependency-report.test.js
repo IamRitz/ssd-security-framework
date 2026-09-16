@@ -81,6 +81,41 @@ describe('osv-scanner reports', () => {
     assert.match(summary, /no package sources/);
   });
 
+  it('accepts results:null — what the scanner really emits for no package sources', async () => {
+    // Go marshals an empty slice as null. This is the EXACT 126-byte payload
+    // OSV-Scanner 2.4.0 writes under --allow-no-lockfiles, captured from a real
+    // runner. Rejecting it broke every dependency-free consumer.
+    const real = JSON.stringify({
+      results: null,
+      experimental_config: { licenses: { summary: false, allowlist: null } }
+    });
+    await withTempFile(real, async (path) => {
+      const summary = await validateDependencyReport('osv-scanner', path);
+      assert.match(summary, /advisories=0/);
+      assert.match(summary, /no package sources/);
+    });
+  });
+
+  it('still rejects a payload with no results key at all', async () => {
+    // null is the scanner saying "nothing found". An absent key is not
+    // something this scanner produces, so it stays fail-closed.
+    await withTempFile('{"experimental_config":{}}', async (path) => {
+      await assert.rejects(
+        () => validateDependencyReport('osv-scanner', path),
+        /has no results key/
+      );
+    });
+  });
+
+  it('rejects a results value that is neither array nor null', async () => {
+    await withTempFile('{"results":"nope"}', async (path) => {
+      await assert.rejects(
+        () => validateDependencyReport('osv-scanner', path),
+        /must be an array, or null/
+      );
+    });
+  });
+
   it('counts advisories in a real report', async () => {
     const summary = await validateDependencyReport(
       'osv-scanner',
@@ -95,15 +130,6 @@ describe('osv-scanner reports', () => {
       join(FIXTURES, 'malicious-package/osv-scanner.json')
     );
     assert.match(summary, /malicious=[1-9]/);
-  });
-
-  it('rejects a report with no results array', async () => {
-    await withTempFile('{"notResults": []}', async (path) => {
-      await assert.rejects(
-        () => validateDependencyReport('osv-scanner', path),
-        /missing its results array/
-      );
-    });
   });
 });
 

@@ -167,6 +167,56 @@ async function readOptionalJson(path, label) {
   return readJson(path, label);
 }
 
+// THE BASELINE BOOTSTRAP, and why it is an explicit mode rather than a fallback.
+//
+// A brand-new repository has no Semgrep baseline. In normal operation a missing
+// baseline is a report-integrity BLOCK (`integrity.trusted: false`), and
+// generate-semgrep-baseline.mjs correctly refuses to baseline from an untrusted
+// run — so a new repo could never produce its first baseline. That is the
+// bootstrap deadlock.
+//
+// The fix must NOT be "a missing baseline is fine", because two situations look
+// identical from the filesystem:
+//
+//   A. a first onboarding, where no baseline exists yet, and
+//   B. an onboarded repository whose baseline was deleted or lost.
+//
+// B must keep failing closed — otherwise deleting a file silently re-accepts
+// every finding it used to gate. Nothing observable distinguishes A from B, so
+// the discriminator is OPERATOR INTENT: bootstrap is requested explicitly, is
+// visible in the workflow run, and refuses to touch a repo that already has a
+// baseline.
+//
+// Scanner integrity is unaffected: evaluateSemgrep still schema-validates the
+// report and still rejects one carrying scan errors, so a malformed, errored or
+// missing Semgrep report produces `trusted: false` in bootstrap exactly as it
+// does normally, and the generator still refuses.
+async function readBaseline(path, bootstrap) {
+  if (!bootstrap) {
+    return readJson(path, 'Semgrep baseline');
+  }
+
+  try {
+    await readFile(path, 'utf8');
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      // Case A: the expected state for a first onboarding. An empty accepted
+      // set means every finding is reported as new/unbaselined — nothing is
+      // waved through, it is simply not yet accepted.
+      return { schemaVersion: 1, findings: [], bootstrap: true };
+    }
+    throw new Error(`Semgrep baseline: cannot read ${path}: ${error.message}`, { cause: error });
+  }
+
+  // Case B, or a second bootstrap of an already-onboarded repo. Refuse: this
+  // mode exists to create a FIRST baseline, never to silently replace one.
+  throw new Error(
+    `bootstrap refused: a Semgrep baseline already exists at ${path}. Baseline bootstrap is for ` +
+      'first onboarding only. A repository whose baseline has disappeared must restore it, not ' +
+      're-accept its current findings.'
+  );
+}
+
 function normalizeSeverity(value) {
   assert(typeof value === 'string', 'severity must be a string');
   const severity = value.toLowerCase();
@@ -463,9 +513,23 @@ function osvHasFix(vulnerability, scannedPackage) {
 
 function evaluateOsv(policy, report, findings) {
   assert(report && typeof report === 'object', 'OSV-Scanner report must be an object');
-  assert(Array.isArray(report.results), 'OSV-Scanner report is missing results array');
+  // OSV-Scanner is written in Go, and Go marshals an empty slice as `null`, so a
+  // successful scan that found no package sources emits
+  // `{"results": null, "experimental_config": {...}}` with exit 0. That is the
+  // scanner reporting "I looked and found nothing" — a clean empty result set,
+  // not a malformed report. Rejecting it fail-closed BLOCKed every repository
+  // with no dependencies, which is precisely the portability case the
+  // cross-ecosystem backstop exists to cover.
+  //
+  // The key must still be PRESENT: a payload with no `results` key is not
+  // something this scanner produces, and stays a report-integrity BLOCK.
+  assert(Object.hasOwn(report, 'results'), 'OSV-Scanner report is missing results array');
+  assert(
+    report.results === null || Array.isArray(report.results),
+    'OSV-Scanner results must be an array, or null when no package sources were found'
+  );
 
-  for (const result of report.results) {
+  for (const result of report.results ?? []) {
     assert(Array.isArray(result.packages), 'OSV-Scanner result is missing packages array');
     for (const dependency of result.packages) {
       assert(
@@ -548,7 +612,7 @@ function semgrepSeverity(policy, finding) {
   return normalizeSeverity(policyValue(policy, `severity_mapping.semgrep_severity.${raw}`));
 }
 
-function evaluateSemgrep(policy, report, baseline, findings) {
+function evaluateSemgrep(policy, report, baseline, findings, bootstrap = false) {
   assert(report && typeof report === 'object', 'Semgrep report must be an object');
   assert(typeof report.version === 'string', 'Semgrep report is missing version');
   assert(Array.isArray(report.results), 'Semgrep report is missing results array');
@@ -580,7 +644,9 @@ function evaluateSemgrep(policy, report, baseline, findings) {
       location: `${finding.path}:${finding.start?.line ?? '?'}`,
       fingerprint,
       severity,
-      baselineState: existing ? 'existing' : 'new',
+      // In bootstrap there is no accepted set yet, so `new` would overstate what
+      // is known. `unbaselined` says the honest thing: not yet accepted.
+      baselineState: bootstrap ? 'unbaselined' : existing ? 'existing' : 'new',
       policyRule: `sast.${severity}${suffix}`,
       reason: `${severity} Semgrep finding is ${existing ? 'baseline-known' : 'new'}`,
       // Human context for the developer-readable formatter (Semgrep rules carry a
@@ -675,6 +741,20 @@ function breakGlassSummary(verdict, findings) {
   };
 }
 
+// Recorded in every gate result so a bootstrap run is auditable after the fact:
+// a reviewer can tell that this run evaluated SAST against an empty accepted set
+// on purpose, rather than wondering why everything reported as new.
+function bootstrapState(bootstrap) {
+  return bootstrap
+    ? {
+        active: true,
+        reason:
+          'baseline bootstrap: no committed Semgrep baseline, evaluated against an empty ' +
+          'accepted set so a first baseline can be generated from this run'
+      }
+    : { active: false };
+}
+
 async function writeResults(paths, result) {
   const exceptions = result.findings.filter((finding) => finding.action === 'EXCEPTION');
   await mkdir(dirname(paths.output), { recursive: true });
@@ -686,7 +766,8 @@ async function writeResults(paths, result) {
   );
 }
 
-export async function runSecurityGate(customPaths = {}) {
+export async function runSecurityGate(options = {}) {
+  const { bootstrap = false, ...customPaths } = options;
   const paths = { ...DEFAULT_PATHS, ...customPaths };
   let result;
 
@@ -705,7 +786,7 @@ export async function runSecurityGate(customPaths = {}) {
       readJson(paths.trufflehog, 'TruffleHog'),
       readJson(paths.osv, 'OSV-Scanner'),
       readJson(paths.semgrep, 'Semgrep'),
-      readJson(paths.baseline, 'Semgrep baseline'),
+      readBaseline(paths.baseline, bootstrap),
       ecosystems.packageLock
         ? readJson(paths.npmAudit, 'npm audit')
         : readOptionalJson(paths.npmAudit, 'npm audit'),
@@ -723,7 +804,7 @@ export async function runSecurityGate(customPaths = {}) {
       evaluatePipAudit(policy, pipAudit, findings);
     }
     evaluateOsv(policy, osv, findings);
-    evaluateSemgrep(policy, semgrep, baseline, findings);
+    evaluateSemgrep(policy, semgrep, baseline, findings, bootstrap);
     markBreakGlassEligibility(policy, findings);
 
     const summary = summarize(findings);
@@ -737,6 +818,7 @@ export async function runSecurityGate(customPaths = {}) {
       verdict,
       summary,
       integrity: summarizeIntegrity(findings),
+      bootstrap: bootstrapState(bootstrap),
       findings,
       breakGlass: breakGlassSummary(verdict, findings)
     };
@@ -753,6 +835,7 @@ export async function runSecurityGate(customPaths = {}) {
       verdict: 'BLOCK',
       summary: { block: 1, exception: 0, log: 0 },
       integrity: summarizeIntegrity([finding]),
+      bootstrap: bootstrapState(bootstrap),
       findings: [finding],
       breakGlass: breakGlassSummary('BLOCK', [finding])
     };
@@ -776,16 +859,24 @@ function parseArguments(arguments_) {
     '--output': 'output',
     '--exceptions': 'exceptions'
   };
-  const paths = {};
+  const options = {};
 
-  for (let index = 0; index < arguments_.length; index += 2) {
-    const key = aliases[arguments_[index]];
+  for (let index = 0; index < arguments_.length; index += 1) {
+    const flag = arguments_[index];
+    // Explicit, auditable opt-in. Deliberately a bare flag with no value, so it
+    // cannot be set accidentally by an empty variable expanding to nothing.
+    if (flag === '--bootstrap') {
+      options.bootstrap = true;
+      continue;
+    }
+    const key = aliases[flag];
     const value = arguments_[index + 1];
-    assert(key && value, `unknown or incomplete argument ${arguments_[index]}`);
-    paths[key] = value;
+    assert(key && value, `unknown or incomplete argument ${flag}`);
+    options[key] = value;
+    index += 1;
   }
 
-  return paths;
+  return options;
 }
 
 async function main() {

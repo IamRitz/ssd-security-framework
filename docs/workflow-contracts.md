@@ -39,7 +39,11 @@ confirmed.
 | `break_glass_lambda_role_arn` / `_function` / `_aws_region` | string | `''` | Required together when transport is `lambda`. |
 | `break_glass_notify_url` / `_status_url` | string | `''` | Legacy HTTP transport endpoints. |
 | `break_glass_timeout_seconds` | string | `''` | How long to wait for a verified decision. |
-| `synthetic_block_fixture` | string | `none` | Demo only. Refuses to run unless **both** break-glass URLs are passed explicitly, so a synthetic BLOCK can never reach production endpoints. |
+| `bootstrap_baseline` | boolean | `false` | **Onboarding only.** Evaluate SAST against an empty accepted set because no baseline exists yet, then generate and upload a candidate. Requires `gate_mode: log-only`, and **refuses if a baseline already exists**. See [onboarding §1.1](onboarding.md#11-bootstrap-the-first-semgrep-baseline). |
+| `synthetic_block_fixture` | string | `none` | Demo only. Requires an **isolated** break-glass configuration and can never fall through to production — dev URLs for `http`, the `synthetic_break_glass_*` inputs for `lambda`. |
+| `synthetic_break_glass_lambda_function` | string | `''` | Test broker used only for a synthetic `lambda` run. **Must differ from** `break_glass_lambda_function`. |
+| `synthetic_break_glass_lambda_role_arn` | string | `''` | Test invoker role for a synthetic `lambda` run. **Must differ from** `break_glass_lambda_role_arn`, so a fabricated BLOCK cannot assume the production role. |
+| `synthetic_break_glass_aws_region` | string | `''` | Region of the test broker. Falls back to `break_glass_aws_region`. |
 
 ### Secrets
 
@@ -174,22 +178,60 @@ Which controls apply to this repository, and what happened to each.
 | `artifact_type` | string | `none` — `container` \| `archive` \| `library` \| `none` |
 | `registry` | string | `none` — `ecr` \| `none` |
 | `deploy_target` | string | `none` — `framework-gated` \| `self-managed` \| `none` |
+| `phase` | string | `pr` — `pr` \| `delivery`. Which part of the lifecycle THIS run is. |
 | `break_glass_enabled` | boolean | `false` |
 | `observed` | string (JSON) | **required** — control id → `{status, evidence}` |
 | `exemptions_path` | string | `security/exemptions.json` |
 
 | Output | Meaning |
 | --- | --- |
-| `failed` | applicable, non-exempt controls that did not pass |
+| `failed` | applicable, expected-now, non-exempt controls that did not pass |
+| `deferred` | required by the repo but not run in this phase — **proven elsewhere, not coverage here** |
 | `not_applicable` | controls the declared capabilities exclude |
 | `exempt` | controls carrying a live exemption — **debt, not coverage** |
 
+### Capability is not the same as lifecycle
+
+The report answers two different questions, and conflating them is how a pull
+request ends up claiming a deploy succeeded:
+
+1. **What does this repository require?** — every control with
+   `appliesToRepository: true`, regardless of phase.
+2. **What executed successfully in this run?** — every control with status
+   `applied`.
+
+Five statuses, deliberately distinct:
+
+| Status | Meaning |
+| --- | --- |
+| `applied` | ran in this phase, real result recorded |
+| `deferred` | required by the repo, but does not run in this phase — proven by the other run, never reported as a pass |
+| `not-applicable` | the declared capabilities give it no subject, with a reason naming the capability |
+| `exempt` | applies, deliberately unenforced; carries an owner and an expiry, and **expires closed** |
+| `failed` | applies, was expected now, and did not pass — including producing no evidence at all |
+
+Only `failed` fails the job. `deferred` does not, because the control genuinely
+runs elsewhere; that is why the delivery caller must actually exist and run.
+
+Control phases:
+
+| Control | Phase(s) |
+| --- | --- |
+| `secret-scan`, `dependency-scan`, `sast`, `source-gate` | `pr`, `delivery` |
+| `image-scan-prepush` | `pr`, `delivery` — the point is catching it *before* any push |
+| `break-glass` | `pr`, `delivery` |
+| `registry-scan-collect`, `artifact-gate`, `gated-deploy` | `delivery` only |
+
 Unrecognized or self-contradictory capability values **fail closed**. A typo like
 `containr` must not silently degrade to "none", because that would mark the image
-controls N/A and report a green conformance for an unscanned image.
+controls N/A and report a green conformance for an unscanned image. An
+unrecognized `phase` is rejected for the same reason: silently defaulting to `pr`
+would defer every delivery control and report a green run.
 
-A control that applies but appears in neither `observed` nor the exemptions is
-**failed**: absence of evidence is not evidence the control ran.
+A control that applies, runs in this phase, and appears in neither `observed` nor
+the exemptions is **failed**: absence of evidence is not evidence the control ran.
+Supplying evidence for a control this phase does not run produces a **warning**
+and is not honoured.
 
 ## `gate_mode`
 

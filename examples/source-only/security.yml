@@ -8,6 +8,11 @@
 # Note what is NOT here: no container-build, no image-security, no ECR. Those
 # controls are not skipped silently — the conformance job below declares
 # `artifact_type: library`, so they are reported N/A WITH A REASON.
+#
+# FIRST ONBOARDING: a brand-new repo has no Semgrep baseline, and the gate
+# requires one. Run the bootstrap once to produce it — see
+# docs/onboarding.md § "Bootstrap the first baseline". Until the baseline is
+# committed, keep `gate_mode: log-only`.
 name: Security checks
 
 on:
@@ -29,8 +34,12 @@ jobs:
     with:
       toolkit_ref: v1
       # START HERE on a new repo. Move to `enforce` only after you have generated
-      # a Semgrep baseline — see docs/onboarding.md § rollout.
+      # and committed a Semgrep baseline — see docs/onboarding.md § rollout.
       gate_mode: ${{ vars.GATE_MODE || 'log-only' }}
+      # ONE-TIME: set this repository variable to `true` for a single run to
+      # produce the first baseline, then unset it. It refuses to run unless
+      # gate_mode is log-only, and refuses outright if a baseline already exists.
+      bootstrap_baseline: ${{ vars.BOOTSTRAP_BASELINE == 'true' }}
       semgrep_configs: |
         p/owasp-top-ten
         p/javascript
@@ -38,24 +47,39 @@ jobs:
       slack_notify_url: ${{ vars.SECURITY_NOTIFY_SLACK_URL }}
 
   security-gate:
+    # THE stable required check for branch protection.
+    #
+    # This repository ships no artifact, so source security IS the whole PR
+    # security contract — there is no image gate to aggregate. A container repo
+    # must additionally require its pre-push image gate; see
+    # examples/container-ecr/security.yml.
+    #
+    # The name is a CONSTANT: branch protection matches by exact string, and a
+    # name computed from the gate mode would stop matching in one mode.
     name: security-gate
     needs: source-security
+    # `always()` so the required check still reports when the dependency fails.
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
-      - name: Report the source security verdict
+      - name: Require every security control that gates this pull request
         env:
-          RESULT: ${{ needs.source-security.result }}
+          # Same variable names as the container examples: the aggregate is the
+          # same contract, this repo simply has one control in it.
+          SOURCE_RESULT: ${{ needs.source-security.result }}
           VERDICT: ${{ needs.source-security.outputs.verdict }}
           MODE: ${{ needs.source-security.outputs.gate_mode }}
         run: |
-          echo "Source security verdict: ${VERDICT:-unknown} (job result: $RESULT)"
+          set -euo pipefail
+          echo "source-security: result=$SOURCE_RESULT verdict=${VERDICT:-unknown}"
           if [ "$MODE" = "log-only" ]; then
             echo "::warning::GREEN BY CONFIGURATION, not by verdict — gate_mode is log-only."
           fi
-          if [ "$RESULT" != "success" ]; then
+          if [ "$SOURCE_RESULT" != "success" ]; then
+            echo "::error::source security did not pass (result=$SOURCE_RESULT)"
             exit 1
           fi
+          echo "All pull-request security controls passed."
 
   conformance:
     needs: source-security
@@ -63,12 +87,15 @@ jobs:
     uses: IamRitz/ssd-security-framework/.github/workflows/_conformance.yml@v1
     with:
       toolkit_ref: v1
+      # A library has no delivery phase of its own, so every control it requires
+      # runs here. Nothing is deferred.
+      phase: pr
       artifact_type: library
       registry: none
       deploy_target: none
       break_glass_enabled: false
       observed: >-
-        {"secret-scan":{"status":"${{ needs.source-security.result }}"},
-         "dependency-scan":{"status":"${{ needs.source-security.result }}"},
-         "sast":{"status":"${{ needs.source-security.result }}"},
-         "source-gate":{"status":"${{ needs.source-security.result }}"}}
+        {"secret-scan":{"status":"${{ needs.source-security.result }}","evidence":"source-security job"},
+         "dependency-scan":{"status":"${{ needs.source-security.result }}","evidence":"source-security job"},
+         "sast":{"status":"${{ needs.source-security.result }}","evidence":"source-security job"},
+         "source-gate":{"status":"${{ needs.source-security.result }}","evidence":"security-gate check"}}

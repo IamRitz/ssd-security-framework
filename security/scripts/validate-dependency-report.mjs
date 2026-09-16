@@ -16,7 +16,8 @@
 // never happened is not the same as zero findings from a scan that did.
 //
 // So every failure below names the scanner, names the file, and says what the
-// state actually means.
+// state actually means. Each rethrow keeps the original error as `cause`, so the
+// underlying errno or parser position survives alongside the explanation.
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
@@ -35,10 +36,13 @@ async function readReport(scanner, reportPath) {
     if (error.code === 'ENOENT') {
       throw new Error(
         `${scanner} report ${reportPath} does not exist. The scanner did not run, or it failed ` +
-          'before writing anything. A missing report is UNKNOWN, not zero findings.'
+          'before writing anything. A missing report is UNKNOWN, not zero findings.',
+        { cause: error }
       );
     }
-    throw new Error(`${scanner} report ${reportPath} could not be read: ${error.message}`);
+    throw new Error(`${scanner} report ${reportPath} could not be read: ${error.message}`, {
+      cause: error
+    });
   }
 
   if (raw.trim() === '') {
@@ -55,7 +59,8 @@ async function readReport(scanner, reportPath) {
   } catch (error) {
     throw new Error(
       `${scanner} report ${reportPath} is not valid JSON: ${error.message}. ` +
-        `First 120 bytes: ${JSON.stringify(raw.slice(0, 120))}`
+        `First 120 bytes: ${JSON.stringify(raw.slice(0, 120))}`,
+      { cause: error }
     );
   }
 }
@@ -87,13 +92,26 @@ export async function validateDependencyReport(scanner, reportPath) {
   }
 
   if (scanner === 'osv-scanner') {
-    // `{ "results": [] }` is the legitimate shape for a repository with no
-    // dependencies, and is what OSV-Scanner emits under --allow-no-lockfiles.
-    // It is accepted here precisely BECAUSE the scanner wrote it: the scanner
-    // is asserting "I looked and found nothing", which an empty file cannot.
-    assert(Array.isArray(report.results), 'OSV-Scanner report is missing its results array');
+    // OSV-Scanner is written in Go, and Go marshals an empty slice as `null`
+    // rather than `[]`. A successful scan that found no package sources emits
+    // exactly `{"results": null, "experimental_config": {...}}` with exit 0 —
+    // verified against this pinned version both locally and on a runner.
+    //
+    // That is the scanner asserting "I looked and found nothing", so it is a
+    // clean empty result set, not a malformed report. It is trusted precisely
+    // BECAUSE the scanner wrote it, which an empty file cannot do.
+    //
+    // The key must still be PRESENT. A payload with no `results` key at all is
+    // not something this scanner produces, so it stays a fail-closed rejection
+    // rather than being normalized away.
+    assert(Object.hasOwn(report, 'results'), 'OSV-Scanner report has no results key');
+    assert(
+      report.results === null || Array.isArray(report.results),
+      'OSV-Scanner report results must be an array, or null when no package sources were found'
+    );
 
-    const advisoryIds = report.results
+    const results = report.results ?? [];
+    const advisoryIds = results
       .flatMap((result) => result.packages ?? [])
       .flatMap((dependency) => dependency.vulnerabilities ?? [])
       .map((advisory) => advisory.id)
@@ -102,7 +120,7 @@ export async function validateDependencyReport(scanner, reportPath) {
 
     return (
       `osv-scanner advisories=${advisoryIds.length} malicious=${maliciousAdvisories.length}` +
-      (report.results.length === 0 ? ' (no package sources — repository has no dependencies)' : '')
+      (results.length === 0 ? ' (no package sources — repository has no dependencies)' : '')
     );
   }
 
