@@ -758,14 +758,69 @@ jobs:
           name: sast-reports
           path: reports
 
-      - name: Require explicit dev endpoints for a synthetic demo run
-        # A synthetic BLOCK must never fall back to the production endpoints.
-        # If synthetic_block_fixture is set, both URLs must be provided explicitly.
-        if: ${{ inputs.synthetic_block_fixture != 'none' && (inputs.break_glass_notify_url == '' || inputs.break_glass_status_url == '') }}
+      - name: Require an isolated break-glass configuration for a synthetic run
+        # A synthetic BLOCK is a FABRICATED finding. It must never reach the real
+        # approval channel, where it would page real approvers and record a real
+        # decision against a finding that does not exist.
+        #
+        # This runs BEFORE the gate evaluates, and therefore before any OIDC role
+        # assumption and before any Lambda invocation — the isolation is proven
+        # by ordering, not by hoping the later steps behave.
+        #
+        # Isolation is required per transport, and is never inferred from a name:
+        # a function called "break-glass-test" is not evidence of anything. The
+        # test identifiers must be supplied explicitly AND must differ from the
+        # production ones, so "just reuse the prod ARN" cannot happen silently.
+        if: ${{ inputs.synthetic_block_fixture != 'none' }}
+        env:
+          TRANSPORT: ${{ inputs.break_glass_transport }}
+          NOTIFY_URL: ${{ inputs.break_glass_notify_url }}
+          STATUS_URL: ${{ inputs.break_glass_status_url }}
+          SYNTH_FUNCTION: ${{ inputs.synthetic_break_glass_lambda_function }}
+          SYNTH_ROLE: ${{ inputs.synthetic_break_glass_lambda_role_arn }}
+          SYNTH_REGION: ${{ inputs.synthetic_break_glass_aws_region }}
+          PROD_FUNCTION: ${{ inputs.break_glass_lambda_function }}
+          PROD_ROLE: ${{ inputs.break_glass_lambda_role_arn }}
+          PROD_REGION: ${{ inputs.break_glass_aws_region }}
         run: |
-          echo "A synthetic_block_fixture run must set BOTH break_glass_notify_url and break_glass_status_url." >&2
-          echo "Refusing to fall back to the production BREAK_GLASS_* endpoints for a synthetic BLOCK." >&2
-          exit 1
+          set -euo pipefail
+          case "$TRANSPORT" in
+            http)
+              if [ -z "$NOTIFY_URL" ] || [ -z "$STATUS_URL" ]; then
+                echo "A synthetic run on the http transport must set BOTH break_glass_notify_url and break_glass_status_url." >&2
+                echo "Refusing to fall back to the production BREAK_GLASS_* endpoints for a synthetic BLOCK." >&2
+                exit 1
+              fi
+              ;;
+            lambda)
+              if [ -z "$SYNTH_FUNCTION" ] || [ -z "$SYNTH_ROLE" ]; then
+                echo "A synthetic run on the lambda transport must set BOTH" >&2
+                echo "  synthetic_break_glass_lambda_function" >&2
+                echo "  synthetic_break_glass_lambda_role_arn" >&2
+                echo "Refusing to invoke the production break-glass broker with a fabricated finding." >&2
+                exit 1
+              fi
+              if [ -n "$PROD_FUNCTION" ] && [ "$SYNTH_FUNCTION" = "$PROD_FUNCTION" ]; then
+                echo "synthetic_break_glass_lambda_function is the production function ($PROD_FUNCTION)." >&2
+                echo "Synthetic isolation means a SEPARATE broker, not the same one renamed." >&2
+                exit 1
+              fi
+              if [ -n "$PROD_ROLE" ] && [ "$SYNTH_ROLE" = "$PROD_ROLE" ]; then
+                echo "synthetic_break_glass_lambda_role_arn is the production role ($PROD_ROLE)." >&2
+                echo "A synthetic BLOCK must not be able to assume the production invoker role." >&2
+                exit 1
+              fi
+              if [ -z "${SYNTH_REGION:-}" ] && [ -z "${PROD_REGION:-}" ]; then
+                echo "A synthetic lambda run needs a region: set synthetic_break_glass_aws_region." >&2
+                exit 1
+              fi
+              ;;
+            *)
+              echo "Unsupported break-glass transport for a synthetic run: $TRANSPORT" >&2
+              exit 1
+              ;;
+          esac
+          echo "Synthetic break-glass configuration is isolated from production."
 
       - name: Apply synthetic eligible BLOCK for a manual demo
         # The fixtures travel with the TOOLKIT, so a consumer repo needs no
@@ -937,20 +992,28 @@ jobs:
               ;;
           esac
 
+          {
+            echo "SSD_BG_FUNCTION=$FUNCTION"
+            echo "SSD_BG_REGION=$REGION"
+            echo "SSD_BG_ROLE=$ROLE"
+          } >> "$GITHUB_ENV"
+
       - name: Assume the break-glass invoker role (OIDC)
         if: ${{ steps.evaluate.outcome == 'failure' && inputs.gate_mode != 'log-only' && inputs.break_glass_enabled && inputs.break_glass_transport == 'lambda' }}
         uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
         with:
-          role-to-assume: ${{ inputs.break_glass_lambda_role_arn }}
-          aws-region: ${{ inputs.break_glass_aws_region }}
+          # The EFFECTIVE role resolved above — the isolated test role on a
+          # synthetic run, the production role otherwise. Never the raw input.
+          role-to-assume: ${{ env.SSD_BG_ROLE }}
+          aws-region: ${{ env.SSD_BG_REGION }}
           role-session-name: break-glass-gate
 
       - name: Request break-glass decision
         if: ${{ steps.evaluate.outcome == 'failure' && inputs.gate_mode != 'log-only' && inputs.break_glass_enabled }}
         env:
           BREAK_GLASS_TRANSPORT: ${{ inputs.break_glass_transport }}
-          BREAK_GLASS_FUNCTION_NAME: ${{ inputs.break_glass_lambda_function }}
-          AWS_REGION: ${{ inputs.break_glass_aws_region }}
+          BREAK_GLASS_FUNCTION_NAME: ${{ env.SSD_BG_FUNCTION }}
+          AWS_REGION: ${{ env.SSD_BG_REGION }}
 
           BREAK_GLASS_NOTIFY_URL: ${{ inputs.break_glass_notify_url }}
           BREAK_GLASS_SHARED_SECRET: ${{ secrets.break_glass_shared_secret }}
@@ -968,8 +1031,8 @@ jobs:
         if: ${{ steps.evaluate.outcome == 'failure' && inputs.gate_mode != 'log-only' && inputs.break_glass_enabled }}
         env:
           BREAK_GLASS_TRANSPORT: ${{ inputs.break_glass_transport }}
-          BREAK_GLASS_FUNCTION_NAME: ${{ inputs.break_glass_lambda_function }}
-          AWS_REGION: ${{ inputs.break_glass_aws_region }}
+          BREAK_GLASS_FUNCTION_NAME: ${{ env.SSD_BG_FUNCTION }}
+          AWS_REGION: ${{ env.SSD_BG_REGION }}
 
           BREAK_GLASS_STATUS_URL: ${{ inputs.break_glass_status_url }}
           BREAK_GLASS_SHARED_SECRET: ${{ secrets.break_glass_shared_secret }}
