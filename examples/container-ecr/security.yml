@@ -50,31 +50,6 @@ jobs:
       break_glass_lambda_function: ${{ vars.BREAK_GLASS_LAMBDA_FUNCTION }}
       break_glass_aws_region: ${{ vars.AWS_REGION }}
 
-  security-gate:
-    # Stable check name for branch protection. A reusable workflow reports its
-    # inner jobs as `caller-job / inner-job`, so this republishes the verdict
-    # under the exact name the branch protection rule matches. The name is a
-    # CONSTANT — a name computed from the gate mode would stop matching in one
-    # mode and the rule would silently protect nothing.
-    name: security-gate
-    needs: source-security
-    if: ${{ always() }}
-    runs-on: ubuntu-latest
-    steps:
-      - name: Report the source security verdict
-        env:
-          RESULT: ${{ needs.source-security.result }}
-          VERDICT: ${{ needs.source-security.outputs.verdict }}
-          MODE: ${{ needs.source-security.outputs.gate_mode }}
-        run: |
-          echo "Source security verdict: ${VERDICT:-unknown} (job result: $RESULT)"
-          if [ "$MODE" = "log-only" ]; then
-            echo "::warning::GREEN BY CONFIGURATION, not by verdict — gate_mode is log-only."
-          fi
-          if [ "$RESULT" != "success" ]; then
-            exit 1
-          fi
-
   container-build:
     # Repo-specific: the consumer owns its own build. Holds ZERO cloud
     # credentials — it builds the image and uploads it as a tarball artifact.
@@ -118,9 +93,80 @@ jobs:
       gate_mode: ${{ vars.GATE_MODE || 'enforce' }}
       slack_notify_url: ${{ vars.SECURITY_NOTIFY_SLACK_URL }}
 
+  security-gate:
+    # THE stable required check for branch protection, and it must represent
+    # EVERY control that gates this PR — not just source security.
+    #
+    # For a container repository that means source security AND the pre-push
+    # image gate. A rule requiring a source-only check would let a PR whose image
+    # gate reported BLOCK_DEPLOY merge, which is not what the name promises.
+    #
+    # The name is a CONSTANT. Branch protection matches by exact string, so a
+    # name computed from the gate mode would stop matching in one mode and the
+    # rule would silently protect nothing.
+    name: security-gate
+    needs:
+      - source-security
+      - image-security
+    # `always()` so this job still REPORTS when a dependency fails or is skipped.
+    # Without it the job is skipped, the required check never posts, and the PR
+    # waits forever on a status that will not arrive.
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every security control that gates this pull request
+        env:
+          EVENT: ${{ github.event_name }}
+          SOURCE_RESULT: ${{ needs.source-security.result }}
+          IMAGE_RESULT: ${{ needs.image-security.result }}
+          SOURCE_VERDICT: ${{ needs.source-security.outputs.verdict }}
+          IMAGE_VERDICT: ${{ needs.image-security.outputs.verdict }}
+          MODE: ${{ needs.source-security.outputs.gate_mode }}
+        run: |
+          set -euo pipefail
+          echo "event=$EVENT"
+          echo "source-security: result=$SOURCE_RESULT verdict=${SOURCE_VERDICT:-unknown}"
+          echo "image-security:  result=$IMAGE_RESULT verdict=${IMAGE_VERDICT:-unknown}"
+
+          failed=0
+          if [ "$SOURCE_RESULT" != "success" ]; then
+            echo "::error::source security did not pass (result=$SOURCE_RESULT)"
+            failed=1
+          fi
+
+          # The scheduled sweep deliberately builds no image, so `skipped` is
+          # legitimate THERE and only there. On a pull request a skipped image
+          # gate means a control that should have run did not — which must fail,
+          # or schedule-shaped skipping would quietly redefine the PR contract.
+          if [ "$EVENT" = "schedule" ]; then
+            case "$IMAGE_RESULT" in
+              success|skipped) ;;
+              *)
+                echo "::error::image security did not pass (result=$IMAGE_RESULT)"
+                failed=1
+                ;;
+            esac
+          elif [ "$IMAGE_RESULT" != "success" ]; then
+            echo "::error::image security did not pass (result=$IMAGE_RESULT); a container PR is gated on it"
+            failed=1
+          fi
+
+          if [ "$MODE" = "log-only" ]; then
+            echo "::warning::GREEN BY CONFIGURATION, not by verdict — gate_mode is log-only."
+          fi
+
+          if [ "$failed" -ne 0 ]; then
+            exit 1
+          fi
+          echo "All pull-request security controls passed."
+
   conformance:
-    # Declares what this repo IS, so controls that do not apply are reported N/A
-    # with a reason rather than silently skipped.
+    # Declares what this repo IS, and which phase this run is.
+    #
+    # Note what is NOT claimed here: registry-scan-collect, artifact-gate and
+    # gated-deploy get no `observed` entry, because they do not execute on a PR.
+    # They are reported `deferred` — required by this repository, proven by the
+    # delivery run — rather than a fabricated `pass`.
     needs:
       - source-security
       - image-security

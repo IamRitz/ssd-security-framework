@@ -1,14 +1,18 @@
 # EXAMPLE CALLER — a Python service that builds a container but deploys through
 # a pipeline this framework does NOT own.
 #
-# Two things make this different from the container-ecr example:
+# Three things make this different from the container-ecr example:
 #
 #  1. `semgrep_configs` uses the Python pack. This is not cosmetic: running
 #     `p/javascript` against Python reports near-zero findings, which reads as a
 #     clean pass rather than a misconfiguration.
 #  2. `deploy_target: self-managed` and `registry: none`. The repo genuinely has
-#     a deploy, but not one this framework gates — so the gated-deploy control is
-#     N/A with that reason, rather than a gap or a fake pass.
+#     a deploy, but not one this framework gates — so the registry and deploy
+#     controls are N/A with that reason, rather than deferred to a delivery run
+#     that never happens here.
+#  3. The pre-push image gate is STILL required. The framework does not push or
+#     deploy this image, but it does refuse to let a vulnerable one leave CI, so
+#     `security-gate` aggregates it exactly as the fully-gated example does.
 #
 # Dependency scanning needs no configuration: pip-audit runs from
 # requirements.txt, and OSV-Scanner covers poetry.lock / Pipfile.lock regardless.
@@ -38,22 +42,6 @@ jobs:
         p/python
       semgrep_paths: src
       slack_notify_url: ${{ vars.SECURITY_NOTIFY_SLACK_URL }}
-
-  security-gate:
-    name: security-gate
-    needs: source-security
-    if: ${{ always() }}
-    runs-on: ubuntu-latest
-    steps:
-      - name: Report the source security verdict
-        env:
-          RESULT: ${{ needs.source-security.result }}
-          VERDICT: ${{ needs.source-security.outputs.verdict }}
-        run: |
-          echo "Source security verdict: ${VERDICT:-unknown} (job result: $RESULT)"
-          if [ "$RESULT" != "success" ]; then
-            exit 1
-          fi
 
   container-build:
     name: Container build
@@ -92,6 +80,58 @@ jobs:
       toolkit_ref: v1
       image_artifact: application-image-${{ github.sha }}
       gate_mode: ${{ vars.GATE_MODE || 'enforce' }}
+
+  security-gate:
+    # THE stable required check. This repo ships a container, so the PR contract
+    # is source security AND the pre-push image gate — even though the framework
+    # owns neither the registry nor the deploy. "We deploy it ourselves" is not a
+    # reason to merge a PR whose image gate reported BLOCK_DEPLOY.
+    name: security-gate
+    needs:
+      - source-security
+      - image-security
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every security control that gates this pull request
+        env:
+          EVENT: ${{ github.event_name }}
+          SOURCE_RESULT: ${{ needs.source-security.result }}
+          IMAGE_RESULT: ${{ needs.image-security.result }}
+          MODE: ${{ needs.source-security.outputs.gate_mode }}
+        run: |
+          set -euo pipefail
+          echo "event=$EVENT source=$SOURCE_RESULT image=$IMAGE_RESULT"
+
+          failed=0
+          if [ "$SOURCE_RESULT" != "success" ]; then
+            echo "::error::source security did not pass (result=$SOURCE_RESULT)"
+            failed=1
+          fi
+
+          # `skipped` is legitimate only on the scheduled sweep, which builds no
+          # image. On a pull request it means a required control did not run.
+          if [ "$EVENT" = "schedule" ]; then
+            case "$IMAGE_RESULT" in
+              success|skipped) ;;
+              *)
+                echo "::error::image security did not pass (result=$IMAGE_RESULT)"
+                failed=1
+                ;;
+            esac
+          elif [ "$IMAGE_RESULT" != "success" ]; then
+            echo "::error::image security did not pass (result=$IMAGE_RESULT); a container PR is gated on it"
+            failed=1
+          fi
+
+          if [ "$MODE" = "log-only" ]; then
+            echo "::warning::GREEN BY CONFIGURATION, not by verdict — gate_mode is log-only."
+          fi
+
+          if [ "$failed" -ne 0 ]; then
+            exit 1
+          fi
+          echo "All pull-request security controls passed."
 
   conformance:
     needs:
