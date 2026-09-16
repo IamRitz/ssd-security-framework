@@ -463,9 +463,23 @@ function osvHasFix(vulnerability, scannedPackage) {
 
 function evaluateOsv(policy, report, findings) {
   assert(report && typeof report === 'object', 'OSV-Scanner report must be an object');
-  assert(Array.isArray(report.results), 'OSV-Scanner report is missing results array');
+  // OSV-Scanner is written in Go, and Go marshals an empty slice as `null`, so a
+  // successful scan that found no package sources emits
+  // `{"results": null, "experimental_config": {...}}` with exit 0. That is the
+  // scanner reporting "I looked and found nothing" — a clean empty result set,
+  // not a malformed report. Rejecting it fail-closed BLOCKed every repository
+  // with no dependencies, which is precisely the portability case the
+  // cross-ecosystem backstop exists to cover.
+  //
+  // The key must still be PRESENT: a payload with no `results` key is not
+  // something this scanner produces, and stays a report-integrity BLOCK.
+  assert(Object.hasOwn(report, 'results'), 'OSV-Scanner report is missing results array');
+  assert(
+    report.results === null || Array.isArray(report.results),
+    'OSV-Scanner results must be an array, or null when no package sources were found'
+  );
 
-  for (const result of report.results) {
+  for (const result of report.results ?? []) {
     assert(Array.isArray(result.packages), 'OSV-Scanner result is missing packages array');
     for (const dependency of result.packages) {
       assert(
