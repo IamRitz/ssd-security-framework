@@ -56,6 +56,42 @@ The `lambda` transport needs no repository secret at all, which removes the
 whole class of "the secret leaked / the secret rotated and CI broke" problems.
 Prefer it. The `http` transport remains for rollback and for existing consumers.
 
+## Synthetic runs are isolated by construction
+
+`synthetic_block_fixture` injects a **fabricated** eligible BLOCK so the approval
+path can be demonstrated without real vulnerable code. That fabricated finding
+must never reach the real broker, where it would page real approvers and record a
+real decision against a finding that does not exist.
+
+Isolation is required per transport, and the run fails before anything is
+assumed or invoked if it is missing:
+
+| Transport | Required for a synthetic run |
+| --- | --- |
+| `http` | `break_glass_notify_url` **and** `break_glass_status_url` — explicit dev endpoints |
+| `lambda` | `synthetic_break_glass_lambda_function` **and** `synthetic_break_glass_lambda_role_arn`, each **different from** its production counterpart (plus a region) |
+
+Three properties make this safe rather than merely discouraged:
+
+1. **It fails before any credential exists.** The isolation guard runs *before*
+   the gate evaluates, and therefore before OIDC role assumption and before any
+   broker invocation. The ordering is the control, and the framework's tests
+   assert it — a guard that ran after the role was assumed would prove nothing.
+2. **Production identifiers cannot be reused.** Passing the production function
+   or role ARN as the synthetic one is rejected explicitly. "Isolation" means a
+   separate broker, not the same broker under a different label.
+3. **Nothing is inferred from a name.** A function called `break-glass-test` is
+   not evidence of anything. The framework never pattern-matches on names; it
+   requires the identifiers to be supplied and to differ.
+
+The steps that talk to the broker use a **resolved** function and role, never the
+raw production inputs, so there is no code path on which a synthetic run reaches
+production configuration by omission.
+
+Eligibility is still checked first. A synthetic run of a *hard* block — a
+verified secret, a malicious package, a report-integrity failure — fails at the
+eligibility step exactly like a real one, before any of the above matters.
+
 ## Infrastructure
 
 **Per AWS account**, shared by every repo:

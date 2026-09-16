@@ -28,6 +28,19 @@ between:
 Each link is an assertion that fails closed, not a convention. Remove any one of
 them and "we scanned it" stops implying "we shipped it".
 
+**The canonical caller that wires this up is
+[`examples/container-ecr/deploy.yml`](../examples/container-ecr/deploy.yml).**
+It is the `delivery` phase: the PR caller (`security.yml`) proves the source and
+pre-push image controls, and this one proves registry collection, the artifact
+gate, and the deploy. Copy it rather than assembling the chain by hand — every
+link above is one `with:` line in that file, and a missing one is a silent
+weakening rather than an error.
+
+Note how the credentials are split across jobs there: the build holds none, the
+collector holds only the push+scan role, the artifact gate holds none, and the
+deploy holds only SSM. Collapsing those into one privileged job would put
+untrusted build code in the same process as deploy credentials.
+
 ## Why two roles, not one
 
 | Role | Assumed by | Holds |
