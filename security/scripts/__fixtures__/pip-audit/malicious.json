@@ -1,0 +1,16 @@
+{
+  "dependencies": [
+    {
+      "name": "fabrice",
+      "version": "1.0.0",
+      "vulns": [
+        {
+          "id": "MAL-2024-10573",
+          "fix_versions": [],
+          "aliases": [],
+          "description": "Malicious PyPI package (typosquat) — blocks regardless of severity."
+        }
+      ]
+    }
+  ]
+}

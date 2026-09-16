@@ -1,0 +1,650 @@
+{
+  "imageScanFindings": {
+    "enhancedFindings": [
+      {
+        "awsAccountId": "123456789012",
+        "description": "Issue summary: OpenSSL CMP response validation passed an unexpected response sender distinguished name directly as the format string to `ERR_raise_data()`.\n\nImpact summary: A malicious or intercepted CMP endpoint can crash a CMP client that enforces an expected sender or uses a pinned server certificate whose subject becomes the default expected sender.\n\nCWE: CWE-134 (Use of Externally-Controlled Format String)\n\nDescription: When validating a received CMP message, ossl_cmp_msg_check_update() converts the peer-supplied sender distinguished name with X509_NAME_oneline() and passes it directly as the format argument to ERR_raise_data(). Percent characters survive the conversion, so a sender DN such as \"CN=%s%n\" reaches BIO_vsnprintf() as an attacker-controlled format string with no matching variadic arguments. This path is only reached when the caller configures an expected sender or pins a server certificate, which is the normal configuration for a CMP client validating server responses.\n\nSince the attacker con",
+        "findingArn": "arn:aws:inspector2:us-east-1:123456789012:finding/2f99e6521757dbffe0636f29311ca84f",
+        "firstObservedAt": "2026-09-13T07:13:06.872000+00:00",
+        "lastObservedAt": "2026-09-13T07:13:06.872000+00:00",
+        "packageVulnerabilityDetails": {
+          "cvss": [
+            {
+              "baseScore": 9.8,
+              "scoringVector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+              "source": "NVD",
+              "version": "3.1"
+            }
+          ],
+          "referenceUrls": [
+            "https://nvd.nist.gov/vuln/detail/CVE-2026-63073",
+            "https://openssl-library.org/news/secadv/20260825.txt",
+            "https://github.com/openssl/openssl/commit/6a0acc072b4d37a7cac1252a29c1ce1f00c5ec29",
+            "https://github.com/openssl/openssl/commit/a7e5a6eea8fd3ccca6b6fbba031a5fbf8a3d93b4",
+            "https://github.com/openssl/openssl/commit/7eb2e3ec9d1d4f35c8022fccd4b03398b3f33e21",
+            "https://github.com/openssl/openssl/commit/0cc20b322639919aa423e90799d9a57c3b4b76ca"
+          ],
+          "relatedVulnerabilities": [],
+          "source": "NVD",
+          "sourceUrl": "https://nvd.nist.gov/vuln/detail/CVE-2026-63073",
+          "vendorCreatedAt": "2026-08-25T13:19:26+00:00",
+          "vendorSeverity": "CRITICAL",
+          "vendorUpdatedAt": "2026-09-11T21:16:45+00:00",
+          "vulnerabilityId": "CVE-2026-63073",
+          "vulnerablePackages": [
+            {
+              "epoch": 0,
+              "filePath": "/usr/local/include/node/openssl/archs/linux-x86_64/asm/include/openssl/opensslv.h",
+              "name": "openssl/openssl",
+              "packageManager": "GENERIC",
+              "sourceLayerHash": "sha256:5654eeaf04645c03fadc59bca7835753203d173222ab6ad8729f75b3dde98784",
+              "version": "3.5.7",
+              "fixedInVersion": "4.0.2"
+            },
+            {
+              "epoch": 0,
+              "filePath": "/usr/local/include/node/openssl/archs/linux-x86_64/asm_avx2/include/openssl/opensslv.h",
+              "name": "openssl/openssl",
+              "packageManager": "GENERIC",
+              "sourceLayerHash": "sha256:5654eeaf04645c03fadc59bca7835753203d173222ab6ad8729f75b3dde98784",
+              "version": "3.5.7",
+              "fixedInVersion": "4.0.2"
+            },
+            {
+              "epoch": 0,
+              "filePath": "/usr/local/include/node/openssl/archs/linux-x86_64/no-asm/include/openssl/opensslv.h",
+              "name": "openssl/openssl",
+              "packageManager": "GENERIC",
+              "sourceLayerHash": "sha256:5654eeaf04645c03fadc59bca7835753203d173222ab6ad8729f75b3dde98784",
+              "version": "3.5.7",
+              "fixedInVersion": "4.0.2"
+            }
+          ]
+        },
+        "remediation": {
+          "recommendation": {
+            "text": "None Provided"
+          }
+        },
+        "resources": [
+          {
+            "details": {
+              "awsEcrContainerImage": {
+                "architecture": "amd64",
+                "imageHash": "sha256:7bb2656c990a9e3c82aa44a28bee2ee14fbcabbc9cf30c642f5c79f112b7b7d1",
+                "imageTags": [
+                  "f94725060803c8eb1077972e72329db89a8ebec9",
+                  "demo"
+                ],
+                "platform": "ALPINE_LINUX_3_24",
+                "pushedAt": "2026-09-13T07:12:54.251000+00:00",
+                "registry": "123456789012",
+                "repositoryName": "secure-software-delivery"
+              }
+            },
+            "id": "arn:aws:ecr:us-east-1:123456789012:repository/secure-software-delivery/sha256:7bb2656c990a9e3c82aa44a28bee2ee14fbcabbc9cf30c642f5c79f112b7b7d1",
+            "tags": {},
+            "type": "AWS_ECR_CONTAINER_IMAGE"
+          }
+        ],
+        "score": 9.8,
+        "scoreDetails": {
+          "cvss": {
+            "adjustments": [],
+            "score": 9.8,
+            "scoreSource": "NVD",
+            "scoringVector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+            "version": "3.1"
+          }
+        },
+        "severity": "CRITICAL",
+        "status": "ACTIVE",
+        "title": "CVE-2026-63073 - openssl/openssl, openssl/openssl and 1 more",
+        "type": "PACKAGE_VULNERABILITY",
+        "updatedAt": "2026-09-13T07:13:06.872000+00:00",
+        "fixAvailable": "YES",
+        "exploitAvailable": "NO"
+      },
+      {
+        "awsAccountId": "123456789012",
+        "description": "Issue summary: The OpenSSL Certificate Management Protocol (CMP) caches additional certificates (extraCerts) sent in a CMP message, but never expunges them (for instance if they are invalid). If a server reuses an OSSL_CMP_CTX frequently, this cache of extraCerts may grow unboundedly, and a malicious client may flood a CMP server with requests driving this growth.\n\nImpact summary: Users utilizing a CMP server that reuses a single OSSL_CMP_CTX for the lifetime of a server process may observe unbounded memory growth in the event a malicious client repeatedly sends requests containing unique extra certificates, which may lead to OOM conditions.\n\nCWE: CWE-770: Allocation of Resources Without Limits or Throttling\n\nDescription: If a remote user sends CMP messages to a server with a list of extraCerts and the message is rejected, the extraCerts from the message remains in the server contexts untrusted certificate stack. This exposes servers with long lived ctx objects to Denial of Service attacks in which an attacke",
+        "findingArn": "arn:aws:inspector2:us-east-1:123456789012:finding/973dc517fd814919e0400a2fde3ecd00",
+        "firstObservedAt": "2026-09-13T07:13:06.872000+00:00",
+        "lastObservedAt": "2026-09-13T07:13:06.872000+00:00",
+        "packageVulnerabilityDetails": {
+          "cvss": [
+            {
+              "baseScore": 5.9,
+              "scoringVector": "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:N/I:N/A:H",
+              "source": "NVD",
+              "version": "3.1"
+            }
+          ],
+          "referenceUrls": [
+            "https://github.com/openssl/openssl/commit/75360af9650d4e0c82ba0050c5c9912cd79e54af",
+            "https://openssl-library.org/news/secadv/20260825.txt",
+            "https://nvd.nist.gov/vuln/detail/CVE-2026-63074",
+            "https://github.com/openssl/openssl/commit/74ae7f6df47a5767c1010b88c47507dfc5b32c46",
+            "https://github.com/openssl/openssl/commit/21a5d9658b0c66daace60e10ea18ff32a448de9f",
+            "https://github.com/openssl/openssl/commit/f636f9ca0fa1bae5b42f9e787f025c96fb09c43a",
+            "https://github.com/openssl/openssl/commit/01e567978a55fba18142a230380c31296049fae7"
+          ],
+          "relatedVulnerabilities": [],
+          "source": "NVD",
+          "sourceUrl": "https://nvd.nist.gov/vuln/detail/CVE-2026-63074",
+          "vendorCreatedAt": "2026-08-25T13:19:26+00:00",
+          "vendorSeverity": "MEDIUM",
+          "vendorUpdatedAt": "2026-09-11T21:16:58+00:00",
+          "vulnerabilityId": "CVE-2026-63074",
+          "vulnerablePackages": [
+            {
+              "epoch": 0,
+              "filePath": "/usr/local/include/node/openssl/archs/linux-x86_64/asm/include/openssl/opensslv.h",
+              "name": "openssl/openssl",
+              "packageManager": "GENERIC",
+              "sourceLayerHash": "sha256:5654eeaf04645c03fadc59bca7835753203d173222ab6ad8729f75b3dde98784",
+              "version": "3.5.7",
+              "fixedInVersion": "4.0.2"
+            },
+            {
+              "epoch": 0,
+              "filePath": "/usr/local/include/node/openssl/archs/linux-x86_64/asm_avx2/include/openssl/opensslv.h",
+              "name": "openssl/openssl",
+              "packageManager": "GENERIC",
+              "sourceLayerHash": "sha256:5654eeaf04645c03fadc59bca7835753203d173222ab6ad8729f75b3dde98784",
+              "version": "3.5.7",
+              "fixedInVersion": "4.0.2"
+            },
+            {
+              "epoch": 0,
+              "filePath": "/usr/local/include/node/openssl/archs/linux-x86_64/no-asm/include/openssl/opensslv.h",
+              "name": "openssl/openssl",
+              "packageManager": "GENERIC",
+              "sourceLayerHash": "sha256:5654eeaf04645c03fadc59bca7835753203d173222ab6ad8729f75b3dde98784",
+              "version": "3.5.7",
+              "fixedInVersion": "4.0.2"
+            }
+          ]
+        },
+        "remediation": {
+          "recommendation": {
+            "text": "None Provided"
+          }
+        },
+        "resources": [
+          {
+            "details": {
+              "awsEcrContainerImage": {
+                "architecture": "amd64",
+                "imageHash": "sha256:7bb2656c990a9e3c82aa44a28bee2ee14fbcabbc9cf30c642f5c79f112b7b7d1",
+                "imageTags": [
+                  "f94725060803c8eb1077972e72329db89a8ebec9",
+                  "demo"
+                ],
+                "platform": "ALPINE_LINUX_3_24",
+                "pushedAt": "2026-09-13T07:12:54.251000+00:00",
+                "registry": "123456789012",
+                "repositoryName": "secure-software-delivery"
+              }
+            },
+            "id": "arn:aws:ecr:us-east-1:123456789012:repository/secure-software-delivery/sha256:7bb2656c990a9e3c82aa44a28bee2ee14fbcabbc9cf30c642f5c79f112b7b7d1",
+            "tags": {},
+            "type": "AWS_ECR_CONTAINER_IMAGE"
+          }
+        ],
+        "score": 5.9,
+        "scoreDetails": {
+          "cvss": {
+            "adjustments": [],
+            "score": 5.9,
+            "scoreSource": "NVD",
+            "scoringVector": "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:N/I:N/A:H",
+            "version": "3.1"
+          }
+        },
+        "severity": "MEDIUM",
+        "status": "ACTIVE",
+        "title": "CVE-2026-63074 - openssl/openssl, openssl/openssl and 1 more",
+        "type": "PACKAGE_VULNERABILITY",
+        "updatedAt": "2026-09-13T07:13:06.872000+00:00",
+        "fixAvailable": "YES",
+        "exploitAvailable": "NO"
+      },
+      {
+        "awsAccountId": "123456789012",
+        "description": "Issue summary: In a server or client configuration with RFC7250 Raw Public Keys (RPKs) enabled, and only the private key (with no associated certificate) configured locally, a NULL pointer dereference may occur when the remote peer solicits raw public keys and also sends the typically omitted \"signature_algorithms_cert\" TLS extension.\n\nImpact summary: The impact is limited to a possible Denial of Service as a result of an application abort, no data disclosure or remote command execution are possible.\n\nCWE: CWE-476: NULL Pointer Dereference\n\nDescription: While a passing comment in sample code in the documentation suggests that key-only RPK configurations are supported, the best-practice RPK configuration is to always configure a corresponding certificate (possibly self-signed or signed by any convenient CA).\n\nWhen the private key is configured along with a matching certificate, the \"signature_algorithms_cert\" extension is handled reliably even without the fix, and peer clients or servers that don't support raw",
+        "findingArn": "arn:aws:inspector2:us-east-1:123456789012:finding/ac1e3566091e378d66661969c576e071",
+        "firstObservedAt": "2026-09-13T07:13:06.872000+00:00",
+        "lastObservedAt": "2026-09-13T07:13:06.872000+00:00",
+        "packageVulnerabilityDetails": {
+          "cvss": [
+            {
+              "baseScore": 7.5,
+              "scoringVector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H",
+              "source": "NVD",
+              "version": "3.1"
+            }
+          ],
+          "referenceUrls": [
+            "https://github.com/openssl/openssl/commit/d0af20478688a6aa2f59d61caa3f82136b181d7f",
+            "https://openssl-library.org/news/secadv/20260825.txt",
+            "https://github.com/openssl/openssl/commit/dad836b071da6579510c968615848ba03cac593b",
+            "https://github.com/openssl/openssl/commit/1e8c398db67404babd3e5af999bb6bd86f720c76",
+            "https://nvd.nist.gov/vuln/detail/CVE-2026-14457",
+            "https://github.com/openssl/openssl/commit/581aaa0f0a35d214740f0fe1f5283ec41f1212e1"
+          ],
+          "relatedVulnerabilities": [],
+          "source": "NVD",
+          "sourceUrl": "https://nvd.nist.gov/vuln/detail/CVE-2026-14457",
+          "vendorCreatedAt": "2026-08-25T13:17:49+00:00",
+          "vendorSeverity": "HIGH",
+          "vendorUpdatedAt": "2026-09-11T21:14:35+00:00",
+          "vulnerabilityId": "CVE-2026-14457",
+          "vulnerablePackages": [
+            {
+              "epoch": 0,
+              "filePath": "/usr/local/include/node/openssl/archs/linux-x86_64/asm/include/openssl/opensslv.h",
+              "name": "openssl/openssl",
+              "packageManager": "GENERIC",
+              "sourceLayerHash": "sha256:5654eeaf04645c03fadc59bca7835753203d173222ab6ad8729f75b3dde98784",
+              "version": "3.5.7",
+              "fixedInVersion": "4.0.2"
+            },
+            {
+              "epoch": 0,
+              "filePath": "/usr/local/include/node/openssl/archs/linux-x86_64/asm_avx2/include/openssl/opensslv.h",
+              "name": "openssl/openssl",
+              "packageManager": "GENERIC",
+              "sourceLayerHash": "sha256:5654eeaf04645c03fadc59bca7835753203d173222ab6ad8729f75b3dde98784",
+              "version": "3.5.7",
+              "fixedInVersion": "4.0.2"
+            },
+            {
+              "epoch": 0,
+              "filePath": "/usr/local/include/node/openssl/archs/linux-x86_64/no-asm/include/openssl/opensslv.h",
+              "name": "openssl/openssl",
+              "packageManager": "GENERIC",
+              "sourceLayerHash": "sha256:5654eeaf04645c03fadc59bca7835753203d173222ab6ad8729f75b3dde98784",
+              "version": "3.5.7",
+              "fixedInVersion": "4.0.2"
+            }
+          ]
+        },
+        "remediation": {
+          "recommendation": {
+            "text": "None Provided"
+          }
+        },
+        "resources": [
+          {
+            "details": {
+              "awsEcrContainerImage": {
+                "architecture": "amd64",
+                "imageHash": "sha256:7bb2656c990a9e3c82aa44a28bee2ee14fbcabbc9cf30c642f5c79f112b7b7d1",
+                "imageTags": [
+                  "f94725060803c8eb1077972e72329db89a8ebec9",
+                  "demo"
+                ],
+                "platform": "ALPINE_LINUX_3_24",
+                "pushedAt": "2026-09-13T07:12:54.251000+00:00",
+                "registry": "123456789012",
+                "repositoryName": "secure-software-delivery"
+              }
+            },
+            "id": "arn:aws:ecr:us-east-1:123456789012:repository/secure-software-delivery/sha256:7bb2656c990a9e3c82aa44a28bee2ee14fbcabbc9cf30c642f5c79f112b7b7d1",
+            "tags": {},
+            "type": "AWS_ECR_CONTAINER_IMAGE"
+          }
+        ],
+        "score": 7.5,
+        "scoreDetails": {
+          "cvss": {
+            "adjustments": [],
+            "score": 7.5,
+            "scoreSource": "NVD",
+            "scoringVector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H",
+            "version": "3.1"
+          }
+        },
+        "severity": "HIGH",
+        "status": "ACTIVE",
+        "title": "CVE-2026-14457 - openssl/openssl, openssl/openssl and 1 more",
+        "type": "PACKAGE_VULNERABILITY",
+        "updatedAt": "2026-09-13T07:13:06.872000+00:00",
+        "fixAvailable": "YES",
+        "exploitAvailable": "NO"
+      },
+      {
+        "awsAccountId": "123456789012",
+        "description": "Issue summary: When OpenSSL processes QUIC traffic from a peer that repeatedly sends ack-eliciting packets while not acknowledging ACK-only responses, the QUIC stack can retain ACK-only packet metadata for the lifetime of the connection.\n\nImpact summary: A remote peer that can complete a QUIC handshake can cause connection-scoped memory growth which may lead to Denial of Service through memory exhaustion, especially with sustained traffic or many concurrent QUIC connections.\n\nCWE: CWE-770: Allocation of Resources Without Limits or Throttling\n\nDescription: When the OpenSSL QUIC stack sends an ACK-only packet, there is no requirement by the QUIC protocol that the peer will acknowledge that ACK-only packet (i.e. it is itself not ack-eliciting). However, the OpenSSL implementation stores the metadata about the ACK frames regardless. In and of itself that's ok, but if a malicious peer establishes a connection, and then drives the connection such that ACK-only packets are forced from the OpenSSL implementation peer",
+        "findingArn": "arn:aws:inspector2:us-east-1:123456789012:finding/adfa27e0d8d312e089b4fd101b626120",
+        "firstObservedAt": "2026-09-13T07:13:06.872000+00:00",
+        "lastObservedAt": "2026-09-13T07:13:06.872000+00:00",
+        "packageVulnerabilityDetails": {
+          "cvss": [
+            {
+              "baseScore": 7.5,
+              "scoringVector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H",
+              "source": "NVD",
+              "version": "3.1"
+            }
+          ],
+          "referenceUrls": [
+            "https://openssl-library.org/news/secadv/20260825.txt",
+            "https://nvd.nist.gov/vuln/detail/CVE-2026-63075",
+            "https://github.com/openssl/openssl/commit/bf84721c2548351176e367e6de505792f0118dc6",
+            "https://github.com/openssl/openssl/commit/7308946576b12e64b8be53bcf0a120354b2b42bc",
+            "https://github.com/openssl/openssl/commit/7c98d79738549df92868e7dd9be4bbf061eed709",
+            "https://github.com/openssl/openssl/commit/c902e5f16d6a9e130e96d3ca6d8f64d71652e393"
+          ],
+          "relatedVulnerabilities": [],
+          "source": "NVD",
+          "sourceUrl": "https://nvd.nist.gov/vuln/detail/CVE-2026-63075",
+          "vendorCreatedAt": "2026-08-25T13:19:26+00:00",
+          "vendorSeverity": "HIGH",
+          "vendorUpdatedAt": "2026-09-11T21:17:05+00:00",
+          "vulnerabilityId": "CVE-2026-63075",
+          "vulnerablePackages": [
+            {
+              "epoch": 0,
+              "filePath": "/usr/local/include/node/openssl/archs/linux-x86_64/asm/include/openssl/opensslv.h",
+              "name": "openssl/openssl",
+              "packageManager": "GENERIC",
+              "sourceLayerHash": "sha256:5654eeaf04645c03fadc59bca7835753203d173222ab6ad8729f75b3dde98784",
+              "version": "3.5.7",
+              "fixedInVersion": "4.0.2"
+            },
+            {
+              "epoch": 0,
+              "filePath": "/usr/local/include/node/openssl/archs/linux-x86_64/asm_avx2/include/openssl/opensslv.h",
+              "name": "openssl/openssl",
+              "packageManager": "GENERIC",
+              "sourceLayerHash": "sha256:5654eeaf04645c03fadc59bca7835753203d173222ab6ad8729f75b3dde98784",
+              "version": "3.5.7",
+              "fixedInVersion": "4.0.2"
+            },
+            {
+              "epoch": 0,
+              "filePath": "/usr/local/include/node/openssl/archs/linux-x86_64/no-asm/include/openssl/opensslv.h",
+              "name": "openssl/openssl",
+              "packageManager": "GENERIC",
+              "sourceLayerHash": "sha256:5654eeaf04645c03fadc59bca7835753203d173222ab6ad8729f75b3dde98784",
+              "version": "3.5.7",
+              "fixedInVersion": "4.0.2"
+            }
+          ]
+        },
+        "remediation": {
+          "recommendation": {
+            "text": "None Provided"
+          }
+        },
+        "resources": [
+          {
+            "details": {
+              "awsEcrContainerImage": {
+                "architecture": "amd64",
+                "imageHash": "sha256:7bb2656c990a9e3c82aa44a28bee2ee14fbcabbc9cf30c642f5c79f112b7b7d1",
+                "imageTags": [
+                  "f94725060803c8eb1077972e72329db89a8ebec9",
+                  "demo"
+                ],
+                "platform": "ALPINE_LINUX_3_24",
+                "pushedAt": "2026-09-13T07:12:54.251000+00:00",
+                "registry": "123456789012",
+                "repositoryName": "secure-software-delivery"
+              }
+            },
+            "id": "arn:aws:ecr:us-east-1:123456789012:repository/secure-software-delivery/sha256:7bb2656c990a9e3c82aa44a28bee2ee14fbcabbc9cf30c642f5c79f112b7b7d1",
+            "tags": {},
+            "type": "AWS_ECR_CONTAINER_IMAGE"
+          }
+        ],
+        "score": 7.5,
+        "scoreDetails": {
+          "cvss": {
+            "adjustments": [],
+            "score": 7.5,
+            "scoreSource": "NVD",
+            "scoringVector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H",
+            "version": "3.1"
+          }
+        },
+        "severity": "HIGH",
+        "status": "ACTIVE",
+        "title": "CVE-2026-63075 - openssl/openssl, openssl/openssl and 1 more",
+        "type": "PACKAGE_VULNERABILITY",
+        "updatedAt": "2026-09-13T07:13:06.872000+00:00",
+        "fixAvailable": "YES",
+        "exploitAvailable": "NO"
+      },
+      {
+        "awsAccountId": "123456789012",
+        "description": "Issue summary: Receiving a DTLS record for a future epoch while a handshake is in progress causes OpenSSL to buffer far more memory than the record itself requires.\n\nImpact summary: A peer can use a small amount of network traffic to make an OpenSSL DTLS endpoint retain a disproportionately large amount of memory, which may lead to a Denial of Service.\n\nCWE: CWE-405: Asymmetric Resource Consumption (Amplification)\n\nDescription: While a DTLS handshake is in progress, a peer may legitimately have already moved on to the next epoch (for example, having sent its ChangeCipherSpec and Finished messages) before the local endpoint has processed the same transition, typically because of reordering on the underlying UDP transport. OpenSSL buffers such early records so that they can be processed once the local endpoint catches up.\n\nBuffering a record currently retains the entire read buffer it arrived in, which is sized to hold the largest possible DTLS record (around 16 kilobytes), rather than just the bytes that make ",
+        "findingArn": "arn:aws:inspector2:us-east-1:123456789012:finding/b3856e4c02c66c34d08d04175a425e94",
+        "firstObservedAt": "2026-09-13T07:13:06.872000+00:00",
+        "lastObservedAt": "2026-09-13T07:13:06.872000+00:00",
+        "packageVulnerabilityDetails": {
+          "cvss": [
+            {
+              "baseScore": 7.5,
+              "scoringVector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H",
+              "source": "NVD",
+              "version": "3.1"
+            }
+          ],
+          "referenceUrls": [
+            "https://openssl-library.org/news/secadv/20260825.txt",
+            "https://github.com/openssl/openssl/commit/a0c8ec557d9cac078f032d76cdf684fe743eb382",
+            "https://github.com/openssl/openssl/commit/cc0c6710917cd5eec001b297355d2ba723505107",
+            "https://github.com/openssl/openssl/commit/7110cb2f75806d0bf809eb2f90790d477900be40",
+            "https://nvd.nist.gov/vuln/detail/CVE-2026-54874",
+            "https://github.com/openssl/openssl/commit/f52ffc11b90737ac89083909618dc2e1f42c561c",
+            "https://github.com/openssl/openssl/commit/4808b5d64176451f3d93d87d0ac9c81a9b13fb23"
+          ],
+          "relatedVulnerabilities": [],
+          "source": "NVD",
+          "sourceUrl": "https://nvd.nist.gov/vuln/detail/CVE-2026-54874",
+          "vendorCreatedAt": "2026-08-25T13:19:24+00:00",
+          "vendorSeverity": "HIGH",
+          "vendorUpdatedAt": "2026-09-11T21:16:28+00:00",
+          "vulnerabilityId": "CVE-2026-54874",
+          "vulnerablePackages": [
+            {
+              "epoch": 0,
+              "filePath": "/usr/local/include/node/openssl/archs/linux-x86_64/asm/include/openssl/opensslv.h",
+              "name": "openssl/openssl",
+              "packageManager": "GENERIC",
+              "sourceLayerHash": "sha256:5654eeaf04645c03fadc59bca7835753203d173222ab6ad8729f75b3dde98784",
+              "version": "3.5.7",
+              "fixedInVersion": "4.0.2"
+            },
+            {
+              "epoch": 0,
+              "filePath": "/usr/local/include/node/openssl/archs/linux-x86_64/asm_avx2/include/openssl/opensslv.h",
+              "name": "openssl/openssl",
+              "packageManager": "GENERIC",
+              "sourceLayerHash": "sha256:5654eeaf04645c03fadc59bca7835753203d173222ab6ad8729f75b3dde98784",
+              "version": "3.5.7",
+              "fixedInVersion": "4.0.2"
+            },
+            {
+              "epoch": 0,
+              "filePath": "/usr/local/include/node/openssl/archs/linux-x86_64/no-asm/include/openssl/opensslv.h",
+              "name": "openssl/openssl",
+              "packageManager": "GENERIC",
+              "sourceLayerHash": "sha256:5654eeaf04645c03fadc59bca7835753203d173222ab6ad8729f75b3dde98784",
+              "version": "3.5.7",
+              "fixedInVersion": "4.0.2"
+            }
+          ]
+        },
+        "remediation": {
+          "recommendation": {
+            "text": "None Provided"
+          }
+        },
+        "resources": [
+          {
+            "details": {
+              "awsEcrContainerImage": {
+                "architecture": "amd64",
+                "imageHash": "sha256:7bb2656c990a9e3c82aa44a28bee2ee14fbcabbc9cf30c642f5c79f112b7b7d1",
+                "imageTags": [
+                  "f94725060803c8eb1077972e72329db89a8ebec9",
+                  "demo"
+                ],
+                "platform": "ALPINE_LINUX_3_24",
+                "pushedAt": "2026-09-13T07:12:54.251000+00:00",
+                "registry": "123456789012",
+                "repositoryName": "secure-software-delivery"
+              }
+            },
+            "id": "arn:aws:ecr:us-east-1:123456789012:repository/secure-software-delivery/sha256:7bb2656c990a9e3c82aa44a28bee2ee14fbcabbc9cf30c642f5c79f112b7b7d1",
+            "tags": {},
+            "type": "AWS_ECR_CONTAINER_IMAGE"
+          }
+        ],
+        "score": 7.5,
+        "scoreDetails": {
+          "cvss": {
+            "adjustments": [],
+            "score": 7.5,
+            "scoreSource": "NVD",
+            "scoringVector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H",
+            "version": "3.1"
+          }
+        },
+        "severity": "HIGH",
+        "status": "ACTIVE",
+        "title": "CVE-2026-54874 - openssl/openssl, openssl/openssl and 1 more",
+        "type": "PACKAGE_VULNERABILITY",
+        "updatedAt": "2026-09-13T07:13:06.872000+00:00",
+        "fixAvailable": "YES",
+        "exploitAvailable": "NO"
+      },
+      {
+        "awsAccountId": "123456789012",
+        "description": "Issue summary: OpenSSL CMP password based protection verification only checks whether the protectionAlg parameter was not NULL and not its ASN.1 type, before treating it as a PBMParameter. A crafted message can contain a parameter of a different type, which is then dereferenced as an invalid pointer.\n\nImpact summary: A remote, unauthenticated attacker can crash an application acting as a CMP server that accepts PBM-protected messages, or a CMP client talking to a malicious or intercepted CMP server, resulting in a Denial of Service.\n\nCWE: CWE-476: NULL Pointer Dereference\n\nDescription: When verifying the password-based MAC protection of a CMP message, OpenSSL library reads the protectionAlg algorithm parameter with X509_ALGOR_get0(), which returns both the parameter type and its value pointer. The value is then cast to an ASN1_STRING and treated as the expected PBMParameter after only checking that pointer is not NULL. The parameter type returned by X509_ALGOR_get0() was never consulted.\n\nThis happens during ",
+        "findingArn": "arn:aws:inspector2:us-east-1:123456789012:finding/f648c66c1dd15629d6accbacc16cf507",
+        "firstObservedAt": "2026-09-13T07:13:06.872000+00:00",
+        "lastObservedAt": "2026-09-13T07:13:06.872000+00:00",
+        "packageVulnerabilityDetails": {
+          "cvss": [
+            {
+              "baseScore": 7.5,
+              "scoringVector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H",
+              "source": "NVD",
+              "version": "3.1"
+            }
+          ],
+          "referenceUrls": [
+            "https://github.com/openssl/openssl/commit/a1f348ccb328c3afbd4ba6883f9b7c813c043259",
+            "https://openssl-library.org/news/secadv/20260825.txt",
+            "https://github.com/openssl/openssl/commit/a7af46a92d0ce19a90e669ef56d2576a07924226",
+            "https://github.com/openssl/openssl/commit/a17cc8d612ecff6d94a9b7ca8b5283ddf5ff570e",
+            "https://github.com/openssl/openssl/commit/37882aa2e0256e1072442a8f62f7db45b995c45b",
+            "https://nvd.nist.gov/vuln/detail/CVE-2026-63076",
+            "https://github.com/openssl/openssl/commit/cdacfff557389abfa9e4615abded2ec984517d6c"
+          ],
+          "relatedVulnerabilities": [],
+          "source": "NVD",
+          "sourceUrl": "https://nvd.nist.gov/vuln/detail/CVE-2026-63076",
+          "vendorCreatedAt": "2026-08-25T13:19:26+00:00",
+          "vendorSeverity": "HIGH",
+          "vendorUpdatedAt": "2026-09-11T21:17:12+00:00",
+          "vulnerabilityId": "CVE-2026-63076",
+          "vulnerablePackages": [
+            {
+              "epoch": 0,
+              "filePath": "/usr/local/include/node/openssl/archs/linux-x86_64/asm/include/openssl/opensslv.h",
+              "name": "openssl/openssl",
+              "packageManager": "GENERIC",
+              "sourceLayerHash": "sha256:5654eeaf04645c03fadc59bca7835753203d173222ab6ad8729f75b3dde98784",
+              "version": "3.5.7",
+              "fixedInVersion": "4.0.2"
+            },
+            {
+              "epoch": 0,
+              "filePath": "/usr/local/include/node/openssl/archs/linux-x86_64/asm_avx2/include/openssl/opensslv.h",
+              "name": "openssl/openssl",
+              "packageManager": "GENERIC",
+              "sourceLayerHash": "sha256:5654eeaf04645c03fadc59bca7835753203d173222ab6ad8729f75b3dde98784",
+              "version": "3.5.7",
+              "fixedInVersion": "4.0.2"
+            },
+            {
+              "epoch": 0,
+              "filePath": "/usr/local/include/node/openssl/archs/linux-x86_64/no-asm/include/openssl/opensslv.h",
+              "name": "openssl/openssl",
+              "packageManager": "GENERIC",
+              "sourceLayerHash": "sha256:5654eeaf04645c03fadc59bca7835753203d173222ab6ad8729f75b3dde98784",
+              "version": "3.5.7",
+              "fixedInVersion": "4.0.2"
+            }
+          ]
+        },
+        "remediation": {
+          "recommendation": {
+            "text": "None Provided"
+          }
+        },
+        "resources": [
+          {
+            "details": {
+              "awsEcrContainerImage": {
+                "architecture": "amd64",
+                "imageHash": "sha256:7bb2656c990a9e3c82aa44a28bee2ee14fbcabbc9cf30c642f5c79f112b7b7d1",
+                "imageTags": [
+                  "f94725060803c8eb1077972e72329db89a8ebec9",
+                  "demo"
+                ],
+                "platform": "ALPINE_LINUX_3_24",
+                "pushedAt": "2026-09-13T07:12:54.251000+00:00",
+                "registry": "123456789012",
+                "repositoryName": "secure-software-delivery"
+              }
+            },
+            "id": "arn:aws:ecr:us-east-1:123456789012:repository/secure-software-delivery/sha256:7bb2656c990a9e3c82aa44a28bee2ee14fbcabbc9cf30c642f5c79f112b7b7d1",
+            "tags": {},
+            "type": "AWS_ECR_CONTAINER_IMAGE"
+          }
+        ],
+        "score": 7.5,
+        "scoreDetails": {
+          "cvss": {
+            "adjustments": [],
+            "score": 7.5,
+            "scoreSource": "NVD",
+            "scoringVector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H",
+            "version": "3.1"
+          }
+        },
+        "severity": "HIGH",
+        "status": "ACTIVE",
+        "title": "CVE-2026-63076 - openssl/openssl, openssl/openssl and 1 more",
+        "type": "PACKAGE_VULNERABILITY",
+        "updatedAt": "2026-09-13T07:13:06.872000+00:00",
+        "fixAvailable": "YES",
+        "exploitAvailable": "NO"
+      }
+    ],
+    "findings": [],
+    "imageScanCompletedAt": "2026-09-13T07:13:06.872000+00:00",
+    "vulnerabilitySourceUpdatedAt": "2026-09-13T07:13:06.872000+00:00",
+    "findingSeverityCounts": {
+      "HIGH": 4,
+      "MEDIUM": 1,
+      "CRITICAL": 1
+    }
+  },
+  "registryId": "123456789012",
+  "repositoryName": "secure-software-delivery",
+  "imageId": {
+    "imageDigest": "sha256:7bb2656c990a9e3c82aa44a28bee2ee14fbcabbc9cf30c642f5c79f112b7b7d1"
+  },
+  "imageScanStatus": {
+    "status": "COMPLETE",
+    "description": "The scan was completed successfully."
+  }
+}

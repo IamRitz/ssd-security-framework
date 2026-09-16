@@ -1,0 +1,113 @@
+# EXAMPLE CALLER — a Python service that builds a container but deploys through
+# a pipeline this framework does NOT own.
+#
+# Two things make this different from the container-ecr example:
+#
+#  1. `semgrep_configs` uses the Python pack. This is not cosmetic: running
+#     `p/javascript` against Python reports near-zero findings, which reads as a
+#     clean pass rather than a misconfiguration.
+#  2. `deploy_target: self-managed` and `registry: none`. The repo genuinely has
+#     a deploy, but not one this framework gates — so the gated-deploy control is
+#     N/A with that reason, rather than a gap or a fake pass.
+#
+# Dependency scanning needs no configuration: pip-audit runs from
+# requirements.txt, and OSV-Scanner covers poetry.lock / Pipfile.lock regardless.
+name: Security checks
+
+on:
+  pull_request:
+    branches:
+      - main
+  schedule:
+    - cron: '0 6 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  source-security:
+    uses: IamRitz/ssd-security-framework/.github/workflows/_source-security.yml@v1
+    permissions:
+      contents: read
+      pull-requests: write
+    with:
+      toolkit_ref: v1
+      gate_mode: ${{ vars.GATE_MODE || 'enforce' }}
+      semgrep_configs: |
+        p/owasp-top-ten
+        p/python
+      semgrep_paths: src
+      slack_notify_url: ${{ vars.SECURITY_NOTIFY_SLACK_URL }}
+
+  security-gate:
+    name: security-gate
+    needs: source-security
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report the source security verdict
+        env:
+          RESULT: ${{ needs.source-security.result }}
+          VERDICT: ${{ needs.source-security.outputs.verdict }}
+        run: |
+          echo "Source security verdict: ${VERDICT:-unknown} (job result: $RESULT)"
+          if [ "$RESULT" != "success" ]; then
+            exit 1
+          fi
+
+  container-build:
+    name: Container build
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          load: true
+          tags: your-python-app:${{ github.sha }}
+      - run: docker save -o application-image.tar "your-python-app:$GITHUB_SHA"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: application-image-${{ github.sha }}
+          path: application-image.tar
+          if-no-files-found: error
+          retention-days: 1
+
+  image-security:
+    # The image still gets scanned before it leaves CI, even though this
+    # framework never pushes or deploys it.
+    needs: container-build
+    if: github.event_name != 'schedule'
+    uses: IamRitz/ssd-security-framework/.github/workflows/_image-scan-prepush.yml@v1
+    permissions:
+      contents: read
+      pull-requests: write
+    with:
+      toolkit_ref: v1
+      image_artifact: application-image-${{ github.sha }}
+      gate_mode: ${{ vars.GATE_MODE || 'enforce' }}
+
+  conformance:
+    needs:
+      - source-security
+      - image-security
+    if: ${{ always() && github.event_name != 'schedule' }}
+    uses: IamRitz/ssd-security-framework/.github/workflows/_conformance.yml@v1
+    with:
+      toolkit_ref: v1
+      artifact_type: container
+      registry: none
+      deploy_target: self-managed
+      break_glass_enabled: false
+      observed: >-
+        {"secret-scan":{"status":"${{ needs.source-security.result }}"},
+         "dependency-scan":{"status":"${{ needs.source-security.result }}"},
+         "sast":{"status":"${{ needs.source-security.result }}"},
+         "source-gate":{"status":"${{ needs.source-security.result }}"},
+         "image-scan-prepush":{"status":"${{ needs.image-security.result }}"}}

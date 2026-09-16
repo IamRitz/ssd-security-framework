@@ -1,0 +1,1 @@
+aws: [ERROR]: An error occurred (ScanNotFoundException) when calling the DescribeImageScanFindings operation: Image scan does not exist for the image with '{imageDigest:'sha256:7bb2656c990a9e3c82aa44a28bee2ee14fbcabbc9cf30c642f5c79f112b7b7d1', imageTag:'null'}' in the repository with name 'secure-software-delivery' in the registry with id '123456789012'

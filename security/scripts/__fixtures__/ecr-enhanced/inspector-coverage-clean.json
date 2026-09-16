@@ -1,0 +1,44 @@
+{
+    "coveredResources": [
+        {
+            "resourceType": "AWS_ECR_CONTAINER_IMAGE",
+            "resourceId": "arn:aws:ecr:us-east-1:123456789012:repository/secure-software-delivery/sha256:c8646f70f38c9c74bb0e917656df2c8d2eb31d356c8eef6732082c19b907a487",
+            "accountId": "123456789012",
+            "scanType": "PACKAGE",
+            "scanStatus": {
+                "statusCode": "INACTIVE",
+                "reason": "SCAN_FREQUENCY_SCAN_ON_PUSH"
+            },
+            "resourceMetadata": {
+                "ecrRepository": {
+                    "name": "secure-software-delivery",
+                    "scanFrequency": "SCAN_ON_PUSH"
+                },
+                "ecrImage": {
+                    "tags": [
+                        "00842f90bd8561d7c7f16fa26420c2a7201464f0",
+                        "demo"
+                    ]
+                },
+                "containerImage": {
+                    "imageTags": [
+                        "00842f90bd8561d7c7f16fa26420c2a7201464f0",
+                        "demo"
+                    ]
+                },
+                "containerRepository": {
+                    "name": "secure-software-delivery",
+                    "scanFrequency": "SCAN_ON_PUSH"
+                },
+                "containerRegistry": {
+                    "name": "123456789012"
+                }
+            },
+            "lastScannedAt": "2026-09-14T10:49:40.375000+05:30",
+            "provider": "AWS",
+            "providerAccountId": "123456789012",
+            "providerRegion": "us-east-1",
+            "providerPartition": "aws"
+        }
+    ]
+}

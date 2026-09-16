@@ -1,0 +1,63 @@
+# POC defaults: intentionally simple and readable. Teams can adjust these
+# thresholds later; this demonstration does not need an enterprise policy engine.
+secrets:
+  verified: BLOCK
+  unverified: LOG
+  # Safe demo-only marker: never claim that a dummy value is provider-verified.
+  demo_dummy: BLOCK
+
+dependencies:
+  critical_with_fix: BLOCK
+  high_with_fix: BLOCK
+  critical_no_fix: EXCEPTION
+  high_no_fix: EXCEPTION
+  medium: LOG
+  low: LOG
+  malicious_package: BLOCK # regardless of severity
+
+sast:
+  critical_new: BLOCK
+  high_new: BLOCK
+  critical_existing: LOG # baseline-known; do not block existing backlog
+  high_existing: LOG
+  medium: LOG
+  low: LOG
+
+# Break-glass never changes the scanner policy above. It only identifies the
+# two BLOCK categories that may enter a separately authenticated approval flow.
+break_glass:
+  sast_new: ELIGIBLE
+  dependency_with_fix: ELIGIBLE
+  verified_secrets: NEVER
+  malicious_package: NEVER
+  report_integrity: NEVER
+
+image:
+  # Trivy pre-push scan reports fix availability, so it uses the same
+  # with_fix/no_fix model as dependencies: a fixable Critical/High blocks (a
+  # developer can act on it), an unfixable one is a tracked EXCEPTION rather than
+  # a permanent block waiting on an upstream patch.
+  critical_with_fix: BLOCK_DEPLOY
+  high_with_fix: BLOCK_DEPLOY
+  critical_no_fix: EXCEPTION
+  high_no_fix: EXCEPTION
+  # ECR BASIC scanning reports no fix availability, so it falls back to
+  # severity-only and conservatively blocks all Critical/High. ECR ENHANCED
+  # scanning (Amazon Inspector) does report it, and uses the with_fix/no_fix keys
+  # above exactly like Trivy. The asymmetry is a scanner limitation.
+  critical: BLOCK_DEPLOY
+  high: BLOCK_DEPLOY
+  medium: LOG
+  low: LOG
+
+severity_mapping:
+  # npm audit reports info/low/moderate/high/critical; the gate uses those values.
+  osv_cvss_thresholds:
+    critical: 9.0
+    high: 7.0
+    medium: 4.0
+    # Scores below 4.0 are low.
+  semgrep_severity:
+    ERROR: high
+    WARNING: medium
+    INFO: low

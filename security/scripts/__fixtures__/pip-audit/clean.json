@@ -1,0 +1,6 @@
+{
+  "dependencies": [
+    { "name": "requests", "version": "2.32.4", "vulns": [] },
+    { "name": "localpkg", "skip_reason": "Dependency not found on PyPI and could not be audited" }
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "name": "ssd-security-framework",
+  "version": "1.0.0",
+  "description": "Reusable CI/CD security workflows and the gate toolkit they run.",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test"
+  }
+}

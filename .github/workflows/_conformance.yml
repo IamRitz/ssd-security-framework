@@ -1,0 +1,208 @@
+name: Conformance (reusable)
+
+# Capability-aware conformance reporting.
+#
+# The other reusable workflows each answer "did this control pass?". This one
+# answers the question a reviewer actually asks: "which controls APPLY to this
+# repository, and what happened to each?"
+#
+# It exists because consumer repos differ in what they SHIP. A library has no
+# image to scan; a repo with its own delivery pipeline has no framework-gated
+# deploy. Reporting those as "skipped" is indistinguishable from a control
+# someone switched off, so every control resolves to exactly one of:
+#
+#   applied | not-applicable (with a reason) | exempt (owned, expiring) | failed
+#
+# CREDENTIAL BOUNDARY: assumes NO cloud role, accepts NO secrets.
+
+on:
+  workflow_call:
+    inputs:
+      artifact_type:
+        description: 'What this repository ships: container | archive | library | none.'
+        type: string
+        default: none
+      registry:
+        description: 'Where its artifact is published: ecr | none.'
+        type: string
+        default: none
+      deploy_target:
+        description: 'How it deploys: framework-gated | self-managed | none.'
+        type: string
+        default: none
+      break_glass_enabled:
+        description: Whether an approval channel is configured for this repository.
+        type: boolean
+        default: false
+      observed:
+        description: >-
+          JSON object mapping control id to {"status": "...", "evidence": "..."}. Callers
+          build this from their job results. A control that applies but is absent here is
+          reported FAILED: absence of evidence is not evidence the control ran.
+        type: string
+        required: true
+      exemptions_path:
+        description: >-
+          Consumer-owned JSON file of exemptions, each needing a control, reason, owner and
+          expiry. Absent file means no exemptions. An expired exemption grants nothing.
+        type: string
+        default: security/exemptions.json
+      gate_mode:
+        description: '`enforce` (a failed applicable control fails this job) or `log-only`.'
+        type: string
+        default: enforce
+      node_version:
+        description: Node version used to run the conformance script (tool dependency).
+        type: string
+        default: '24.21.0'
+      toolkit_repository:
+        description: Framework repository holding the conformance engine.
+        type: string
+        default: IamRitz/ssd-security-framework
+      toolkit_ref:
+        description: Ref of the framework repository the toolkit is loaded from.
+        type: string
+        default: v1
+      toolkit_path:
+        description: Escape hatch for a toolkit already vendored in the caller's checkout.
+        type: string
+        default: ''
+    outputs:
+      failed:
+        description: Number of applicable, non-exempt controls that did not pass.
+        value: ${{ jobs.conformance.outputs.failed }}
+      not_applicable:
+        description: Number of controls the declared capabilities exclude.
+        value: ${{ jobs.conformance.outputs.not_applicable }}
+      exempt:
+        description: Number of controls carrying a live exemption. This is debt, not coverage.
+        value: ${{ jobs.conformance.outputs.exempt }}
+
+permissions:
+  contents: read
+
+env:
+  SSD_REQUIRED_TOOLKIT_MAJOR: '1'
+
+jobs:
+  conformance:
+    name: conformance
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      failed: ${{ steps.report.outputs.failed }}
+      not_applicable: ${{ steps.report.outputs.not_applicable }}
+      exempt: ${{ steps.report.outputs.exempt }}
+    steps:
+      - name: Check out the consumer repository
+        # Only for the consumer-owned exemptions file.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check out the security framework toolkit
+        if: ${{ inputs.toolkit_path == '' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.toolkit_repository }}
+          ref: ${{ inputs.toolkit_ref }}
+          path: .ssd-toolkit-checkout
+          persist-credentials: false
+
+      - name: Place the toolkit outside the workspace
+        env:
+          VENDORED_PATH: ${{ inputs.toolkit_path }}
+          TOOLKIT_REF: ${{ inputs.toolkit_ref }}
+        run: |
+          set -euo pipefail
+          if [ -n "$VENDORED_PATH" ]; then
+            echo "SSD_TOOLKIT=$(cd "$VENDORED_PATH" && pwd)" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          test -n "$TOOLKIT_REF" || { echo "toolkit_ref is empty." >&2; exit 1; }
+          rm -rf "$RUNNER_TEMP/ssd-toolkit"
+          mv .ssd-toolkit-checkout "$RUNNER_TEMP/ssd-toolkit"
+          version="$(cat "$RUNNER_TEMP/ssd-toolkit/VERSION" 2>/dev/null || true)"
+          test -n "$version" || { echo "Toolkit checkout has no VERSION file." >&2; exit 1; }
+          major="${version#v}"; major="${major%%.*}"
+          [ "$major" = "$SSD_REQUIRED_TOOLKIT_MAJOR" ] || {
+            echo "Toolkit $version incompatible (needs major v${SSD_REQUIRED_TOOLKIT_MAJOR})." >&2
+            exit 1
+          }
+          echo "SSD_TOOLKIT=$RUNNER_TEMP/ssd-toolkit/security" >> "$GITHUB_ENV"
+          echo "Toolkit $version loaded."
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ inputs.node_version }}
+          package-manager-cache: false
+
+      - name: Build the conformance report
+        id: report
+        continue-on-error: true
+        env:
+          # Every caller-supplied value crosses into the shell as an environment
+          # variable, never by expression interpolation into the command line.
+          # Interpolation would splice the raw input text into the script before
+          # bash ever sees it, so a crafted input could run as shell.
+          OBSERVED: ${{ inputs.observed }}
+          EXEMPTIONS_PATH: ${{ inputs.exemptions_path }}
+          ARTIFACT_TYPE: ${{ inputs.artifact_type }}
+          REGISTRY: ${{ inputs.registry }}
+          DEPLOY_TARGET: ${{ inputs.deploy_target }}
+          BREAK_GLASS_ENABLED: ${{ inputs.break_glass_enabled }}
+        run: |
+          mkdir -p reports
+          set +e
+          node "$SSD_TOOLKIT/scripts/conformance.mjs" \
+            --artifact-type "$ARTIFACT_TYPE" \
+            --registry "$REGISTRY" \
+            --deploy-target "$DEPLOY_TARGET" \
+            --break-glass "$BREAK_GLASS_ENABLED" \
+            --exemptions "$EXEMPTIONS_PATH" \
+            --observed "$OBSERVED" \
+            --repository "$GITHUB_REPOSITORY" \
+            --output reports/conformance.json | tee "$GITHUB_STEP_SUMMARY"
+          status=${PIPESTATUS[0]}
+          set -e
+          # An unreadable report is a failure, not zero failures.
+          failed="$(node -e 'try{process.stdout.write(String(require("./reports/conformance.json").summary.failed))}catch{process.stdout.write("1")}')"
+          na="$(node -e 'try{process.stdout.write(String(require("./reports/conformance.json").summary.notApplicable))}catch{process.stdout.write("0")}')"
+          exempt="$(node -e 'try{process.stdout.write(String(require("./reports/conformance.json").summary.exempt))}catch{process.stdout.write("0")}')"
+          {
+            echo "failed=$failed"
+            echo "not_applicable=$na"
+            echo "exempt=$exempt"
+          } >> "$GITHUB_OUTPUT"
+          exit "$status"
+
+      - name: Upload the conformance report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: conformance-report
+          path: reports/conformance.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Enforce the conformance result
+        if: always()
+        env:
+          GATE_MODE: ${{ inputs.gate_mode }}
+          FAILED: ${{ steps.report.outputs.failed }}
+          EXEMPT: ${{ steps.report.outputs.exempt }}
+        run: |
+          if [ "${EXEMPT:-0}" != "0" ]; then
+            echo "::warning::${EXEMPT} control(s) are EXEMPT. That is accepted debt with an owner and an expiry, not coverage."
+          fi
+          if [ "$GATE_MODE" = "log-only" ]; then
+            echo "::warning::gate_mode=log-only — ${FAILED:-?} failed control(s) reported but NOT enforced."
+            exit 0
+          fi
+          if [ "${FAILED:-1}" != "0" ]; then
+            echo "${FAILED:-1} applicable control(s) did not pass." >&2
+            exit 1
+          fi
+          echo "Every applicable control passed."

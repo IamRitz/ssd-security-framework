@@ -1,0 +1,24 @@
+{
+  "imageScanStatus": {
+    "status": "COMPLETE"
+  },
+  "imageId": {
+    "imageDigest": "sha256:ecr-response"
+  },
+  "imageScanFindings": {
+    "findingSeverityCounts": {
+      "CRITICAL": 1,
+      "MEDIUM": 1
+    },
+    "findings": [
+      {
+        "name": "CVE-2099-CRITICAL",
+        "severity": "CRITICAL"
+      },
+      {
+        "name": "CVE-2099-MEDIUM",
+        "severity": "MEDIUM"
+      }
+    ]
+  }
+}

@@ -1,0 +1,54 @@
+name: Framework checks
+
+# The framework's own tests. These are the guards that keep the reusable
+# workflows honest — the credential boundary, the registry neutrality, and the
+# extraction itself (scripts loaded from the toolkit, toolkit moved out of the
+# scanned workspace).
+#
+# It also runs the consumer-isolation proof, which reproduces on the runner what
+# a consumer repo experiences: the toolkit somewhere else entirely, the consumer
+# holding none of it.
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Framework checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24.21.0'
+          package-manager-cache: false
+
+      - name: Toolkit and workflow tests
+        run: node --test
+
+      - name: Prove a consumer needs zero framework files
+        run: ./tools/verify-consumer-isolation.sh
+
+      - name: The toolkit must stay dependency-free
+        # Every script imports only Node builtins. That is what lets the toolkit
+        # be dropped into any consumer's runner with nothing installed, and it is
+        # why there is no lockfile here for a consumer's OSV scan to trip over.
+        run: |
+          if grep -rnE "^import .* from '(?!node:)[^.]" security/scripts --include='*.mjs' -P; then
+            echo "A toolkit script imports a third-party module; the toolkit must use Node builtins only." >&2
+            exit 1
+          fi
+          echo "Toolkit imports are Node builtins and relative paths only."

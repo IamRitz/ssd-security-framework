@@ -1,0 +1,30 @@
+# Security-owned paths — copy into a consumer repo as .github/CODEOWNERS
+#
+# WHY THIS MATTERS
+#
+# `gate_mode: log-only` makes the gate genuinely non-blocking, including for
+# report-integrity failures. Caller workflows are app-team-owned and edited by
+# ordinary pull request, so without this file a one-line change turns a red
+# required check green, reviewed by whoever normally reviews that repo's code.
+# That is an unreviewed path to bypassing the repo's own security gate.
+#
+# THIS FILE ALONE ENFORCES NOTHING. CODEOWNERS is advisory until branch
+# protection on the default branch enables "Require review from Code Owners"
+# with at least one required approval. See docs/onboarding.md § 1.4 and § 1.6.
+#
+# Own these with a TEAM, not an individual, so review does not depend on one
+# person being available.
+
+# Everything CI executes, including the framework ref and the gate mode.
+/.github/workflows/          @your-org/security-engineering
+/.github/CODEOWNERS          @your-org/security-engineering
+
+# The accepted-findings baseline. Whoever can rewrite this can accept any
+# finding permanently and silently.
+/security/baseline/          @your-org/security-engineering
+
+# Deliberate, owned, expiring exceptions.
+/security/exemptions.json    @your-org/security-engineering
+
+# Only if this repo overrides the framework's default policy.
+/security/policy.yaml        @your-org/security-engineering

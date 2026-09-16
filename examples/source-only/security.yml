@@ -1,0 +1,74 @@
+# EXAMPLE CALLER — a repo that ships NO container: a library, a static site, or
+# a Lambda zip built by a pipeline this framework does not own.
+#
+# This is the minimum viable adoption. It calls ONE reusable workflow, holds no
+# cloud credentials, and needs no AWS setup at all. Break-glass is off, so an
+# eligible BLOCK simply stays blocked.
+#
+# Note what is NOT here: no container-build, no image-security, no ECR. Those
+# controls are not skipped silently — the conformance job below declares
+# `artifact_type: library`, so they are reported N/A WITH A REASON.
+name: Security checks
+
+on:
+  pull_request:
+    branches:
+      - main
+  schedule:
+    - cron: '0 6 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  source-security:
+    uses: IamRitz/ssd-security-framework/.github/workflows/_source-security.yml@v1
+    permissions:
+      contents: read
+      pull-requests: write
+    with:
+      toolkit_ref: v1
+      # START HERE on a new repo. Move to `enforce` only after you have generated
+      # a Semgrep baseline — see docs/onboarding.md § rollout.
+      gate_mode: ${{ vars.GATE_MODE || 'log-only' }}
+      semgrep_configs: |
+        p/owasp-top-ten
+        p/javascript
+      semgrep_paths: src
+      slack_notify_url: ${{ vars.SECURITY_NOTIFY_SLACK_URL }}
+
+  security-gate:
+    name: security-gate
+    needs: source-security
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report the source security verdict
+        env:
+          RESULT: ${{ needs.source-security.result }}
+          VERDICT: ${{ needs.source-security.outputs.verdict }}
+          MODE: ${{ needs.source-security.outputs.gate_mode }}
+        run: |
+          echo "Source security verdict: ${VERDICT:-unknown} (job result: $RESULT)"
+          if [ "$MODE" = "log-only" ]; then
+            echo "::warning::GREEN BY CONFIGURATION, not by verdict — gate_mode is log-only."
+          fi
+          if [ "$RESULT" != "success" ]; then
+            exit 1
+          fi
+
+  conformance:
+    needs: source-security
+    if: ${{ always() }}
+    uses: IamRitz/ssd-security-framework/.github/workflows/_conformance.yml@v1
+    with:
+      toolkit_ref: v1
+      artifact_type: library
+      registry: none
+      deploy_target: none
+      break_glass_enabled: false
+      observed: >-
+        {"secret-scan":{"status":"${{ needs.source-security.result }}"},
+         "dependency-scan":{"status":"${{ needs.source-security.result }}"},
+         "sast":{"status":"${{ needs.source-security.result }}"},
+         "source-gate":{"status":"${{ needs.source-security.result }}"}}

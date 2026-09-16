@@ -1,0 +1,22 @@
+{
+  "version": "1.176.0",
+  "results": [
+    {
+      "check_id": "test.existing-critical",
+      "path": "src/legacy.js",
+      "start": {
+        "line": 21
+      },
+      "extra": {
+        "severity": "CRITICAL",
+        "lines": "dangerousLegacyCall();"
+      }
+    }
+  ],
+  "errors": [],
+  "paths": {
+    "scanned": [
+      "src/legacy.js"
+    ]
+  }
+}

@@ -1,0 +1,14 @@
+[
+  {
+    "control": "image-scan-prepush",
+    "reason": "Base image upgrade is blocked on the platform team's runtime rollout; tracked in PLAT-1421.",
+    "owner": "@your-org/platform-security",
+    "expires": "2026-12-31"
+  },
+  {
+    "control": "break-glass",
+    "reason": "No Slack workspace for this team yet. An eligible BLOCK stays blocked, which is accepted.",
+    "owner": "@your-org/security-engineering",
+    "expires": "2026-10-31"
+  }
+]

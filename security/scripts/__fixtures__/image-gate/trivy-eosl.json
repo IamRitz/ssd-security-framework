@@ -1,0 +1,8 @@
+{
+  "SchemaVersion": 2,
+  "CreatedAt": "2026-09-10T00:00:00Z",
+  "ArtifactType": "container_image",
+  "Metadata": { "ImageID": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+    "OS": { "Family": "debian", "Name": "9", "EOSL": true } },
+  "Results": [ { "Target": "debian", "Class": "os-pkgs", "Type": "debian", "Vulnerabilities": [] } ]
+}

@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "findings": [
+    {
+      "fingerprint": "a446efda0675fbda08886416ff9de3f43f930af306359b23721161dd6b8ada9a",
+      "checkId": "test.existing-critical",
+      "path": "src/legacy.js"
+    }
+  ]
+}

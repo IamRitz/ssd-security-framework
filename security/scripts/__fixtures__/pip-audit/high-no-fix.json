@@ -1,0 +1,16 @@
+{
+  "dependencies": [
+    {
+      "name": "examplepkg",
+      "version": "1.0.0",
+      "vulns": [
+        {
+          "id": "PYSEC-2099-0001",
+          "fix_versions": [],
+          "aliases": ["CVE-2099-0001"],
+          "description": "Known advisory with no fixed version published yet."
+        }
+      ]
+    }
+  ]
+}

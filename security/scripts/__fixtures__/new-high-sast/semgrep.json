@@ -1,0 +1,22 @@
+{
+  "version": "1.176.0",
+  "results": [
+    {
+      "check_id": "test.new-high",
+      "path": "src/new-code.js",
+      "start": {
+        "line": 12
+      },
+      "extra": {
+        "severity": "ERROR",
+        "lines": "dangerousNewCall();"
+      }
+    }
+  ],
+  "errors": [],
+  "paths": {
+    "scanned": [
+      "src/new-code.js"
+    ]
+  }
+}

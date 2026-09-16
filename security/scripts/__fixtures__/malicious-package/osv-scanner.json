@@ -1,0 +1,20 @@
+{
+  "results": [
+    {
+      "packages": [
+        {
+          "package": {
+            "name": "malicious-demo-package",
+            "version": "1.0.0",
+            "ecosystem": "npm"
+          },
+          "vulnerabilities": [
+            {
+              "id": "MAL-2026-DEMO"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

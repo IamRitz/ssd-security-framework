@@ -1,0 +1,13 @@
+{
+  "SchemaVersion": 2,
+  "CreatedAt": "2026-09-10T00:00:00Z",
+  "ArtifactType": "container_image",
+  "Metadata": { "ImageID": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+    "OS": { "Family": "alpine", "Name": "3.24.1", "EOSL": false } },
+  "Results": [
+    { "Target": "alpine", "Class": "os-pkgs", "Type": "alpine",
+      "Vulnerabilities": [
+        { "VulnerabilityID": "CVE-2099-3000", "PkgName": "libfoo", "InstalledVersion": "1.0", "FixedVersion": "", "Severity": "CRITICAL" }
+      ] }
+  ]
+}

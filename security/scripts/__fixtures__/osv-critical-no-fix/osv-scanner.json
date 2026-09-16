@@ -1,0 +1,44 @@
+{
+  "results": [
+    {
+      "packages": [
+        {
+          "package": {
+            "name": "osv-unfixed-package",
+            "version": "1.0.0",
+            "ecosystem": "npm"
+          },
+          "vulnerabilities": [
+            {
+              "id": "GHSA-DEMO-NO-FIX",
+              "severity": [
+                {
+                  "type": "CVSS_V3",
+                  "score": "9.8"
+                }
+              ],
+              "affected": [
+                {
+                  "package": {
+                    "name": "osv-unfixed-package",
+                    "ecosystem": "npm"
+                  },
+                  "ranges": [
+                    {
+                      "type": "ECOSYSTEM",
+                      "events": [
+                        {
+                          "introduced": "0"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+{
+  "SchemaVersion": 2,
+  "CreatedAt": "2026-09-10T00:00:00Z",
+  "ArtifactType": "container_image",
+  "Metadata": { "ImageID": "sha256:2222222222222222222222222222222222222222222222222222222222222222" },
+  "Results": []
+}

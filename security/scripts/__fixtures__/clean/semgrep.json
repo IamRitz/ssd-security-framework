@@ -1,0 +1,11 @@
+{
+  "version": "1.176.0",
+  "results": [],
+  "errors": [],
+  "paths": {
+    "scanned": [
+      "src/app.js",
+      "src/server.js"
+    ]
+  }
+}

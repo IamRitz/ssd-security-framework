@@ -1,0 +1,268 @@
+name: Image scan pre-push (reusable)
+
+# Reusable pre-push image scan: Trivy against a BUILT IMAGE TARBALL ARTIFACT,
+# then the reviewed pre-push image gate.
+#
+# CREDENTIAL BOUNDARY: this workflow assumes NO cloud role, accepts NO secrets,
+# and never touches a registry. It scans an artifact the caller already built.
+# Callers must never use `secrets: inherit`.
+#
+# OPTIONAL BY CONSTRUCTION: a repo that ships no container (a library, a static
+# site, a Lambda zip) simply does not call this workflow, and declares
+# `artifact_type` accordingly so `_conformance.yml` reports the image controls
+# as N/A with a reason rather than as a silent gap.
+
+on:
+  workflow_call:
+    inputs:
+      image_artifact:
+        description: Name of the uploaded artifact containing the image tarball.
+        type: string
+        required: true
+      image_tarball:
+        description: File name of the `docker save` tarball inside that artifact.
+        type: string
+        default: application-image.tar
+      gate_mode:
+        description: '`enforce` (a BLOCK_DEPLOY fails this job) or `log-only` (reported, never fails, no Slack).'
+        type: string
+        default: enforce
+      node_version:
+        description: Node version used to run the gate scripts (tool dependency).
+        type: string
+        default: '24.21.0'
+      toolkit_repository:
+        description: Framework repository holding policy.yaml and scripts/.
+        type: string
+        default: IamRitz/ssd-security-framework
+      toolkit_ref:
+        description: Ref of the framework repository the toolkit is loaded from. Must match the ref the caller pinned this workflow to.
+        type: string
+        default: v1
+      toolkit_path:
+        description: Escape hatch for a toolkit already vendored in the caller's checkout. Empty means check the framework out.
+        type: string
+        default: ''
+      policy_path:
+        description: Consumer-owned policy.yaml, relative to the caller's checkout. Empty uses the framework's default policy.
+        type: string
+        default: ''
+      reproduce_commands:
+        description: JSON object mapping finding source to the local command that reproduces it. Empty uses portable direct scanner invocations.
+        type: string
+        default: ''
+      slack_notify_url:
+        description: Slack incoming-webhook URL for BLOCK_DEPLOY alerts. Empty disables Slack.
+        type: string
+        default: ''
+      pr_number:
+        description: PR number that receives the findings comment. Defaults to the PR of a pull_request run.
+        type: string
+        default: ''
+    outputs:
+      verdict:
+        description: DEPLOY | DEPLOY-WITH-EXCEPTIONS | BLOCK_DEPLOY
+        value: ${{ jobs.image-scan-prepush.outputs.verdict }}
+      image_id:
+        description: Trivy's Metadata.ImageID (image config digest) — anchor of the build -> push -> scan -> deploy digest chain.
+        value: ${{ jobs.image-scan-prepush.outputs.image_id }}
+      gate_mode:
+        description: The mode this run actually evaluated under.
+        value: ${{ jobs.image-scan-prepush.outputs.gate_mode }}
+      integrity_trusted:
+        description: '`false` when Trivy could not interpret the image (no OS family detected, no os-pkgs result, or an end-of-life OS). A zero-finding result is then UNKNOWN, not clean.'
+        value: ${{ jobs.image-scan-prepush.outputs.integrity_trusted }}
+
+permissions:
+  contents: read
+
+env:
+  SSD_REQUIRED_TOOLKIT_MAJOR: '1'
+
+jobs:
+  image-scan-prepush:
+    name: Pre-push image scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Scoped to this job: the pre-push image findings update the same PR comment.
+      # NOTE: no `id-token` — this job can assume no cloud role.
+      pull-requests: write
+    outputs:
+      verdict: ${{ steps.verdict.outputs.verdict }}
+      image_id: ${{ steps.trivy-id.outputs.image_id }}
+      gate_mode: ${{ inputs.gate_mode }}
+      integrity_trusted: ${{ steps.verdict.outputs.integrity_trusted }}
+    steps:
+      - name: Check out the consumer repository
+        # Needed for a consumer-owned policy_path; the toolkit itself arrives
+        # separately below.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check out the security framework toolkit
+        if: ${{ inputs.toolkit_path == '' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.toolkit_repository }}
+          ref: ${{ inputs.toolkit_ref }}
+          path: .ssd-toolkit-checkout
+          persist-credentials: false
+
+      - name: Place the toolkit outside the workspace
+        env:
+          VENDORED_PATH: ${{ inputs.toolkit_path }}
+          TOOLKIT_REF: ${{ inputs.toolkit_ref }}
+        run: |
+          set -euo pipefail
+          if [ -n "$VENDORED_PATH" ]; then
+            echo "SSD_TOOLKIT=$(cd "$VENDORED_PATH" && pwd)" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          test -n "$TOOLKIT_REF" || { echo "toolkit_ref is empty." >&2; exit 1; }
+          rm -rf "$RUNNER_TEMP/ssd-toolkit"
+          mv .ssd-toolkit-checkout "$RUNNER_TEMP/ssd-toolkit"
+          version="$(cat "$RUNNER_TEMP/ssd-toolkit/VERSION" 2>/dev/null || true)"
+          test -n "$version" || { echo "Toolkit checkout has no VERSION file." >&2; exit 1; }
+          major="${version#v}"; major="${major%%.*}"
+          [ "$major" = "$SSD_REQUIRED_TOOLKIT_MAJOR" ] || {
+            echo "Toolkit $version incompatible (needs major v${SSD_REQUIRED_TOOLKIT_MAJOR})." >&2
+            exit 1
+          }
+          echo "SSD_TOOLKIT=$RUNNER_TEMP/ssd-toolkit/security" >> "$GITHUB_ENV"
+          echo "Toolkit $version loaded."
+
+      - name: Resolve the effective policy
+        env:
+          POLICY_PATH: ${{ inputs.policy_path }}
+        run: |
+          if [ -n "$POLICY_PATH" ]; then
+            test -f "$POLICY_PATH" || {
+              echo "policy_path '$POLICY_PATH' does not exist in the consumer checkout." >&2
+              exit 1
+            }
+            echo "SSD_POLICY=$POLICY_PATH" >> "$GITHUB_ENV"
+          else
+            echo "SSD_POLICY=$SSD_TOOLKIT/policy.yaml" >> "$GITHUB_ENV"
+          fi
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ inputs.node_version }}
+          package-manager-cache: false
+
+      - name: Download image tarball
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ inputs.image_artifact }}
+
+      - name: Trivy image scan (report only — image-gate.mjs decides)
+        # Pinned by digest and verified (see security/trivy-provenance.md). Scans
+        # the tarball via --input; the Docker socket is never mounted into the
+        # scanner. --exit-code 0: the scanner reports, our reviewed gate judges.
+        env:
+          IMAGE_TARBALL: ${{ inputs.image_tarball }}
+        run: |
+          mkdir -p reports "$RUNNER_TEMP/trivy-cache"
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE/$IMAGE_TARBALL:/in/image.tar:ro" \
+            -v "$GITHUB_WORKSPACE/reports:/reports" \
+            -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy" \
+            ghcr.io/aquasecurity/trivy@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969 \
+            image --input /in/image.tar \
+              --scanners vuln,secret \
+              --pkg-types os,library \
+              --format json --output /reports/trivy-image.json \
+              --exit-code 0 --quiet
+
+      - name: Record scanned image ID
+        id: trivy-id
+        run: |
+          image_id="$(node -e 'process.stdout.write(require("./reports/trivy-image.json").Metadata.ImageID)')"
+          echo "image_id=$image_id" >> "$GITHUB_OUTPUT"
+          echo "Trivy scanned image config digest: $image_id"
+
+      - name: Pre-push image gate (fail-closed)
+        id: evaluate
+        continue-on-error: true
+        run: >-
+          node "$SSD_TOOLKIT/scripts/image-gate.mjs"
+          --policy "$SSD_POLICY"
+          --source trivy
+          --report reports/trivy-image.json
+          --output reports/image-gate-prepush.json
+
+      - name: Publish pre-push image verdict
+        id: verdict
+        if: always()
+        run: |
+          verdict="$(node -e 'try{process.stdout.write(require("./reports/image-gate-prepush.json").verdict||"BLOCK_DEPLOY")}catch{process.stdout.write("BLOCK_DEPLOY")}')"
+          # Fail closed: an unreadable or integrity-less gate result is untrusted.
+          trusted="$(node -e 'try{process.stdout.write(String(require("./reports/image-gate-prepush.json").integrity?.trusted===true))}catch{process.stdout.write("false")}')"
+          echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
+          echo "integrity_trusted=$trusted" >> "$GITHUB_OUTPUT"
+          echo "PRE-PUSH IMAGE GATE: $verdict (scan trusted: $trusted)"
+
+      - name: Post developer-readable image findings (PR comment + summary; Slack on BLOCK_DEPLOY)
+        if: always()
+        continue-on-error: true
+        env:
+          GATE_MODE: ${{ inputs.gate_mode }}
+          GITHUB_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+          SECURITY_NOTIFY_SLACK_URL: ${{ inputs.slack_notify_url }}
+          SECURITY_REPRODUCE_COMMANDS: ${{ inputs.reproduce_commands }}
+        run: node "$SSD_TOOLKIT/scripts/notify.mjs" --gate reports/image-gate-prepush.json
+
+      - name: Flag an untrusted image scan (blocks baseline generation)
+        # Runs in EVERY mode. A Trivy "false clean" (no OS family detected, no
+        # os-pkgs result) or an end-of-life base image means zero findings is
+        # UNKNOWN, not clean. In `log-only` that does not fail the job, so this
+        # is where it becomes visible and where the marker is produced.
+        if: ${{ always() && steps.verdict.outputs.integrity_trusted != 'true' }}
+        run: |
+          {
+            echo "The image scan COULD NOT BE TRUSTED on this run."
+            echo
+            echo "Trivy could not interpret the image (no OS family detected, no os-pkgs"
+            echo "result, or an end-of-life OS with no advisories). Zero findings here"
+            echo "means UNKNOWN, not clean."
+            echo
+            echo "DO NOT TREAT THIS RUN AS A CLEAN BASELINE."
+            echo "Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } | tee reports/DO-NOT-BASELINE.txt >> "$GITHUB_STEP_SUMMARY"
+          node -e 'const f=(require("./reports/image-gate-prepush.json").integrity?.failures)||[];for(const x of f)console.log(`::error title=Untrusted image scan — do not baseline::${x.source}: ${x.reason}`)' \
+            || echo "::error title=Untrusted image scan — do not baseline::the gate result could not be read"
+
+      - name: Upload Trivy + pre-push gate reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: trivy-reports-${{ github.sha }}
+          path: |
+            reports/trivy-image.json
+            reports/image-gate-prepush.json
+            reports/DO-NOT-BASELINE.txt
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Enforce the pre-push image verdict
+        # The single place this job's pass/fail is decided. A Critical/High-with-fix
+        # finding, a baked-in secret, an EOSL base image, or an undetectable OS
+        # ("false clean") fails here — before merge, before any push.
+        if: always()
+        env:
+          GATE_MODE: ${{ inputs.gate_mode }}
+          VERDICT: ${{ steps.verdict.outputs.verdict }}
+        run: |
+          if [ "$GATE_MODE" = "log-only" ]; then
+            echo "::warning::gate_mode=log-only — pre-push image verdict $VERDICT is reported but NOT enforced."
+            exit 0
+          fi
+          if [ "$VERDICT" = "BLOCK_DEPLOY" ]; then
+            echo "Pre-push image gate verdict is BLOCK_DEPLOY." >&2
+            exit 1
+          fi
+          echo "Pre-push image gate verdict is $VERDICT."

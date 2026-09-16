@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "source": "aws-ecr-basic",
+  "scanStatus": "COMPLETE",
+  "image": {
+    "repository": "secure-software-delivery",
+    "imageTag": "demo-clean",
+    "imageDigest": "sha256:clean"
+  },
+  "severityCounts": {},
+  "findings": []
+}

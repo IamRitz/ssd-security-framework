@@ -1,0 +1,18 @@
+{
+  "imageScanFindings": {
+    "enhancedFindings": [],
+    "findings": [],
+    "imageScanCompletedAt": "2026-09-13T07:13:06.872000+00:00",
+    "vulnerabilitySourceUpdatedAt": "2026-09-13T07:13:06.872000+00:00",
+    "findingSeverityCounts": {}
+  },
+  "registryId": "123456789012",
+  "repositoryName": "secure-software-delivery",
+  "imageId": {
+    "imageDigest": "sha256:7bb2656c990a9e3c82aa44a28bee2ee14fbcabbc9cf30c642f5c79f112b7b7d1"
+  },
+  "imageScanStatus": {
+    "status": "COMPLETE",
+    "description": "The scan was completed successfully."
+  }
+}

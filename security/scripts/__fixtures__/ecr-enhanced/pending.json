@@ -1,0 +1,14 @@
+{
+  "imageScanFindings": {
+    "findings": []
+  },
+  "registryId": "123456789012",
+  "repositoryName": "secure-software-delivery",
+  "imageId": {
+    "imageDigest": "sha256:7bb2656c990a9e3c82aa44a28bee2ee14fbcabbc9cf30c642f5c79f112b7b7d1"
+  },
+  "imageScanStatus": {
+    "status": "PENDING",
+    "description": "Pending start of the image scan."
+  }
+}

@@ -1,0 +1,215 @@
+name: Artifact gate (reusable)
+
+# Reusable policy gate over a NORMALIZED registry scan report.
+#
+# Registry-neutral by design: this workflow names no registry and calls no
+# registry API. It consumes the shared normalized report schema (schemaVersion 1
+# with `image.repository` / `image.imageTag` / `image.imageDigest`, `findings`,
+# `severityCounts`) that a collector workflow produces. Swapping registries
+# changes the collector only.
+#
+# CREDENTIAL BOUNDARY: assumes NO cloud role, accepts NO secrets.
+# Callers must never use `secrets: inherit`.
+#
+# Fail-closed: a missing, empty, or malformed report makes image-gate.mjs exit
+# non-zero, which fails this job, which skips every downstream deploy job.
+
+on:
+  workflow_call:
+    inputs:
+      report_artifact:
+        description: Name of the artifact holding the normalized scan report.
+        type: string
+        required: true
+      report_path:
+        description: Path of the normalized report inside that artifact.
+        type: string
+        default: reports/registry-image-scan.json
+      expected_digest:
+        description: Manifest digest the report must describe. The gate fails closed on a mismatch.
+        type: string
+        required: true
+      gate_mode:
+        description: '`enforce` (a BLOCK_DEPLOY fails this job) or `log-only` (reported, never fails, no Slack).'
+        type: string
+        default: enforce
+      node_version:
+        description: Node version used to run the gate scripts (tool dependency).
+        type: string
+        default: '24.21.0'
+      toolkit_repository:
+        description: Framework repository holding policy.yaml and scripts/.
+        type: string
+        default: IamRitz/ssd-security-framework
+      toolkit_ref:
+        description: Ref of the framework repository the toolkit is loaded from. Must match the ref the caller pinned this workflow to.
+        type: string
+        default: v1
+      toolkit_path:
+        description: Escape hatch for a toolkit already vendored in the caller's checkout. Empty means check the framework out.
+        type: string
+        default: ''
+      policy_path:
+        description: Consumer-owned policy.yaml, relative to the caller's checkout. Empty uses the framework's default policy.
+        type: string
+        default: ''
+      reproduce_commands:
+        description: JSON object mapping finding source to the local command that reproduces it.
+        type: string
+        default: ''
+      slack_notify_url:
+        description: Slack incoming-webhook URL for BLOCK_DEPLOY alerts. Empty disables Slack.
+        type: string
+        default: ''
+    outputs:
+      verdict:
+        description: DEPLOY | DEPLOY-WITH-EXCEPTIONS | BLOCK_DEPLOY
+        value: ${{ jobs.artifact-gate.outputs.verdict }}
+
+permissions:
+  contents: read
+
+env:
+  SSD_REQUIRED_TOOLKIT_MAJOR: '1'
+
+jobs:
+  artifact-gate:
+    name: artifact-gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # NOTE: no `id-token` — this job can assume no cloud role.
+    outputs:
+      verdict: ${{ steps.verdict.outputs.verdict }}
+    steps:
+      - name: Check out the consumer repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check out the security framework toolkit
+        if: ${{ inputs.toolkit_path == '' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.toolkit_repository }}
+          ref: ${{ inputs.toolkit_ref }}
+          path: .ssd-toolkit-checkout
+          persist-credentials: false
+
+      - name: Place the toolkit outside the workspace
+        env:
+          VENDORED_PATH: ${{ inputs.toolkit_path }}
+          TOOLKIT_REF: ${{ inputs.toolkit_ref }}
+        run: |
+          set -euo pipefail
+          if [ -n "$VENDORED_PATH" ]; then
+            echo "SSD_TOOLKIT=$(cd "$VENDORED_PATH" && pwd)" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          test -n "$TOOLKIT_REF" || { echo "toolkit_ref is empty." >&2; exit 1; }
+          rm -rf "$RUNNER_TEMP/ssd-toolkit"
+          mv .ssd-toolkit-checkout "$RUNNER_TEMP/ssd-toolkit"
+          version="$(cat "$RUNNER_TEMP/ssd-toolkit/VERSION" 2>/dev/null || true)"
+          test -n "$version" || { echo "Toolkit checkout has no VERSION file." >&2; exit 1; }
+          major="${version#v}"; major="${major%%.*}"
+          [ "$major" = "$SSD_REQUIRED_TOOLKIT_MAJOR" ] || {
+            echo "Toolkit $version incompatible (needs major v${SSD_REQUIRED_TOOLKIT_MAJOR})." >&2
+            exit 1
+          }
+          echo "SSD_TOOLKIT=$RUNNER_TEMP/ssd-toolkit/security" >> "$GITHUB_ENV"
+          echo "Toolkit $version loaded."
+
+      - name: Resolve the effective policy
+        env:
+          POLICY_PATH: ${{ inputs.policy_path }}
+        run: |
+          if [ -n "$POLICY_PATH" ]; then
+            test -f "$POLICY_PATH" || {
+              echo "policy_path '$POLICY_PATH' does not exist in the consumer checkout." >&2
+              exit 1
+            }
+            echo "SSD_POLICY=$POLICY_PATH" >> "$GITHUB_ENV"
+          else
+            echo "SSD_POLICY=$SSD_TOOLKIT/policy.yaml" >> "$GITHUB_ENV"
+          fi
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ inputs.node_version }}
+          package-manager-cache: false
+
+      - name: Download the normalized scan report
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ inputs.report_artifact }}
+          path: reports
+
+      - name: Assert the scanned digest is the expected digest
+        # Digest chain: the report this gate is about to judge must describe the
+        # exact manifest the collector pushed. The collector already bound this by
+        # querying by digest; re-asserted here so the gate is self-contained and
+        # cannot be handed a report for a different artifact.
+        env:
+          REPORT_PATH: ${{ inputs.report_path }}
+          EXPECTED_DIGEST: ${{ inputs.expected_digest }}
+        run: |
+          scanned="$(node -e 'process.stdout.write((require(require("node:path").resolve(process.env.REPORT_PATH)).image||{}).imageDigest||"")' 2>/dev/null || true)"
+          if [ -n "$scanned" ] && [ "$scanned" != "$EXPECTED_DIGEST" ]; then
+            echo "scanned digest $scanned != expected digest $EXPECTED_DIGEST" >&2
+            exit 1
+          fi
+
+      - name: Evaluate artifact policy (fail-closed)
+        id: evaluate
+        continue-on-error: true
+        run: >-
+          node "$SSD_TOOLKIT/scripts/image-gate.mjs"
+          --policy "$SSD_POLICY"
+          --report "${{ inputs.report_path }}"
+          --output reports/image-gate.json
+
+      - name: Publish artifact gate verdict
+        id: verdict
+        if: always()
+        run: |
+          verdict="$(node -e 'try{process.stdout.write(require("./reports/image-gate.json").verdict||"BLOCK_DEPLOY")}catch{process.stdout.write("BLOCK_DEPLOY")}')"
+          echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
+          echo "ARTIFACT GATE: $verdict"
+
+      - name: Post developer-readable artifact-gate findings (Slack + summary)
+        # Post-push — no PR to comment on, so this surfaces the job summary and
+        # (on BLOCK_DEPLOY) a Slack alert. Feedback only.
+        if: always()
+        continue-on-error: true
+        env:
+          GATE_MODE: ${{ inputs.gate_mode }}
+          GITHUB_TOKEN: ${{ github.token }}
+          SECURITY_NOTIFY_SLACK_URL: ${{ inputs.slack_notify_url }}
+          SECURITY_REPRODUCE_COMMANDS: ${{ inputs.reproduce_commands }}
+        run: node "$SSD_TOOLKIT/scripts/notify.mjs" --gate reports/image-gate.json
+
+      - name: Upload artifact gate report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: image-gate-result
+          path: reports/image-gate.json
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Enforce the artifact gate verdict
+        if: always()
+        env:
+          GATE_MODE: ${{ inputs.gate_mode }}
+          VERDICT: ${{ steps.verdict.outputs.verdict }}
+        run: |
+          if [ "$GATE_MODE" = "log-only" ]; then
+            echo "::warning::gate_mode=log-only — artifact gate verdict $VERDICT is reported but NOT enforced."
+            exit 0
+          fi
+          if [ "$VERDICT" = "BLOCK_DEPLOY" ]; then
+            echo "Artifact gate verdict is BLOCK_DEPLOY." >&2
+            exit 1
+          fi
+          echo "Artifact gate verdict is $VERDICT."

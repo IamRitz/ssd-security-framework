@@ -1,0 +1,7 @@
+[
+  {
+    "RuleID": "phase10-demo-dummy-secret",
+    "File": "src/config/_demo_secret.js",
+    "StartLine": 4
+  }
+]

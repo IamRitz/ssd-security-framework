@@ -1,0 +1,22 @@
+{
+  "dependencies": [
+    {
+      "name": "requests",
+      "version": "2.19.1",
+      "vulns": [
+        {
+          "id": "PYSEC-2018-28",
+          "fix_versions": ["2.20.0"],
+          "aliases": ["CVE-2018-18074", "GHSA-x84v-xcm2-53pg"],
+          "description": "Requests before 2.20.0 sends an Authorization header on same-hostname https-to-http redirects."
+        },
+        {
+          "id": "PYSEC-2018-28",
+          "fix_versions": ["2.20.0"],
+          "aliases": ["CVE-2018-18074"],
+          "description": "Duplicate advisory from a second source; the gate must dedupe (name, id)."
+        }
+      ]
+    }
+  ]
+}

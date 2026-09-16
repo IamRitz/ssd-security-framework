@@ -1,0 +1,921 @@
+name: Source security (reusable)
+
+# Reusable source-security workflow: secret scan, dependency scan, SAST, and the
+# source security gate.
+#
+# CREDENTIAL BOUNDARY: scanner jobs receive no cloud credentials.
+# The source-gate job may assume the narrowly scoped break-glass Lambda
+# invoker role through GitHub OIDC, and only after eligibility is confirmed.
+# Callers must never use `secrets: inherit`.
+#
+# Portability: every repo-specific value is an input. Node is installed as a TOOL
+# dependency (the gate scripts are .mjs) independent of the target repo's own
+# language; a pure-Python or Go consumer needs no Node of its own.
+#
+# THE TOOLKIT DOES NOT TRAVEL WITH THE CONSUMER. Every job below checks THIS
+# framework repository out itself and relocates it outside $GITHUB_WORKSPACE
+# before any scanner runs, so a consumer repo needs zero framework files.
+# See docs/toolkit-resolution.md for why it is a checkout rather than a
+# self-reference, and why the relocation is a control rather than tidiness.
+
+on:
+  workflow_call:
+    inputs:
+      gate_mode:
+        description: '`enforce` (a BLOCK fails the gate job) or `log-only` (findings are reported, nothing fails, no Slack). Onboarding repos start in log-only.'
+        type: string
+        default: enforce
+      node_version:
+        description: Node version used to run the gate scripts. A tool dependency, not the consumer repo's runtime.
+        type: string
+        default: '24.21.0'
+      toolkit_repository:
+        description: Framework repository holding policy.yaml and scripts/.
+        type: string
+        default: IamRitz/ssd-security-framework
+      toolkit_ref:
+        description: >-
+          Ref of the framework repository the toolkit is loaded from. MUST match the ref
+          the caller pinned this workflow to. A reusable workflow cannot read its own ref
+          (`job_workflow_sha` is an OIDC claim, not an expression context), so this is
+          stated rather than derived; the major-version assertion catches a mismatch.
+        type: string
+        default: v1
+      toolkit_path:
+        description: >-
+          Escape hatch: path to a toolkit ALREADY PRESENT in the caller's checkout. When
+          set, no framework checkout happens. For repos that vendor deliberately; leave
+          empty for normal central consumption.
+        type: string
+        default: ''
+      policy_path:
+        description: Consumer-owned policy.yaml, relative to the caller's checkout. Empty uses the framework's default policy.
+        type: string
+        default: ''
+      semgrep_configs:
+        description: Whitespace/newline separated Semgrep configs. Default is language-agnostic; add language packs (p/javascript, p/python, ...) and local rule files per repo.
+        type: string
+        default: p/owasp-top-ten
+      semgrep_paths:
+        description: Whitespace separated paths Semgrep scans, relative to the repo root.
+        type: string
+        default: '.'
+      semgrep_baseline_path:
+        description: Path to the committed Semgrep baseline (consumer-owned; see docs/onboarding.md for how to generate one).
+        type: string
+        default: security/baseline/semgrep-baseline.json
+      gitleaks_config:
+        description: Gitleaks config path. Omitted automatically when the file is absent, so a repo with no config still scans with the default ruleset.
+        type: string
+        default: .gitleaks.toml
+      trufflehog_exclude_paths:
+        description: TruffleHog exclude-paths file. Omitted automatically when absent.
+        type: string
+        default: .trufflehog-exclude-paths.txt
+      reproduce_commands:
+        description: >-
+          JSON object mapping finding source (gitleaks, trufflehog, npm-audit, pip-audit,
+          osv-scanner, semgrep, trivy, ecr-image-scan) to the command a developer runs
+          locally to reproduce it. Empty uses portable direct scanner invocations.
+        type: string
+        default: ''
+      slack_notify_url:
+        description: Slack incoming-webhook URL for developer-readable BLOCK alerts. Empty disables Slack.
+        type: string
+        default: ''
+      pr_number:
+        description: PR number that receives the findings comment. Defaults to the PR of a pull_request run.
+        type: string
+        default: ''
+      break_glass_enabled:
+        description: Whether an eligible BLOCK may enter the interactive break-glass approval flow.
+        type: boolean
+        default: false
+      break_glass_transport:
+        description: Break-glass transport. `http` uses the legacy webhook path; `lambda` uses direct Lambda invocation via GitHub OIDC.
+        type: string
+        default: http
+      break_glass_lambda_role_arn:
+        description: IAM role assumed through GitHub OIDC when break_glass_transport is lambda.
+        type: string
+        default: ''
+      break_glass_lambda_function:
+        description: Lambda function used for break-glass notify/status when transport is lambda.
+        type: string
+        default: ''
+      break_glass_aws_region:
+        description: AWS region containing the break-glass Lambda.
+        type: string
+        default: ''
+      break_glass_notify_url:
+        description: Break-glass approval-request webhook (legacy HTTP transport).
+        type: string
+        default: ''
+      break_glass_status_url:
+        description: Break-glass decision-status webhook (legacy HTTP transport).
+        type: string
+        default: ''
+      break_glass_timeout_seconds:
+        description: How long to wait for a verified break-glass decision.
+        type: string
+        default: ''
+      synthetic_block_fixture:
+        description: 'Demo only: `sast` or `dependency` injects a synthetic ELIGIBLE BLOCK fixture. Requires both break-glass URLs to be passed explicitly.'
+        type: string
+        default: none
+    secrets:
+      break_glass_shared_secret:
+        description: HMAC shared secret for the break-glass request/decision channel. Not a cloud credential; required only when break_glass_enabled is true.
+        required: false
+    outputs:
+      verdict:
+        description: PASS | PASS-WITH-EXCEPTIONS | BLOCK
+        value: ${{ jobs.source-gate.outputs.verdict }}
+      break_glass_eligible:
+        description: 'true when the BLOCK consists only of break-glass-eligible findings'
+        value: ${{ jobs.source-gate.outputs.break_glass_eligible }}
+      gate_mode:
+        description: The mode this run actually evaluated under. Echoed back so a caller reports the real mode rather than what it believes it passed.
+        value: ${{ jobs.source-gate.outputs.gate_mode }}
+      integrity_trusted:
+        description: '`false` when a scanner could not interpret its input. A `false` here means the findings list is UNKNOWN, not clean — never baseline from such a run.'
+        value: ${{ jobs.source-gate.outputs.integrity_trusted }}
+
+permissions:
+  contents: read
+
+env:
+  # The toolkit major version THIS workflow file is written against. Asserted
+  # against the checked-out toolkit's VERSION, so a v2 toolkit loaded by a v1
+  # workflow fails loudly instead of running mismatched scripts.
+  SSD_REQUIRED_TOOLKIT_MAJOR: '1'
+
+jobs:
+  secret-scanning:
+    name: Secret scanning
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out full repository history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out the security framework toolkit
+        if: ${{ inputs.toolkit_path == '' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.toolkit_repository }}
+          ref: ${{ inputs.toolkit_ref }}
+          path: .ssd-toolkit-checkout
+          persist-credentials: false
+
+      - name: Place the toolkit outside the scanned workspace
+        env:
+          VENDORED_PATH: ${{ inputs.toolkit_path }}
+          TOOLKIT_REF: ${{ inputs.toolkit_ref }}
+          TOOLKIT_REPOSITORY: ${{ inputs.toolkit_repository }}
+        run: |
+          set -euo pipefail
+          if [ -n "$VENDORED_PATH" ]; then
+            echo "SSD_TOOLKIT=$(cd "$VENDORED_PATH" && pwd)" >> "$GITHUB_ENV"
+            echo "::notice::Using a vendored toolkit at '$VENDORED_PATH' (no framework checkout)."
+            exit 0
+          fi
+          test -n "$TOOLKIT_REF" || {
+            echo "toolkit_ref is empty; refusing to resolve the toolkit from a default branch." >&2
+            exit 1
+          }
+          # THE RELOCATION IS A CONTROL, NOT TIDINESS. Left in the workspace, the
+          # framework's own files get scanned as if they were the consumer's
+          # code: Semgrep reports findings in toolkit scripts against the
+          # consumer, and OSV-Scanner's recursive source scan picks up any
+          # manifest the framework ships. Moving it under RUNNER_TEMP leaves the
+          # workspace byte-identical to the consumer's own checkout.
+          rm -rf "$RUNNER_TEMP/ssd-toolkit"
+          mv .ssd-toolkit-checkout "$RUNNER_TEMP/ssd-toolkit"
+          version="$(cat "$RUNNER_TEMP/ssd-toolkit/VERSION" 2>/dev/null || true)"
+          test -n "$version" || {
+            echo "The toolkit checkout has no VERSION file; it is not a framework release." >&2
+            exit 1
+          }
+          major="${version#v}"; major="${major%%.*}"
+          if [ "$major" != "$SSD_REQUIRED_TOOLKIT_MAJOR" ]; then
+            echo "Toolkit $version is incompatible with this workflow (needs major v${SSD_REQUIRED_TOOLKIT_MAJOR})." >&2
+            exit 1
+          fi
+          echo "SSD_TOOLKIT=$RUNNER_TEMP/ssd-toolkit/security" >> "$GITHUB_ENV"
+          echo "Toolkit $version loaded from ${TOOLKIT_REPOSITORY}@${TOOLKIT_REF}"
+
+      - name: Confirm the workspace holds no framework files
+        # The executable proof that a consumer needs zero framework files: after
+        # relocation nothing framework-owned remains in the scanned tree.
+        run: |
+          if [ -e .ssd-toolkit-checkout ]; then
+            echo ".ssd-toolkit-checkout is still inside the scanned workspace." >&2
+            exit 1
+          fi
+          echo "Workspace contains only the consumer's own checkout."
+
+      - name: Set up Node.js for report normalization
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ inputs.node_version }}
+          package-manager-cache: false
+
+      - name: Create report directory
+        run: mkdir -p reports
+
+      - name: Determine secret scan scope
+        # pull_request: only commits on the branch since the merge-base with the base branch.
+        # push to main: only commits since the previous main tip (github.event.before).
+        # schedule / dispatch / anything else: full history.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          BASE_SHA=""
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            git fetch --no-tags origin "$BASE_REF" >/dev/null 2>&1 || true
+            BASE_SHA="$(git merge-base "origin/$BASE_REF" HEAD || true)"
+          elif [ "$EVENT_NAME" = "push" ]; then
+            if [ -n "$BEFORE_SHA" ] && [ "$BEFORE_SHA" != "0000000000000000000000000000000000000000" ] && git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null; then
+              BASE_SHA="$BEFORE_SHA"
+            fi
+          fi
+          if [ -n "$BASE_SHA" ]; then
+            echo "GITLEAKS_LOG_OPTS=--log-opts=${BASE_SHA}..HEAD" >> "$GITHUB_ENV"
+            echo "TRUFFLEHOG_SINCE=--since-commit=${BASE_SHA}" >> "$GITHUB_ENV"
+            echo "Incremental secret scan range ${BASE_SHA}..HEAD (event=$EVENT_NAME)"
+          else
+            echo "GITLEAKS_LOG_OPTS=--log-opts=HEAD" >> "$GITHUB_ENV"
+            echo "TRUFFLEHOG_SINCE=" >> "$GITHUB_ENV"
+            echo "Full-history secret scan (event=$EVENT_NAME)"
+          fi
+
+      - name: Resolve optional scanner config files
+        # A consumer repo may ship neither file. Absent config is a documented
+        # fallback to the scanner's own default ruleset, not a silent skip of the
+        # scan itself — the scan always runs.
+        env:
+          GITLEAKS_CONFIG: ${{ inputs.gitleaks_config }}
+          TRUFFLEHOG_EXCLUDE: ${{ inputs.trufflehog_exclude_paths }}
+        run: |
+          if [ -n "$GITLEAKS_CONFIG" ] && [ -f "$GITLEAKS_CONFIG" ]; then
+            echo "GITLEAKS_CONFIG_OPT=--config /repo/$GITLEAKS_CONFIG" >> "$GITHUB_ENV"
+          else
+            echo "GITLEAKS_CONFIG_OPT=" >> "$GITHUB_ENV"
+            echo "::notice::No Gitleaks config at '${GITLEAKS_CONFIG:-<unset>}'; scanning with the default ruleset."
+          fi
+          if [ -n "$TRUFFLEHOG_EXCLUDE" ] && [ -f "$TRUFFLEHOG_EXCLUDE" ]; then
+            echo "TRUFFLEHOG_EXCLUDE_OPT=--exclude-paths=/repo/$TRUFFLEHOG_EXCLUDE" >> "$GITHUB_ENV"
+          else
+            echo "TRUFFLEHOG_EXCLUDE_OPT=" >> "$GITHUB_ENV"
+            echo "::notice::No TruffleHog exclude-paths file at '${TRUFFLEHOG_EXCLUDE:-<unset>}'; scanning every path."
+          fi
+
+      - name: Run Gitleaks (report only)
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/repo:ro" \
+            -v "$GITHUB_WORKSPACE/reports:/reports" \
+            ghcr.io/gitleaks/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f \
+            git /repo ${GITLEAKS_CONFIG_OPT} ${GITLEAKS_LOG_OPTS} --platform github \
+            --no-banner --redact=100 --report-format json \
+            --report-path /reports/gitleaks.json --exit-code 0
+
+      - name: Run TruffleHog (report only)
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/repo:ro" \
+            trufflesecurity/trufflehog@sha256:deb2af10659a488a14d262a323addcde099d99827a1cf1dc4e93c17915c39f08 \
+            git file:///repo --json --no-update ${TRUFFLEHOG_SINCE} \
+            ${TRUFFLEHOG_EXCLUDE_OPT} \
+            --results=verified,unverified,unknown --no-fail \
+            --fail-on-scan-errors > reports/trufflehog.raw.jsonl
+          node "$SSD_TOOLKIT/scripts/normalize-trufflehog.mjs" \
+            reports/trufflehog.raw.jsonl reports/trufflehog.json
+
+      - name: Upload secret scan reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: secret-scan-reports
+          path: |
+            reports/gitleaks.json
+            reports/trufflehog.json
+          if-no-files-found: error
+          retention-days: 14
+
+  dependency-scanning:
+    name: Dependency scanning
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check out the security framework toolkit
+        if: ${{ inputs.toolkit_path == '' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.toolkit_repository }}
+          ref: ${{ inputs.toolkit_ref }}
+          path: .ssd-toolkit-checkout
+          persist-credentials: false
+
+      - name: Place the toolkit outside the scanned workspace
+        # OSV-Scanner below walks the whole workspace recursively for lockfiles.
+        # A toolkit left in the tree would have its manifests scanned and
+        # reported as the consumer's own dependencies.
+        env:
+          VENDORED_PATH: ${{ inputs.toolkit_path }}
+          TOOLKIT_REF: ${{ inputs.toolkit_ref }}
+        run: |
+          set -euo pipefail
+          if [ -n "$VENDORED_PATH" ]; then
+            echo "SSD_TOOLKIT=$(cd "$VENDORED_PATH" && pwd)" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          test -n "$TOOLKIT_REF" || { echo "toolkit_ref is empty." >&2; exit 1; }
+          rm -rf "$RUNNER_TEMP/ssd-toolkit"
+          mv .ssd-toolkit-checkout "$RUNNER_TEMP/ssd-toolkit"
+          version="$(cat "$RUNNER_TEMP/ssd-toolkit/VERSION" 2>/dev/null || true)"
+          test -n "$version" || { echo "Toolkit checkout has no VERSION file." >&2; exit 1; }
+          major="${version#v}"; major="${major%%.*}"
+          [ "$major" = "$SSD_REQUIRED_TOOLKIT_MAJOR" ] || {
+            echo "Toolkit $version incompatible (needs major v${SSD_REQUIRED_TOOLKIT_MAJOR})." >&2
+            exit 1
+          }
+          echo "SSD_TOOLKIT=$RUNNER_TEMP/ssd-toolkit/security" >> "$GITHUB_ENV"
+          echo "Toolkit $version loaded."
+
+      - name: Confirm the workspace holds no framework files
+        run: |
+          if [ -e .ssd-toolkit-checkout ]; then
+            echo ".ssd-toolkit-checkout is still inside the scanned workspace." >&2
+            exit 1
+          fi
+          echo "Workspace contains only the consumer's own checkout."
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ inputs.node_version }}
+          package-manager-cache: false
+
+      - name: Create report directory
+        run: mkdir -p reports
+
+      - name: Detect dependency ecosystems
+        # Decides which language-native scanner runs. npm audit needs a
+        # package-lock.json; pip-audit needs a requirements.txt. OSV-Scanner runs
+        # regardless and covers every ecosystem's lockfiles. Neither present is a
+        # clean skip, mirroring the AWS-not-configured detect-and-skip pattern.
+        id: detect
+        run: node "$SSD_TOOLKIT/scripts/detect-ecosystems.mjs" --github-output
+
+      - name: Run npm audit (report only)
+        if: steps.detect.outputs.package_lock == 'true'
+        continue-on-error: true
+        run: |
+          for attempt in 1 2 3; do
+            set +e
+            npm audit --json --package-lock-only > reports/npm-audit.json
+            audit_status=$?
+            set -e
+            if node "$SSD_TOOLKIT/scripts/validate-dependency-report.mjs" \
+              npm-audit reports/npm-audit.json; then
+              echo "npm audit produced a valid report (scanner exit $audit_status)"
+              exit 0
+            fi
+            echo "npm audit report attempt $attempt was invalid; retrying" >&2
+            if [ "$attempt" -lt 3 ]; then
+              sleep 15
+            fi
+          done
+          exit 1
+
+      - name: Validate npm audit report
+        if: steps.detect.outputs.package_lock == 'true'
+        run: |
+          node "$SSD_TOOLKIT/scripts/validate-dependency-report.mjs" \
+            npm-audit reports/npm-audit.json
+          echo "npm audit report is valid; the security gate evaluates findings"
+
+      - name: Run pip-audit (report only)
+        # Python's npm-audit-equivalent. Pinned tool version; audits the pinned
+        # requirements.txt with --no-deps so dependency RESOLUTION never runs (no
+        # untrusted setup.py execution), the same discipline as npm ci vs install.
+        if: steps.detect.outputs.requirements_txt != ''
+        continue-on-error: true
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/repo:ro" \
+            -v "$GITHUB_WORKSPACE/reports:/reports" \
+            -w /repo \
+            python@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea \
+            sh -c 'pip install --quiet --no-cache-dir pip-audit==2.10.1 && pip-audit --requirement requirements.txt --no-deps --format json > /reports/pip-audit.json'
+
+      - name: Validate pip-audit report
+        if: steps.detect.outputs.requirements_txt != ''
+        run: |
+          node "$SSD_TOOLKIT/scripts/validate-dependency-report.mjs" \
+            pip-audit reports/pip-audit.json
+          echo "pip-audit report is valid; the security gate evaluates findings"
+
+      - name: Run OSV-Scanner (report only)
+        # Cross-ecosystem backstop: recursively scans the checkout for every
+        # supported lockfile (package-lock.json, requirements.txt, poetry.lock,
+        # Pipfile.lock, ...) rather than a single hard-coded file. Runs even when
+        # neither npm nor Python is detected, so a Go/Rust/Java consumer repo is
+        # still covered rather than silently unscanned.
+        continue-on-error: true
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/repo:ro" \
+            ghcr.io/google/osv-scanner@sha256:5116601dedc01c1c580eb92371883ec052fc4c13c3fbc109d621a63ac416d475 \
+            scan source --recursive /repo --format=json \
+            > reports/osv-scanner.json
+
+      - name: Validate OSV-Scanner report
+        run: |
+          node "$SSD_TOOLKIT/scripts/validate-dependency-report.mjs" \
+            osv-scanner reports/osv-scanner.json
+          echo "OSV-Scanner report is valid; the security gate evaluates findings"
+
+      - name: Upload dependency scan reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          # npm-audit.json / pip-audit.json are present only for those ecosystems;
+          # upload-artifact errors only when NO listed file matches, and
+          # osv-scanner.json is always produced, so this stays green for any repo.
+          name: dependency-scan-reports
+          path: |
+            reports/npm-audit.json
+            reports/pip-audit.json
+            reports/osv-scanner.json
+          if-no-files-found: error
+          retention-days: 14
+
+  sast:
+    name: SAST
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # Full history so Semgrep can diff against the baseline commit.
+          fetch-depth: 0
+
+      - name: Check out the security framework toolkit
+        if: ${{ inputs.toolkit_path == '' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.toolkit_repository }}
+          ref: ${{ inputs.toolkit_ref }}
+          path: .ssd-toolkit-checkout
+          persist-credentials: false
+
+      - name: Place the toolkit outside the scanned workspace
+        # Semgrep's default scan path is `.`. A toolkit left in the workspace
+        # would be scanned with the CONSUMER's rulesets and its findings
+        # attributed to the consumer's code.
+        env:
+          VENDORED_PATH: ${{ inputs.toolkit_path }}
+          TOOLKIT_REF: ${{ inputs.toolkit_ref }}
+        run: |
+          set -euo pipefail
+          if [ -n "$VENDORED_PATH" ]; then
+            echo "SSD_TOOLKIT=$(cd "$VENDORED_PATH" && pwd)" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          test -n "$TOOLKIT_REF" || { echo "toolkit_ref is empty." >&2; exit 1; }
+          rm -rf "$RUNNER_TEMP/ssd-toolkit"
+          mv .ssd-toolkit-checkout "$RUNNER_TEMP/ssd-toolkit"
+          version="$(cat "$RUNNER_TEMP/ssd-toolkit/VERSION" 2>/dev/null || true)"
+          test -n "$version" || { echo "Toolkit checkout has no VERSION file." >&2; exit 1; }
+          major="${version#v}"; major="${major%%.*}"
+          [ "$major" = "$SSD_REQUIRED_TOOLKIT_MAJOR" ] || {
+            echo "Toolkit $version incompatible (needs major v${SSD_REQUIRED_TOOLKIT_MAJOR})." >&2
+            exit 1
+          }
+          echo "SSD_TOOLKIT=$RUNNER_TEMP/ssd-toolkit/security" >> "$GITHUB_ENV"
+          echo "Toolkit $version loaded."
+
+      - name: Confirm the workspace holds no framework files
+        run: |
+          if [ -e .ssd-toolkit-checkout ]; then
+            echo ".ssd-toolkit-checkout is still inside the scanned workspace." >&2
+            exit 1
+          fi
+          echo "Workspace contains only the consumer's own checkout."
+
+      - name: Set up Node.js for report validation
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ inputs.node_version }}
+          package-manager-cache: false
+
+      - name: Create report directory
+        run: mkdir -p reports
+
+      - name: Determine SAST scan scope
+        # pull_request: only files changed since the merge-base with the base branch.
+        # push to main: only files changed since the previous main tip (github.event.before).
+        # schedule / dispatch / anything else: full scan (no baseline).
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          BASE_SHA=""
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            git fetch --no-tags origin "$BASE_REF" >/dev/null 2>&1 || true
+            BASE_SHA="$(git merge-base "origin/$BASE_REF" HEAD || true)"
+          elif [ "$EVENT_NAME" = "push" ]; then
+            if [ -n "$BEFORE_SHA" ] && [ "$BEFORE_SHA" != "0000000000000000000000000000000000000000" ] && git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null; then
+              BASE_SHA="$BEFORE_SHA"
+            fi
+          fi
+          if [ -n "$BASE_SHA" ]; then
+            echo "SEMGREP_BASELINE=--baseline-commit=${BASE_SHA}" >> "$GITHUB_ENV"
+            echo "Incremental SAST scan since ${BASE_SHA} (event=$EVENT_NAME)"
+          else
+            echo "SEMGREP_BASELINE=" >> "$GITHUB_ENV"
+            echo "Full-tree SAST scan (event=$EVENT_NAME)"
+          fi
+
+      - name: Run Semgrep OSS (report only)
+        # Rulesets and scan paths are INPUTS. A hardcoded language pack on a repo
+        # of another language reports near-zero findings, which reads as a clean
+        # pass rather than a misconfiguration — the same false-clean risk as
+        # Trivy failing to identify a base-image OS.
+        env:
+          SEMGREP_CONFIGS: ${{ inputs.semgrep_configs }}
+          SEMGREP_PATHS: ${{ inputs.semgrep_paths }}
+        run: |
+          config_args=()
+          for config in $SEMGREP_CONFIGS; do
+            config_args+=(--config "$config")
+          done
+          if [ "${#config_args[@]}" -eq 0 ]; then
+            echo "semgrep_configs resolved to no rulesets; a SAST scan with no rules is a false clean." >&2
+            exit 1
+          fi
+          scan_paths=()
+          for path in $SEMGREP_PATHS; do
+            scan_paths+=("$path")
+          done
+          if [ "${#scan_paths[@]}" -eq 0 ]; then
+            echo "semgrep_paths resolved to no paths; refusing to report a scan of nothing." >&2
+            exit 1
+          fi
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/src:ro" \
+            -v "$GITHUB_WORKSPACE/reports:/reports" \
+            -w /src \
+            -e HOME=/tmp \
+            -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0=/src \
+            semgrep/semgrep@sha256:12672acdb0949e19f9f6a4c2b288edd0b404f268f0ca7738a2c06f372f50362e \
+            semgrep scan \
+            "${config_args[@]}" \
+            ${SEMGREP_BASELINE} \
+            --json-output=/reports/semgrep.json \
+            --metrics=off \
+            --disable-version-check \
+            "${scan_paths[@]}"
+          node "$SSD_TOOLKIT/scripts/validate-semgrep-report.mjs" reports/semgrep.json
+          echo "Semgrep report is ready for the security gate"
+
+      - name: Upload SAST report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sast-reports
+          path: reports/semgrep.json
+          if-no-files-found: error
+          retention-days: 14
+
+  source-gate:
+    name: source-gate
+    needs:
+      - secret-scanning
+      - dependency-scanning
+      - sast
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Scoped to THIS job only: the developer-readable notifier updates one PR
+      # comment (find-by-marker) with the full finding detail. No other job is
+      # granted PR write.
+      pull-requests: write
+      id-token: write
+    outputs:
+      verdict: ${{ steps.verdict.outputs.verdict }}
+      break_glass_eligible: ${{ steps.verdict.outputs.break_glass_eligible }}
+      gate_mode: ${{ inputs.gate_mode }}
+      integrity_trusted: ${{ steps.verdict.outputs.integrity_trusted }}
+
+    steps:
+      - name: Check out the consumer repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check out the security framework toolkit
+        if: ${{ inputs.toolkit_path == '' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.toolkit_repository }}
+          ref: ${{ inputs.toolkit_ref }}
+          path: .ssd-toolkit-checkout
+          persist-credentials: false
+
+      - name: Place the toolkit outside the scanned workspace
+        env:
+          VENDORED_PATH: ${{ inputs.toolkit_path }}
+          TOOLKIT_REF: ${{ inputs.toolkit_ref }}
+        run: |
+          set -euo pipefail
+          if [ -n "$VENDORED_PATH" ]; then
+            echo "SSD_TOOLKIT=$(cd "$VENDORED_PATH" && pwd)" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          test -n "$TOOLKIT_REF" || { echo "toolkit_ref is empty." >&2; exit 1; }
+          rm -rf "$RUNNER_TEMP/ssd-toolkit"
+          mv .ssd-toolkit-checkout "$RUNNER_TEMP/ssd-toolkit"
+          version="$(cat "$RUNNER_TEMP/ssd-toolkit/VERSION" 2>/dev/null || true)"
+          test -n "$version" || { echo "Toolkit checkout has no VERSION file." >&2; exit 1; }
+          major="${version#v}"; major="${major%%.*}"
+          [ "$major" = "$SSD_REQUIRED_TOOLKIT_MAJOR" ] || {
+            echo "Toolkit $version incompatible (needs major v${SSD_REQUIRED_TOOLKIT_MAJOR})." >&2
+            exit 1
+          }
+          echo "SSD_TOOLKIT=$RUNNER_TEMP/ssd-toolkit/security" >> "$GITHUB_ENV"
+          echo "Toolkit $version loaded."
+
+      - name: Resolve the effective policy
+        # A consumer may own its own thresholds. Default: the framework's policy,
+        # which travels with the toolkit and is therefore centrally fixable.
+        env:
+          POLICY_PATH: ${{ inputs.policy_path }}
+        run: |
+          if [ -n "$POLICY_PATH" ]; then
+            test -f "$POLICY_PATH" || {
+              echo "policy_path '$POLICY_PATH' does not exist in the consumer checkout." >&2
+              exit 1
+            }
+            echo "SSD_POLICY=$POLICY_PATH" >> "$GITHUB_ENV"
+            echo "::notice::Using the consumer's policy at '$POLICY_PATH'."
+          else
+            echo "SSD_POLICY=$SSD_TOOLKIT/policy.yaml" >> "$GITHUB_ENV"
+          fi
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ inputs.node_version }}
+          package-manager-cache: false
+
+      - name: Download secret scan reports
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: secret-scan-reports
+          path: reports
+
+      - name: Download dependency scan reports
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dependency-scan-reports
+          path: reports
+
+      - name: Download SAST report
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: sast-reports
+          path: reports
+
+      - name: Require explicit dev endpoints for a synthetic demo run
+        # A synthetic BLOCK must never fall back to the production endpoints.
+        # If synthetic_block_fixture is set, both URLs must be provided explicitly.
+        if: ${{ inputs.synthetic_block_fixture != 'none' && (inputs.break_glass_notify_url == '' || inputs.break_glass_status_url == '') }}
+        run: |
+          echo "A synthetic_block_fixture run must set BOTH break_glass_notify_url and break_glass_status_url." >&2
+          echo "Refusing to fall back to the production BREAK_GLASS_* endpoints for a synthetic BLOCK." >&2
+          exit 1
+
+      - name: Apply synthetic eligible BLOCK for a manual demo
+        # The fixtures travel with the TOOLKIT, so a consumer repo needs no
+        # fixture files of its own to run a demo.
+        if: ${{ inputs.synthetic_block_fixture != 'none' }}
+        env:
+          DEMO_TYPE: ${{ inputs.synthetic_block_fixture }}
+        run: |
+          FIXTURES="$SSD_TOOLKIT/scripts/__fixtures__"
+          case "$DEMO_TYPE" in
+            sast)
+              cp "$FIXTURES/new-high-sast/semgrep.json" reports/semgrep.json
+              ;;
+            dependency)
+              cp "$FIXTURES/critical-with-fix/npm-audit.json" reports/npm-audit.json
+              ;;
+            *)
+              echo "Unsupported synthetic block fixture: $DEMO_TYPE" >&2
+              exit 1
+              ;;
+          esac
+          echo "Applied synthetic $DEMO_TYPE BLOCK input; no live vulnerable fixture was activated"
+
+      - name: Evaluate security policy
+        id: evaluate
+        continue-on-error: true
+        run: >-
+          node "$SSD_TOOLKIT/scripts/security-gate.mjs"
+          --policy "$SSD_POLICY"
+          --baseline "${{ inputs.semgrep_baseline_path }}"
+
+      - name: Publish gate verdict
+        id: verdict
+        if: always()
+        run: |
+          verdict="$(node -e 'try{process.stdout.write(require("./reports/security-gate.json").verdict||"BLOCK")}catch{process.stdout.write("BLOCK")}')"
+          eligible="$(node -e 'try{process.stdout.write(String(require("./reports/security-gate.json").breakGlass?.eligible===true))}catch{process.stdout.write("false")}')"
+          # Fail closed: an unreadable or integrity-less gate result is untrusted.
+          trusted="$(node -e 'try{process.stdout.write(String(require("./reports/security-gate.json").integrity?.trusted===true))}catch{process.stdout.write("false")}')"
+          echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
+          echo "break_glass_eligible=$eligible" >> "$GITHUB_OUTPUT"
+          echo "integrity_trusted=$trusted" >> "$GITHUB_OUTPUT"
+          echo "SECURITY GATE: $verdict (break-glass eligible: $eligible, scan trusted: $trusted)"
+
+      - name: Confirm the BLOCK is eligible before loading any approval credential
+        if: ${{ steps.evaluate.outcome == 'failure' && inputs.gate_mode != 'log-only' && inputs.break_glass_enabled }}
+        run: node "$SSD_TOOLKIT/scripts/break-glass-notify.mjs" --check-only
+
+      - name: Validate break-glass transport configuration
+        if: ${{ steps.evaluate.outcome == 'failure' && inputs.gate_mode != 'log-only' && inputs.break_glass_enabled }}
+        env:
+          BREAK_GLASS_TRANSPORT: ${{ inputs.break_glass_transport }}
+          BREAK_GLASS_FUNCTION_NAME: ${{ inputs.break_glass_lambda_function }}
+          BREAK_GLASS_AWS_REGION: ${{ inputs.break_glass_aws_region }}
+          BREAK_GLASS_ROLE_ARN: ${{ inputs.break_glass_lambda_role_arn }}
+        run: |
+          case "$BREAK_GLASS_TRANSPORT" in
+            lambda)
+              test -n "$BREAK_GLASS_FUNCTION_NAME" || {
+                echo "Lambda transport requires a function name" >&2
+                exit 1
+              }
+              test -n "$BREAK_GLASS_AWS_REGION" || {
+                echo "Lambda transport requires an AWS region" >&2
+                exit 1
+              }
+              test -n "$BREAK_GLASS_ROLE_ARN" || {
+                echo "Lambda transport requires an IAM role ARN" >&2
+                exit 1
+              }
+              ;;
+            http)
+              ;;
+            *)
+              echo "Unsupported break-glass transport: $BREAK_GLASS_TRANSPORT" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Assume the break-glass invoker role (OIDC)
+        if: ${{ steps.evaluate.outcome == 'failure' && inputs.gate_mode != 'log-only' && inputs.break_glass_enabled && inputs.break_glass_transport == 'lambda' }}
+        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+        with:
+          role-to-assume: ${{ inputs.break_glass_lambda_role_arn }}
+          aws-region: ${{ inputs.break_glass_aws_region }}
+          role-session-name: break-glass-gate
+
+      - name: Request break-glass decision
+        if: ${{ steps.evaluate.outcome == 'failure' && inputs.gate_mode != 'log-only' && inputs.break_glass_enabled }}
+        env:
+          BREAK_GLASS_TRANSPORT: ${{ inputs.break_glass_transport }}
+          BREAK_GLASS_FUNCTION_NAME: ${{ inputs.break_glass_lambda_function }}
+          AWS_REGION: ${{ inputs.break_glass_aws_region }}
+
+          BREAK_GLASS_NOTIFY_URL: ${{ inputs.break_glass_notify_url }}
+          BREAK_GLASS_SHARED_SECRET: ${{ secrets.break_glass_shared_secret }}
+
+          BREAK_GLASS_TIMEOUT_SECONDS: ${{ inputs.break_glass_timeout_seconds }}
+          CI_REPOSITORY: ${{ github.repository }}
+          CI_COMMIT_SHA: ${{ github.sha }}
+          CI_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          CI_PULL_REQUEST: ${{ github.event.pull_request.number || inputs.pr_number }}
+          CI_SYSTEM: github-actions
+        run: node "$SSD_TOOLKIT/scripts/break-glass-notify.mjs"
+
+      - name: Wait for verified break-glass decision
+        id: break-glass
+        if: ${{ steps.evaluate.outcome == 'failure' && inputs.gate_mode != 'log-only' && inputs.break_glass_enabled }}
+        env:
+          BREAK_GLASS_TRANSPORT: ${{ inputs.break_glass_transport }}
+          BREAK_GLASS_FUNCTION_NAME: ${{ inputs.break_glass_lambda_function }}
+          AWS_REGION: ${{ inputs.break_glass_aws_region }}
+
+          BREAK_GLASS_STATUS_URL: ${{ inputs.break_glass_status_url }}
+          BREAK_GLASS_SHARED_SECRET: ${{ secrets.break_glass_shared_secret }}
+
+          BREAK_GLASS_TIMEOUT_SECONDS: ${{ inputs.break_glass_timeout_seconds }}
+        run: node "$SSD_TOOLKIT/scripts/break-glass-poll.mjs"
+
+      - name: Post developer-readable findings (Slack + PR comment + job summary)
+        # Feedback only — never fails the gate (the gate's own verdict decides the
+        # job result). Routing: BLOCK -> Slack + PR + summary; EXCEPTION -> PR +
+        # summary; break-glass eligible -> no plain ping (the interactive request
+        # owns Slack); gate_mode=log-only -> no Slack at all.
+        if: always()
+        continue-on-error: true
+        env:
+          GATE_MODE: ${{ inputs.gate_mode }}
+          GITHUB_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+          SECURITY_NOTIFY_SLACK_URL: ${{ inputs.slack_notify_url }}
+          SECURITY_REPRODUCE_COMMANDS: ${{ inputs.reproduce_commands }}
+        run: node "$SSD_TOOLKIT/scripts/notify.mjs" --gate reports/security-gate.json
+
+      - name: Flag an untrusted scan (blocks baseline generation)
+        # Runs in EVERY mode. In `log-only` an integrity BLOCK does not fail the
+        # job, which is exactly when this needs to be loud: the TUNE phase
+        # generates a Semgrep baseline from a log-only run, and baselining from a
+        # scan that could not interpret its input writes "no findings" into the
+        # permanently accepted state. generate-semgrep-baseline.mjs refuses on
+        # `integrity.trusted: false`; this makes the same fact visible to humans
+        # and ships a marker inside the reports artifact.
+        if: ${{ always() && steps.verdict.outputs.integrity_trusted != 'true' }}
+        run: |
+          {
+            echo "This repository's scan COULD NOT BE TRUSTED on this run."
+            echo
+            echo "A scanner could not interpret its input (missing or malformed report,"
+            echo "unidentifiable base image OS, or an end-of-life OS with no advisories)."
+            echo "The findings list is UNKNOWN, not clean."
+            echo
+            echo "DO NOT GENERATE A SEMGREP BASELINE FROM THIS RUN."
+            echo "Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } | tee reports/DO-NOT-BASELINE.txt >> "$GITHUB_STEP_SUMMARY"
+          node -e 'const f=(require("./reports/security-gate.json").integrity?.failures)||[];for(const x of f)console.log(`::error title=Untrusted scan — do not baseline::${x.source}: ${x.reason}`)' \
+            || echo "::error title=Untrusted scan — do not baseline::the gate result could not be read"
+
+      - name: Upload security gate decision
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: security-gate-results
+          path: |
+            reports/security-gate.json
+            reports/gate-exceptions.json
+            reports/break-glass-request.json
+            reports/break-glass-decision.json
+            reports/DO-NOT-BASELINE.txt
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Enforce the gate verdict
+        # The single place this job's pass/fail is decided.
+        #   enforce   -> a BLOCK (including a fail-closed report-integrity BLOCK)
+        #                fails the job, unless break-glass already approved it.
+        #   log-only  -> nothing fails. Onboarding mode only; announced loudly so
+        #                a repo cannot sit in log-only unnoticed.
+        if: always()
+        env:
+          GATE_MODE: ${{ inputs.gate_mode }}
+          VERDICT: ${{ steps.verdict.outputs.verdict }}
+          # 'success' only when the approval poll actually ran and returned a
+          # verified APPROVE; 'skipped' when break-glass was never entered.
+          BREAK_GLASS_OUTCOME: ${{ steps.break-glass.outcome }}
+        run: |
+          if [ "$GATE_MODE" = "log-only" ]; then
+            echo "::warning::gate_mode=log-only — verdict $VERDICT is reported but NOT enforced. This repository's security gate is not blocking."
+            exit 0
+          fi
+          if [ "$VERDICT" = "BLOCK" ]; then
+            if [ "$BREAK_GLASS_OUTCOME" = "success" ]; then
+              echo "::warning::Security gate verdict is BLOCK, overridden by a verified break-glass approval."
+              exit 0
+            fi
+            echo "Security gate verdict is BLOCK." >&2
+            exit 1
+          fi
+          echo "Security gate verdict is $VERDICT."

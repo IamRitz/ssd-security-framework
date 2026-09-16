@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "source": "aws-ecr-basic",
+  "scanStatus": "COMPLETE",
+  "image": {
+    "repository": "secure-software-delivery",
+    "imageTag": "demo-critical",
+    "imageDigest": "sha256:critical"
+  },
+  "severityCounts": {
+    "critical": 1
+  },
+  "findings": [
+    {
+      "id": "CVE-2099-DEMO",
+      "severity": "critical"
+    }
+  ]
+}

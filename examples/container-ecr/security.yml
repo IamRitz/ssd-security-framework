@@ -1,0 +1,144 @@
+# EXAMPLE CALLER — a repo that ships a container image to ECR and lets the
+# framework gate its deploy.
+#
+# Copy this to .github/workflows/security.yml in the consumer repo and change:
+#   - the image name in `container-build`
+#   - `semgrep_configs` to your language pack
+#   - `@v1` if you pin a different framework version
+#
+# TRIGGER OWNERSHIP: this file owns `pull_request` and `schedule`; deploy.yml
+# owns `push` to main and `workflow_dispatch`. Neither reacts to the other's
+# events, so the scanners run exactly once per event.
+#
+# SECURITY: keep this `pull_request` — never `pull_request_target`. The notifier
+# holds `pull-requests: write`; on `pull_request` GitHub forces the token
+# read-only for fork PRs, so untrusted fork code cannot write a comment or read
+# the Slack URL.
+name: Security checks
+
+on:
+  pull_request:
+    branches:
+      - main
+  schedule:
+    - cron: '0 6 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  source-security:
+    # NEVER change this to `secrets: inherit` — that would hand every repo secret
+    # to the scanning jobs.
+    uses: IamRitz/ssd-security-framework/.github/workflows/_source-security.yml@v1
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+    with:
+      # toolkit_ref MUST match the @v1 above. See docs/versioning.md.
+      toolkit_ref: v1
+      gate_mode: ${{ vars.GATE_MODE || 'enforce' }}
+      semgrep_configs: |
+        p/owasp-top-ten
+        p/javascript
+      semgrep_paths: src
+      slack_notify_url: ${{ vars.SECURITY_NOTIFY_SLACK_URL }}
+      break_glass_enabled: true
+      break_glass_transport: lambda
+      break_glass_lambda_role_arn: ${{ vars.BREAK_GLASS_LAMBDA_ROLE_ARN }}
+      break_glass_lambda_function: ${{ vars.BREAK_GLASS_LAMBDA_FUNCTION }}
+      break_glass_aws_region: ${{ vars.AWS_REGION }}
+
+  security-gate:
+    # Stable check name for branch protection. A reusable workflow reports its
+    # inner jobs as `caller-job / inner-job`, so this republishes the verdict
+    # under the exact name the branch protection rule matches. The name is a
+    # CONSTANT — a name computed from the gate mode would stop matching in one
+    # mode and the rule would silently protect nothing.
+    name: security-gate
+    needs: source-security
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report the source security verdict
+        env:
+          RESULT: ${{ needs.source-security.result }}
+          VERDICT: ${{ needs.source-security.outputs.verdict }}
+          MODE: ${{ needs.source-security.outputs.gate_mode }}
+        run: |
+          echo "Source security verdict: ${VERDICT:-unknown} (job result: $RESULT)"
+          if [ "$MODE" = "log-only" ]; then
+            echo "::warning::GREEN BY CONFIGURATION, not by verdict — gate_mode is log-only."
+          fi
+          if [ "$RESULT" != "success" ]; then
+            exit 1
+          fi
+
+  container-build:
+    # Repo-specific: the consumer owns its own build. Holds ZERO cloud
+    # credentials — it builds the image and uploads it as a tarball artifact.
+    name: Container build
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - name: Build without AWS credentials
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          load: true
+          tags: your-app:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Export image tarball
+        run: docker save -o application-image.tar "your-app:$GITHUB_SHA"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: application-image-${{ github.sha }}
+          path: application-image.tar
+          if-no-files-found: error
+          retention-days: 1
+
+  image-security:
+    needs: container-build
+    if: github.event_name != 'schedule'
+    uses: IamRitz/ssd-security-framework/.github/workflows/_image-scan-prepush.yml@v1
+    permissions:
+      contents: read
+      pull-requests: write
+    with:
+      toolkit_ref: v1
+      image_artifact: application-image-${{ github.sha }}
+      gate_mode: ${{ vars.GATE_MODE || 'enforce' }}
+      slack_notify_url: ${{ vars.SECURITY_NOTIFY_SLACK_URL }}
+
+  conformance:
+    # Declares what this repo IS, so controls that do not apply are reported N/A
+    # with a reason rather than silently skipped.
+    needs:
+      - source-security
+      - image-security
+    if: ${{ always() && github.event_name != 'schedule' }}
+    uses: IamRitz/ssd-security-framework/.github/workflows/_conformance.yml@v1
+    with:
+      toolkit_ref: v1
+      artifact_type: container
+      registry: ecr
+      deploy_target: framework-gated
+      break_glass_enabled: true
+      observed: >-
+        {"secret-scan":{"status":"${{ needs.source-security.result }}"},
+         "dependency-scan":{"status":"${{ needs.source-security.result }}"},
+         "sast":{"status":"${{ needs.source-security.result }}"},
+         "source-gate":{"status":"${{ needs.source-security.result }}"},
+         "image-scan-prepush":{"status":"${{ needs.image-security.result }}"},
+         "break-glass":{"status":"pass","evidence":"configured"},
+         "registry-scan-collect":{"status":"pass","evidence":"runs on push to main"},
+         "artifact-gate":{"status":"pass","evidence":"runs on push to main"},
+         "gated-deploy":{"status":"pass","evidence":"runs on push to main"}}

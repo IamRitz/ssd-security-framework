@@ -1,0 +1,15 @@
+{
+  "imageScanFindings": {
+    "findings": [],
+    "imageScanCompletedAt": "2026-09-14T05:19:40.375000+00:00"
+  },
+  "registryId": "123456789012",
+  "repositoryName": "secure-software-delivery",
+  "imageId": {
+    "imageDigest": "sha256:c8646f70f38c9c74bb0e917656df2c8d2eb31d356c8eef6732082c19b907a487"
+  },
+  "imageScanStatus": {
+    "status": "COMPLETE",
+    "description": "The scan was completed successfully."
+  }
+}

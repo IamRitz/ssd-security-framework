@@ -1,0 +1,15 @@
+{
+  "SchemaVersion": 2,
+  "CreatedAt": "2026-09-10T00:00:00Z",
+  "ArtifactName": "secure-software-delivery:abc",
+  "ArtifactType": "container_image",
+  "Metadata": { "ImageID": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "OS": { "Family": "alpine", "Name": "3.24.1", "EOSL": false } },
+  "Results": [
+    { "Target": "alpine", "Class": "os-pkgs", "Type": "alpine",
+      "Vulnerabilities": [
+        { "VulnerabilityID": "CVE-2099-0001", "PkgName": "libssl3", "InstalledVersion": "3.5.7", "FixedVersion": "3.5.8", "Severity": "CRITICAL" },
+        { "VulnerabilityID": "CVE-2099-0002", "PkgName": "busybox", "InstalledVersion": "1.0", "FixedVersion": "", "Severity": "LOW" }
+      ] }
+  ]
+}

@@ -1,0 +1,249 @@
+name: ECR collect (reusable)
+
+# THE ECR ADAPTER — the only workflow in this set that knows what ECR is.
+#
+# It pushes the built image tarball to Amazon ECR, polls the ECR scan-on-push
+# result BY DIGEST, and normalizes the result into the shared report schema that
+# `_artifact-gate.yml` evaluates. Swapping registries means writing a sibling
+# collector (`_gar-collect.yml`, `_acr-collect.yml`, ...) that emits the same
+# normalized report; the gate and the policy do not change.
+#
+# CREDENTIAL BOUNDARY: this workflow DOES assume an AWS role — it is the push
+# side of the boundary and the only security-adjacent workflow that holds cloud
+# credentials. It holds the ECR push+scan role only; the SSM deploy role stays in
+# the caller's own deploy job. It makes NO policy decision: the scan report it
+# emits is judged by `_artifact-gate.yml`, which holds no credentials at all.
+
+on:
+  workflow_call:
+    inputs:
+      image_artifact:
+        description: Name of the uploaded artifact containing the image tarball.
+        type: string
+        required: true
+      image_tarball:
+        description: File name of the `docker save` tarball inside that artifact.
+        type: string
+        default: application-image.tar
+      local_image_ref:
+        description: The `name:tag` the tarball loads as, used for the pre-push identity assertion.
+        type: string
+        required: true
+      expected_image_id:
+        description: Image config digest Trivy scanned pre-push. A mismatch means a different image slipped in between scan and push — fail closed.
+        type: string
+        required: true
+      role_arn:
+        description: OIDC role with ECR push + scan-findings read on this repository.
+        type: string
+        required: true
+      aws_region:
+        description: AWS region of the ECR repository.
+        type: string
+        required: true
+      ecr_repository:
+        description: ECR repository name.
+        type: string
+        required: true
+      immutable_tag:
+        description: Immutable tag to push (conventionally the commit SHA).
+        type: string
+        required: true
+      extra_tags:
+        description: Whitespace separated additional mutable tags to push (e.g. `demo`).
+        type: string
+        default: ''
+      node_version:
+        description: Node version used to run the poll/normalize script (tool dependency).
+        type: string
+        default: '24.21.0'
+      toolkit_repository:
+        description: Framework repository holding policy.yaml and scripts/.
+        type: string
+        default: IamRitz/ssd-security-framework
+      toolkit_ref:
+        description: Ref of the framework repository the toolkit is loaded from. Must match the ref the caller pinned this workflow to.
+        type: string
+        default: v1
+      toolkit_path:
+        description: Escape hatch for a toolkit already vendored in the caller's checkout. Empty means check the framework out.
+        type: string
+        default: ''
+      report_artifact:
+        description: Name of the artifact this workflow uploads the normalized report as.
+        type: string
+        default: registry-image-scan
+    outputs:
+      registry:
+        description: The ECR registry host the image was pushed to.
+        value: ${{ jobs.ecr-collect.outputs.registry }}
+      image_digest:
+        description: The immutable manifest digest of the pushed image.
+        value: ${{ jobs.ecr-collect.outputs.image_digest }}
+      report_artifact:
+        description: Artifact name holding the normalized scan report, to hand to `_artifact-gate.yml`.
+        value: ${{ jobs.ecr-collect.outputs.report_artifact }}
+      report_path:
+        description: Path of the normalized report once that artifact is downloaded into `reports/`.
+        value: reports/registry-image-scan.json
+
+permissions:
+  contents: read
+
+env:
+  SSD_REQUIRED_TOOLKIT_MAJOR: '1'
+
+jobs:
+  ecr-collect:
+    name: ECR push and scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      registry: ${{ steps.ecr-login.outputs.registry }}
+      image_digest: ${{ steps.push.outputs.image_digest }}
+      report_artifact: ${{ inputs.report_artifact }}
+    steps:
+      - name: Check out the consumer repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check out the security framework toolkit
+        if: ${{ inputs.toolkit_path == '' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.toolkit_repository }}
+          ref: ${{ inputs.toolkit_ref }}
+          path: .ssd-toolkit-checkout
+          persist-credentials: false
+
+      - name: Place the toolkit outside the workspace
+        env:
+          VENDORED_PATH: ${{ inputs.toolkit_path }}
+          TOOLKIT_REF: ${{ inputs.toolkit_ref }}
+        run: |
+          set -euo pipefail
+          if [ -n "$VENDORED_PATH" ]; then
+            echo "SSD_TOOLKIT=$(cd "$VENDORED_PATH" && pwd)" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          test -n "$TOOLKIT_REF" || { echo "toolkit_ref is empty." >&2; exit 1; }
+          rm -rf "$RUNNER_TEMP/ssd-toolkit"
+          mv .ssd-toolkit-checkout "$RUNNER_TEMP/ssd-toolkit"
+          version="$(cat "$RUNNER_TEMP/ssd-toolkit/VERSION" 2>/dev/null || true)"
+          test -n "$version" || { echo "Toolkit checkout has no VERSION file." >&2; exit 1; }
+          major="${version#v}"; major="${major%%.*}"
+          [ "$major" = "$SSD_REQUIRED_TOOLKIT_MAJOR" ] || {
+            echo "Toolkit $version incompatible (needs major v${SSD_REQUIRED_TOOLKIT_MAJOR})." >&2
+            exit 1
+          }
+          echo "SSD_TOOLKIT=$RUNNER_TEMP/ssd-toolkit/security" >> "$GITHUB_ENV"
+          echo "Toolkit $version loaded."
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ inputs.node_version }}
+          package-manager-cache: false
+
+      - name: Download image tarball
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ inputs.image_artifact }}
+
+      - name: Load application image
+        run: docker load -i "${{ inputs.image_tarball }}"
+
+      - name: Assume the ECR push+scan role
+        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+        with:
+          role-to-assume: ${{ inputs.role_arn }}
+          aws-region: ${{ inputs.aws_region }}
+          role-session-name: ssd-ecr-push-scan
+
+      - name: Log in to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+
+      - name: Verify identity, push, and record the pushed manifest digest
+        id: push
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          ECR_REPOSITORY: ${{ inputs.ecr_repository }}
+          LOCAL_IMAGE_REF: ${{ inputs.local_image_ref }}
+          EXPECTED_IMAGE_ID: ${{ inputs.expected_image_id }}
+          IMMUTABLE_TAG: ${{ inputs.immutable_tag }}
+          EXTRA_TAGS: ${{ inputs.extra_tags }}
+        run: |
+          # Digest chain link 1 (build/scan -> push): the loaded artifact's config
+          # digest must equal the ImageID Trivy scanned pre-push, or a different
+          # image slipped in between scan and push.
+          loaded_id="$(docker inspect --format '{{.Id}}' "$LOCAL_IMAGE_REF")"
+          if [ "$loaded_id" != "$EXPECTED_IMAGE_ID" ]; then
+            echo "loaded image $loaded_id != Trivy-scanned $EXPECTED_IMAGE_ID" >&2
+            exit 1
+          fi
+          target="$ECR_REGISTRY/$ECR_REPOSITORY"
+          docker tag "$LOCAL_IMAGE_REF" "$target:$IMMUTABLE_TAG"
+          docker push "$target:$IMMUTABLE_TAG"
+          for tag in $EXTRA_TAGS; do
+            docker tag "$LOCAL_IMAGE_REF" "$target:$tag"
+            docker push "$target:$tag"
+          done
+          # Digest chain link 2: capture the immutable pushed manifest digest that
+          # the scan (below) and the caller's deploy job pin to.
+          digest="$(docker inspect --format '{{index .RepoDigests 0}}' "$target:$IMMUTABLE_TAG" | cut -d@ -f2)"
+          echo "image_digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "pushed manifest digest: $digest"
+
+      - name: Poll the ECR image scan (by digest) and normalize it
+        continue-on-error: true
+        env:
+          ECR_REPOSITORY: ${{ inputs.ecr_repository }}
+          AWS_REGION: ${{ inputs.aws_region }}
+          IMMUTABLE_TAG: ${{ inputs.immutable_tag }}
+          # Digest chain link 3 (push -> scan): poll ECR for the exact manifest
+          # just pushed, not whatever the tag currently points at.
+          IMAGE_DIGEST: ${{ steps.push.outputs.image_digest }}
+        run: |
+          mkdir -p reports
+          # Capture the poller's status instead of letting `bash -e` abort the
+          # step: the empty-report guarantee below must run even when polling
+          # fails, or it guarantees nothing.
+          poll_status=0
+          node "$SSD_TOOLKIT/scripts/poll-ecr-scan.mjs" \
+            --repository "$ECR_REPOSITORY" \
+            --image-digest "$IMAGE_DIGEST" \
+            --image-tag "$IMMUTABLE_TAG" \
+            --region "$AWS_REGION" \
+            --output reports/registry-image-scan.json \
+            --raw-output reports/ecr-raw-response.json || poll_status=$?
+          # Guarantee the artifact exists even on a poll failure, so the artifact
+          # gate fail-closes to BLOCK_DEPLOY on the empty report rather than
+          # erroring on a missing artifact.
+          [ -s reports/registry-image-scan.json ] || printf '' > reports/registry-image-scan.json
+          exit "$poll_status"
+
+      - name: Upload the normalized scan report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ inputs.report_artifact }}
+          path: reports/registry-image-scan.json
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload the raw registry responses (evidence, not a gate input)
+        # Every DescribeImageScanFindings attempt: exit code, stderr, and the raw
+        # body. This is how the real basic/enhanced response shape and any
+        # permission error are observed, and it is the registry side of the
+        # Trivy-vs-registry comparison. Nothing downstream reads it.
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ecr-raw-response
+          path: reports/ecr-raw-response.json
+          if-no-files-found: warn
+          retention-days: 14
