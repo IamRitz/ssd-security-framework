@@ -19,7 +19,7 @@ import {
   parseRequirements,
   versionKey
 } from '../security/scripts/dependency-evidence.mjs';
-import { buildReport, renderMarkdown } from '../security/scripts/format-findings.mjs';
+import { buildReport, renderEvidenceMarkdown, renderMarkdown } from '../security/scripts/format-findings.mjs';
 import { runSecurityGate } from '../security/scripts/security-gate.mjs';
 
 const FIXTURES = resolve('security/scripts/__fixtures__');
@@ -74,7 +74,12 @@ async function gate({ requirements = null, pipAudit = null, osv = join(CLEAN, 'o
 const liveGate = (overrides = {}) =>
   gate({ requirements: 'requests==2.33.0\n', pipAudit: join(LIVE, 'pip-audit.json'), osv: join(LIVE, 'osv-scanner.json'), ...overrides });
 
-const markdownOf = (result) => renderMarkdown(buildReport({ gate: result, mode: 'enforce' }));
+// The job summary plus the full evidence document: a non-blocking INFO issue's
+// card is only in the latter, and every assertion must hold across both.
+const markdownOf = (result) => {
+  const report = buildReport({ gate: result, mode: 'enforce' });
+  return `${renderMarkdown(report)}\n${renderEvidenceMarkdown(report)}`;
+};
 
 // The policy record: everything a decision is made from or recorded as.
 const policyView = (result) => ({

@@ -14,7 +14,7 @@ import { join, resolve } from 'node:path';
 import { describe, it } from 'node:test';
 
 import { correlateFindings, correlationRecord } from '../security/scripts/correlate-findings.mjs';
-import { buildReport, renderMarkdown, renderSlack } from '../security/scripts/format-findings.mjs';
+import { buildReport, renderEvidenceMarkdown, renderMarkdown, renderSlack } from '../security/scripts/format-findings.mjs';
 import { runSecurityGate } from '../security/scripts/security-gate.mjs';
 
 const FIXTURES = resolve('security/scripts/__fixtures__');
@@ -107,9 +107,12 @@ describe('the live requests + idna run', () => {
     assert.match(markdown, /\*\*1\*\* blocking · \*\*0\*\* exception · \*\*1\*\* logged/);
     assert.match(markdown, /\*\*2\*\* unique issues from \*\*5\*\* scanner findings/);
     assert.match(markdown, /### ⛔ Blocking findings \(1\)/);
-    assert.match(markdown, /### 📝 Logged \(non-blocking\) \(1\)/);
+    // The logged idna issue has conflicting version evidence, so it is shown as
+    // REVIEW (presentation only; its policy action stays LOG).
+    assert.match(markdown, /### ⚖️ Needs review — non-blocking, evidence disagrees \(1\)/);
+    assert.equal(report.issues.find((issue) => issue.package === 'idna').action, 'LOG');
 
-    const blocking = markdown.slice(markdown.indexOf('### ⛔'), markdown.indexOf('### 📝'));
+    const blocking = markdown.slice(markdown.indexOf('### ⛔'), markdown.indexOf('### ⚖️'));
     assert.match(blocking, /\*\*`requests` 2\.32\.5 — CVE-2026-25645\*\*/);
     assert.match(blocking, /`CVE-2026-25645`, `GHSA-gc5v-m9x4-r6x2`, `PYSEC-2026-2275`/);
     assert.match(
@@ -128,7 +131,7 @@ describe('the live requests + idna run', () => {
     assert.match(blocking, /Fixed version\(s\): 2\.33\.0 \(pip-audit, OSV-Scanner\)/, 'fix provenance per source');
 
     // Not duplicated as extra LOG entries.
-    const logged = markdown.slice(markdown.indexOf('### 📝'));
+    const logged = markdown.slice(markdown.indexOf('### ⚖️'), markdown.indexOf('\n---\n'));
     assert.doesNotMatch(logged, /requests/);
     // pip-audit listed idna 3.19 (no advisory) while OSV-Scanner matched 3.9.0:
     // neither version is headlined as the one in use.
@@ -291,7 +294,11 @@ describe('correlation is supported only by identity evidence', () => {
     const markdown = renderMarkdown(report);
     assert.match(markdown, /### ⚠️ Tracked exceptions \(no fix available — passed deliberately\) \(1\)/);
     assert.match(markdown, /`pkg` 1\.0\.0 — CVE-5/);
-    assert.match(markdown, /Medium-severity advisory PYSEC-6 in PyPI dependency `pkg` 1\.0\.0/);
+    // The standalone LOG record is an INFO row in the summary; its original
+    // single-record card is kept in the full evidence document.
+    assert.match(markdown, /\| ℹ️ INFO \| Medium \| `pkg` \| `CVE-6` \| unknown \| 1\.0\.0 \| — \|/);
+    assert.doesNotMatch(markdown, /Medium-severity advisory PYSEC-6/);
+    assert.match(renderEvidenceMarkdown(report), /Medium-severity advisory PYSEC-6 in PyPI dependency `pkg` 1\.0\.0/);
     assert.equal(report.issues.length, 2);
   });
 });

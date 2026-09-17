@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { correlationRecord } from './correlate-findings.mjs';
 import { collectDependencyEvidenceSafely } from './dependency-evidence.mjs';
 import { detectEcosystems } from './detect-ecosystems.mjs';
+import { EXECUTION_SCHEMA_VERSION, readExecutionRecords } from './scanner-execution.mjs';
 
 const VALID_ACTIONS = new Set(['BLOCK', 'BLOCK_DEPLOY', 'EXCEPTION', 'LOG']);
 
@@ -20,6 +21,9 @@ const DEFAULT_PATHS = {
   pipAudit: 'reports/pip-audit.json',
   osv: 'reports/osv-scanner.json',
   semgrep: 'reports/semgrep.json',
+  // Scanner execution record written by the SAST job (scanner-execution.mjs).
+  // Optional evidence about WHY a report is missing; never a policy input.
+  semgrepExecution: 'reports/scanner-execution-semgrep.json',
   baseline: 'security/baseline/semgrep-baseline.json',
   output: 'reports/security-gate.json',
   exceptions: 'reports/gate-exceptions.json'
@@ -905,6 +909,14 @@ export async function runSecurityGate(options = {}) {
   const { bootstrap = false, ...customPaths } = options;
   const paths = { ...DEFAULT_PATHS, ...customPaths };
   let result;
+  // Read BEFORE any report and outside the try: execution evidence must be
+  // present on a report-integrity result — that is exactly when it explains
+  // something — and reading it never throws, so it cannot create or clear an
+  // integrity failure.
+  const scannerExecution = {
+    schemaVersion: EXECUTION_SCHEMA_VERSION,
+    records: await readExecutionRecords({ semgrep: paths.semgrepExecution })
+  };
 
   try {
     const policy = await attributed('source-gate', async () => {
@@ -978,6 +990,10 @@ export async function runSecurityGate(options = {}) {
       // scanner observed, and the manifests those scanners analyzed. See
       // docs/evidence-model.md. Never read by a policy decision.
       dependencyEvidence,
+      // Scanner execution evidence (additive): whether each recorded scanner
+      // acquired its image, ran, and wrote a valid report. Kept apart from
+      // `integrity` (could the gate trust a report) and from findings.
+      scannerExecution,
       breakGlass: breakGlassSummary(verdict, findings)
     };
   } catch (error) {
@@ -1000,6 +1016,7 @@ export async function runSecurityGate(options = {}) {
       bootstrap: bootstrapState(bootstrap),
       findings: [finding],
       correlation: correlationRecord([finding]),
+      scannerExecution,
       breakGlass: breakGlassSummary('BLOCK', [finding])
     };
   }
@@ -1018,6 +1035,7 @@ function parseArguments(arguments_) {
     '--pip-audit': 'pipAudit',
     '--osv': 'osv',
     '--semgrep': 'semgrep',
+    '--semgrep-execution': 'semgrepExecution',
     '--baseline': 'baseline',
     '--output': 'output',
     '--exceptions': 'exceptions'

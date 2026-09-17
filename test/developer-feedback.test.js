@@ -21,6 +21,7 @@ import {
   breakGlassNotice,
   buildReport,
   deriveBreakGlassState,
+  renderEvidenceMarkdown,
   renderMarkdown,
   renderSlack
 } from '../security/scripts/format-findings.mjs';
@@ -102,7 +103,11 @@ function render(gate, { context = CONTEXT, mode = 'enforce', breakGlass } = {}) 
   const comment = renderMarkdown(report, { includeMarker: true });
   const summary = renderMarkdown(report, { includeMarker: false });
   const slack = JSON.stringify(renderSlack(report));
-  return { report, comment, summary, slack, all: `${comment}\n${summary}\n${slack}` };
+  // The bounded summary shows INFO issues as table rows only; their full cards
+  // live in the evidence document. `all` spans every surface, so a wording rule
+  // (and every doesNotMatch) holds wherever the card is rendered.
+  const evidence = renderEvidenceMarkdown(report);
+  return { report, comment, summary, slack, evidence, all: `${comment}\n${summary}\n${slack}\n${evidence}` };
 }
 
 function fakeSurfaces() {

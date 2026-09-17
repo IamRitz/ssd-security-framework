@@ -410,3 +410,201 @@ describe('the scanner steps no longer mask failure', () => {
     });
   }
 });
+
+// ---- 3. Semgrep: image acquisition is separate from, and retried unlike, execution ----
+//
+// Regression (live run IamRitz/ssd-scratch-consumer 35233605122, attempt 1): the
+// pinned Semgrep image could not be pulled (connection reset talking to Docker
+// Hub), the scanner never ran, and the only visible cause was a missing report.
+// The REAL SAST step script runs here with a scripted `docker` that counts pulls
+// and runs separately.
+
+const SOURCE_WORKFLOW = '.github/workflows/_source-security.yml';
+const SAST_STEP = 'Run Semgrep OSS (report only)';
+const PINNED_SEMGREP = 'semgrep/semgrep@sha256:12672acdb0949e19f9f6a4c2b288edd0b404f268f0ca7738a2c06f372f50362e';
+const REGISTRY_RESET =
+  'docker: Error response from daemon: Get "https://auth.docker.io/token?scope=repository%3Asemgrep%2Fsemgrep%3Apull": read tcp 10.1.0.94:48212->98.85.153.80:443: read: connection reset by peer';
+
+const SEMGREP_STUB_BIN = join(WORK, 'semgrep-bin');
+mkdirSync(SEMGREP_STUB_BIN, { recursive: true });
+writeFileSync(
+  join(SEMGREP_STUB_BIN, 'docker'),
+  [
+    '#!/usr/bin/env bash',
+    'echo "$*" >> "$STUB_CALLS"',
+    'case "$1" in',
+    '  image) exit 1 ;;',
+    '  pull)',
+    '    n=$(( $(cat "$STUB_PULLS" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$STUB_PULLS"',
+    '    if [ "$n" -le "${STUB_PULL_FAILURES:-0}" ]; then echo "${STUB_PULL_ERROR}" >&2; exit 1; fi',
+    '    exit 0 ;;',
+    '  run)',
+    '    case "$*" in *--pull=never*) ;; *) echo "stub: docker run without --pull=never" >&2; exit 99 ;; esac',
+    '    if [ -n "${STUB_RUN_REPORT:-}" ]; then cp "$STUB_RUN_REPORT" "$GITHUB_WORKSPACE/reports/semgrep.json"; fi',
+    '    exit "${STUB_RUN_EXIT:-0}" ;;',
+    'esac',
+    'exit 98',
+    ''
+  ].join('\n')
+);
+chmodSync(join(SEMGREP_STUB_BIN, 'docker'), 0o755);
+
+function stepEnvValue(file, step, name) {
+  const source = readFileSync(join(FRAMEWORK, file), 'utf8');
+  const start = source.indexOf(`- name: ${step}\n`);
+  const block = source.slice(start, source.indexOf('\n      - name:', start + 1));
+  return new RegExp(`^\\s+${name}: (.+)$`, 'm').exec(block)?.[1].trim();
+}
+
+function semgrepStep(stub) {
+  const workspace = mkdtempSync(join(WORK, 'sast-'));
+  mkdirSync(join(workspace, 'reports'));
+  const calls = join(workspace, 'docker-calls');
+  writeFileSync(calls, '');
+  const result = runStep(
+    SOURCE_WORKFLOW,
+    SAST_STEP,
+    {
+      GITHUB_WORKSPACE: workspace,
+      SSD_TOOLKIT: join(FRAMEWORK, 'security'),
+      SEMGREP_CONFIGS: 'p/owasp-top-ten',
+      SEMGREP_PATHS: '.',
+      SEMGREP_BASELINE: '',
+      SEMGREP_IMAGE: stepEnvValue(SOURCE_WORKFLOW, SAST_STEP, 'SEMGREP_IMAGE'),
+      EXECUTION_RECORD: stepEnvValue(SOURCE_WORKFLOW, SAST_STEP, 'EXECUTION_RECORD'),
+      SSD_IMAGE_ACQUIRE_BACKOFF_MS: '0',
+      STUB_CALLS: calls,
+      STUB_PULLS: join(workspace, 'pull-count'),
+      STUB_PULL_ERROR: REGISTRY_RESET,
+      ...stub
+    },
+    { cwd: workspace, path: `${SEMGREP_STUB_BIN}:${process.env.PATH}` }
+  );
+  const lines = readFileSync(calls, 'utf8').split('\n').filter(Boolean);
+  let record = null;
+  try {
+    record = JSON.parse(readFileSync(join(workspace, 'reports/scanner-execution-semgrep.json'), 'utf8'));
+  } catch {
+    // absent record is asserted by the caller
+  }
+  return {
+    ...result,
+    record,
+    pulls: lines.filter((line) => line.startsWith('pull ')).length,
+    runs: lines.filter((line) => line.startsWith('run ')).length,
+    calls: lines
+  };
+}
+
+const SEMGREP_CLEAN_REPORT = join(FRAMEWORK, 'security/scripts/__fixtures__/clean/semgrep.json');
+
+describe('Semgrep step: acquire (bounded retry) -> run once -> complete', () => {
+  it('the pinned image identity is unchanged and is what gets pulled and run', () => {
+    assert.equal(stepEnvValue(SOURCE_WORKFLOW, SAST_STEP, 'SEMGREP_IMAGE'), PINNED_SEMGREP);
+    const { code, out, calls } = semgrepStep({ STUB_RUN_REPORT: SEMGREP_CLEAN_REPORT });
+    assert.equal(code, 0, out);
+    assert.ok(calls.includes(`pull ${PINNED_SEMGREP}`));
+    assert.ok(calls.some((line) => line.startsWith('run --rm --pull=never') && line.includes(PINNED_SEMGREP)));
+  });
+
+  it('a transient registry failure on attempt 1 is retried, and the scan then runs exactly once', () => {
+    const { code, out, record, pulls, runs } = semgrepStep({ STUB_PULL_FAILURES: '1', STUB_RUN_REPORT: SEMGREP_CLEAN_REPORT });
+    assert.equal(code, 0, out);
+    assert.equal(pulls, 2);
+    assert.equal(runs, 1);
+    assert.match(out, /attempt 1\/3/);
+    assert.match(out, /Acquired .* on attempt 2\/3/);
+    assert.equal(record.state, 'success');
+    assert.deepEqual(record.acquisition.attempts.map((attempt) => attempt.outcome), ['failed', 'acquired']);
+  });
+
+  it('succeeds on attempt 3', () => {
+    const { code, record, pulls, runs } = semgrepStep({ STUB_PULL_FAILURES: '2', STUB_RUN_REPORT: SEMGREP_CLEAN_REPORT });
+    assert.equal(code, 0);
+    assert.deepEqual([pulls, runs, record.state], [3, 1, 'success']);
+  });
+
+  it('exhausting 3 attempts fails the step, never runs the scanner, and records acquisition-failed', () => {
+    const { code, out, record, pulls, runs } = semgrepStep({ STUB_PULL_FAILURES: '9', STUB_RUN_REPORT: SEMGREP_CLEAN_REPORT });
+    assert.notEqual(code, 0, 'fail closed');
+    assert.equal(pulls, 3);
+    assert.equal(runs, 0);
+    assert.deepEqual([record.state, record.cause, record.retryable], ['acquisition-failed', 'registry-network', true]);
+    assert.match(out, /::error title=Semgrep could not start — scanner image unavailable::/);
+    assert.match(out, /not a vulnerability finding/);
+  });
+
+  it('a registry auth failure is not retried', () => {
+    const { code, record, pulls, runs } = semgrepStep({ STUB_PULL_FAILURES: '9', STUB_PULL_ERROR: 'unauthorized: authentication required' });
+    assert.notEqual(code, 0);
+    assert.deepEqual([pulls, runs, record.cause, record.retryable], [1, 0, 'registry-auth', false]);
+  });
+
+  for (const [exit, cause] of [
+    ['2', 'scanner-runtime'],
+    ['7', 'scanner-configuration'],
+    ['137', 'scanner-runtime']
+  ]) {
+    it(`a scanner failure (exit ${exit}) fails the step, is NOT retried, and is not a registry cause`, () => {
+      const { code, out, record, pulls, runs } = semgrepStep({ STUB_RUN_EXIT: exit, STUB_RUN_REPORT: SEMGREP_CLEAN_REPORT });
+      assert.notEqual(code, 0, 'the runtime failure is not swallowed');
+      assert.equal(pulls, 1);
+      assert.equal(runs, 1, 'scanner execution runs exactly once');
+      assert.deepEqual([record.state, record.cause], ['execution-failed', cause]);
+      assert.match(out, /::error title=Semgrep execution-failed::/);
+    });
+  }
+
+  it('exit 0 with no report fails as report-missing', () => {
+    const { code, record, runs } = semgrepStep({});
+    assert.notEqual(code, 0);
+    assert.deepEqual([runs, record.state, record.cause], [1, 'report-missing', 'report-validation']);
+  });
+
+  it('exit 0 with a malformed report fails as report-invalid', () => {
+    const malformed = join(WORK, 'malformed-semgrep.json');
+    writeFileSync(malformed, '{ "version": "1" }');
+    const { code, record } = semgrepStep({ STUB_RUN_REPORT: malformed });
+    assert.notEqual(code, 0);
+    assert.equal(record.state, 'report-invalid');
+  });
+
+  it('an empty ruleset is refused before any image is pulled, with a configuration record', () => {
+    const { code, record, calls } = semgrepStep({ SEMGREP_CONFIGS: '' });
+    assert.notEqual(code, 0);
+    assert.deepEqual(calls, []);
+    assert.deepEqual([record.state, record.cause], ['execution-failed', 'scanner-configuration']);
+  });
+
+  it('the step masks nothing: no `|| true`, no continue-on-error, no :latest, and no loop around the scan', () => {
+    const source = readFileSync(join(FRAMEWORK, SOURCE_WORKFLOW), 'utf8');
+    const start = source.indexOf(`- name: ${SAST_STEP}\n`);
+    const block = source
+      .slice(start, source.indexOf('\n      - name:', start + 1))
+      .split('\n')
+      .filter((line) => !/^\s*#/.test(line))
+      .join('\n');
+    assert.ok(!/^\s*continue-on-error:/m.test(block));
+    assert.ok(!/\|\|\s*true/.test(block));
+    assert.ok(!/:latest\b/.test(block));
+    const script = stepScript(SOURCE_WORKFLOW, SAST_STEP)
+      .split('\n')
+      .filter((line) => !/^\s*#/.test(line))
+      .join('\n');
+    const acquire = script.indexOf('scanner-execution.mjs" acquire');
+    const run = script.indexOf('docker run');
+    const complete = script.indexOf('scanner-execution.mjs" complete');
+    assert.ok(acquire >= 0 && acquire < run && run < complete, 'acquire, then run, then complete');
+    assert.equal(script.split('docker run').length - 1, 1, 'exactly one scanner invocation');
+    assert.doesNotMatch(script.slice(acquire, complete), /\b(for|while|until)\b/, 'no retry loop around the scanner run');
+    assert.match(script, /docker run --rm --pull=never/);
+  });
+
+  it('the SAST artifact carries the execution record even when the scan failed', () => {
+    const source = readFileSync(join(FRAMEWORK, SOURCE_WORKFLOW), 'utf8');
+    const start = source.indexOf('- name: Upload SAST report\n');
+    const block = source.slice(start, source.indexOf('\n      - name:', start + 1));
+    assert.match(block, /if: always\(\)/);
+    assert.match(block, /reports\/scanner-execution-semgrep\.json/);
+  });
+});

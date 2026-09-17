@@ -674,9 +674,26 @@ jobs:
         # of another language reports near-zero findings, which reads as a clean
         # pass rather than a misconfiguration — the same false-clean risk as
         # Trivy failing to identify a base-image OS.
+        #
+        # THREE PHASES, EACH WITH ITS OWN EVIDENCE (scanner-execution.mjs), all
+        # recorded in reports/scanner-execution-semgrep.json:
+        #   1. acquire  pull the PINNED image by digest. The only retried phase:
+        #               at most 3 pulls, and only for a registry failure the
+        #               error text shows to be transient (network, rate limit).
+        #               A live run lost to a Docker Hub connection reset
+        #               succeeded on re-run with no code change.
+        #   2. run      `--pull=never`: the already-acquired image, exactly once.
+        #               A crash, bad rule config or OOM is NEVER retried.
+        #   3. complete judge the exit status and the report. Non-zero exit,
+        #               missing report or invalid report fails the step.
+        # No phase is masked (`|| true`, continue-on-error). A failure anywhere
+        # still leaves no trustworthy semgrep.json, so the gate still fails
+        # closed; the record only says WHY.
         env:
           SEMGREP_CONFIGS: ${{ inputs.semgrep_configs }}
           SEMGREP_PATHS: ${{ inputs.semgrep_paths }}
+          SEMGREP_IMAGE: semgrep/semgrep@sha256:12672acdb0949e19f9f6a4c2b288edd0b404f268f0ca7738a2c06f372f50362e
+          EXECUTION_RECORD: reports/scanner-execution-semgrep.json
         run: |
           config_args=()
           for config in $SEMGREP_CONFIGS; do
@@ -684,6 +701,8 @@ jobs:
           done
           if [ "${#config_args[@]}" -eq 0 ]; then
             echo "semgrep_configs resolved to no rulesets; a SAST scan with no rules is a false clean." >&2
+            node "$SSD_TOOLKIT/scripts/scanner-execution.mjs" configuration-failure --scanner semgrep \
+              --record "$EXECUTION_RECORD" --detail "semgrep_configs resolved to no rulesets"
             exit 1
           fi
           scan_paths=()
@@ -692,15 +711,24 @@ jobs:
           done
           if [ "${#scan_paths[@]}" -eq 0 ]; then
             echo "semgrep_paths resolved to no paths; refusing to report a scan of nothing." >&2
+            node "$SSD_TOOLKIT/scripts/scanner-execution.mjs" configuration-failure --scanner semgrep \
+              --record "$EXECUTION_RECORD" --detail "semgrep_paths resolved to no paths"
             exit 1
           fi
-          docker run --rm \
+
+          # 1. acquire (bounded retry lives inside; exits non-zero when exhausted)
+          node "$SSD_TOOLKIT/scripts/scanner-execution.mjs" acquire --scanner semgrep \
+            --image "$SEMGREP_IMAGE" --record "$EXECUTION_RECORD"
+
+          # 2. run once; the exit status is captured as data for step 3
+          set +e
+          docker run --rm --pull=never \
             -v "$GITHUB_WORKSPACE:/src:ro" \
             -v "$GITHUB_WORKSPACE/reports:/reports" \
             -w /src \
             -e HOME=/tmp \
             -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0=/src \
-            semgrep/semgrep@sha256:12672acdb0949e19f9f6a4c2b288edd0b404f268f0ca7738a2c06f372f50362e \
+            "$SEMGREP_IMAGE" \
             semgrep scan \
             "${config_args[@]}" \
             ${SEMGREP_BASELINE} \
@@ -708,15 +736,25 @@ jobs:
             --metrics=off \
             --disable-version-check \
             "${scan_paths[@]}"
-          node "$SSD_TOOLKIT/scripts/validate-semgrep-report.mjs" reports/semgrep.json
+          scanner_status=$?
+          set -e
+
+          # 3. complete: fails the step unless exit 0 AND a valid report
+          node "$SSD_TOOLKIT/scripts/scanner-execution.mjs" complete --scanner semgrep \
+            --exit-code "$scanner_status" --report reports/semgrep.json --record "$EXECUTION_RECORD"
           echo "Semgrep report is ready for the security gate"
 
       - name: Upload SAST report
+        # The execution record is uploaded even when the scan failed, so the
+        # gate can explain a missing report. upload-artifact errors only when NO
+        # listed file exists — i.e. the job died before any phase ran.
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sast-reports
-          path: reports/semgrep.json
+          path: |
+            reports/semgrep.json
+            reports/scanner-execution-semgrep.json
           if-no-files-found: error
           retention-days: 14
 
@@ -1166,6 +1204,11 @@ jobs:
           SEMGREP_PATHS: ${{ inputs.semgrep_paths }}
           GITLEAKS_CONFIG: ${{ inputs.gitleaks_config }}
           TRUFFLEHOG_EXCLUDE_PATHS: ${{ inputs.trufflehog_exclude_paths }}
+          # Each scanner job's own result, so the feedback reports scan health
+          # per control (the same derivation as the per-control outputs).
+          SECRET_SCAN_JOB_RESULT: ${{ needs.secret-scanning.result }}
+          DEPENDENCY_SCAN_JOB_RESULT: ${{ needs.dependency-scanning.result }}
+          SAST_JOB_RESULT: ${{ needs.sast.result }}
         run: node "$SSD_TOOLKIT/scripts/notify.mjs" --gate reports/security-gate.json
 
       - name: Flag an untrusted scan (blocks baseline generation)
@@ -1181,14 +1224,15 @@ jobs:
           {
             echo "This repository's scan COULD NOT BE TRUSTED on this run."
             echo
-            echo "A scanner could not interpret its input (missing or malformed report,"
-            echo "unidentifiable base image OS, or an end-of-life OS with no advisories)."
+            echo "A scanner could not run, or its input could not be interpreted (scanner image"
+            echo "unavailable, scanner failure, missing or malformed report, unidentifiable base"
+            echo "image OS, or an end-of-life OS with no advisories)."
             echo "The findings list is UNKNOWN, not clean."
             echo
             echo "DO NOT GENERATE A SEMGREP BASELINE FROM THIS RUN."
             echo "Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           } | tee reports/DO-NOT-BASELINE.txt >> "$GITHUB_STEP_SUMMARY"
-          node -e 'const f=(require("./reports/security-gate.json").integrity?.failures)||[];for(const x of f)console.log(`::error title=Untrusted scan — do not baseline::${x.source}: ${x.reason}`)' \
+          node -e 'const g=require("./reports/security-gate.json");for(const x of g.integrity?.failures||[])console.log(`::error title=Untrusted scan — do not baseline::${x.source}: ${x.reason}`);for(const r of g.scannerExecution?.records||[])if(r.state!=="success")console.log(`::error title=Scanner did not complete — do not baseline::${r.scanner}: ${r.state} (cause: ${r.cause}, retryable: ${r.retryable})`)' \
             || echo "::error title=Untrusted scan — do not baseline::the gate result could not be read"
 
       - name: Upload security gate decision
@@ -1198,6 +1242,7 @@ jobs:
           name: security-gate-results
           path: |
             reports/security-gate.json
+            reports/security-gate-evidence.md
             reports/gate-exceptions.json
             reports/break-glass-request.json
             reports/break-glass-decision.json

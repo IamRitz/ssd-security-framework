@@ -649,13 +649,18 @@ describe('format-findings: repo-scale finding count renders readably', () => {
     return { verdict: 'BLOCK_DEPLOY', findings };
   }
 
-  it('collapses long lists behind <details> and keeps blocking findings visible', () => {
+  it('keeps every blocking finding visible and bounds the logged ones, stating the omission', () => {
     const report = buildReport({ gate: scaleGate(), context: CONTEXT });
     assert.deepEqual(report.counts, { block: 12, exception: 0, log: 26, integrity: 0 });
     const md = renderMarkdown(report);
-    // The 26 logged findings collapse; the 12 blocking findings do not.
-    assert.match(md, /<details><summary>Show 26 findings<\/summary>/);
-    assert.ok(!/<details><summary>Show 12/.test(md));
+    // All 12 blocking issues have a table row AND collapsible full evidence.
+    assert.equal((md.match(/^\| ⛔ BLOCK \|/gm) ?? []).length, 12);
+    assert.equal((md.match(/<details><summary>⛔ BLOCK/g) ?? []).length, 12);
+    // The 26 logged findings are INFO rows, capped at 20, with the exact
+    // omission stated — never a full card each.
+    assert.equal((md.match(/^\| ℹ️ INFO \|/gm) ?? []).length, 20);
+    assert.match(md, /Showing 32 of 38 issues; 6 table rows not shown \(6 INFO\)/);
+    assert.doesNotMatch(md, /<summary>ℹ️ INFO/);
     // Slack stays concise: at most 5 highlighted blocking findings + a "more" note.
     const slack = renderSlack(report);
     assert.match(slackText(slack), /and 7 more/);

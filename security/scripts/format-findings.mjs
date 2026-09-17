@@ -19,6 +19,9 @@
 // rule), nothing is claimed.
 
 import { correlateFindings, summarizeIssues } from './correlate-findings.mjs';
+import { versionKey } from './dependency-evidence.mjs';
+import { RECORDED_SCANNERS } from './scanner-execution.mjs';
+import { deriveScanControlResults, SCAN_CONTROLS } from './source-control-results.mjs';
 
 export const PR_COMMENT_MARKER = '<!-- security-gate-findings -->';
 
@@ -652,18 +655,20 @@ function correlatedCard(issue, members, memberCards, context, gate) {
   const derivations = [...new Set(members.map((finding) => (finding.severity || 'unknown').toLowerCase()))];
   const strongest = members.filter((finding) => finding.action === issue.action);
   const strongestText = [...new Set(strongest.map((finding) => `${scannerLabel(finding.source)} / \`${finding.id}\``))].join(', ');
+  // Only a DISAGREEMENT is worth a severity note. Records that agree need no
+  // repeated policy explanation: each record's own derivation is listed under
+  // "Observed by", and why records are grouped is stated once per report.
   const severityNote =
     derivations.length > 1
       ? `Severity: the records disagree (${derivations.join(' vs ')}), and each derivation is listed below as recorded. ` +
         `This issue takes the strongest policy action any record received — **${issue.action}**, from ${strongestText} — ` +
         'and discards no record\'s interpretation.'
-      : `Severity: every record is classified ${derivations[0]}; see each record's derivation below. Policy action: **${issue.action}**.`;
+      : null;
 
   const summary = members.map((finding) => finding.summary).find((value) => typeof value === 'string' && value !== '');
-  const whatItMeans =
-    `${summary ? `${sentence(summary)} ` : ''}` +
-    `${members.length} scanner records describe the same vulnerability in \`${pkg}\`: their advisory IDs and aliases ` +
-    'connect them, so they are shown as one issue. Every record is kept below and in the gate result.';
+  const whatItMeans = summary
+    ? sentence(summary)
+    : `Advisory ${issue.primaryId} affects \`${pkg}\`, reported by ${members.length} scanner records.`;
 
   let howToFix;
   if (malicious) {
@@ -1080,6 +1085,316 @@ export function route({ verdict, mode = 'enforce', breakGlass = null }) {
   return { slack, slackReason, prComment: true, summary: true };
 }
 
+// ---- presentation model -------------------------------------------------------
+//
+// The job summary, PR comment and Slack are TRIAGE surfaces, not the evidence
+// database. `security-gate.json` (raw findings, correlation.issues[].evidence,
+// dependencyEvidence, scannerExecution) stays complete; these surfaces show the
+// few fields a developer acts on, in priority order, with bounded size.
+//
+// DISPOSITION IS PRESENTATION ONLY. Policy actions stay BLOCK / EXCEPTION / LOG
+// on the raw findings and the verdict is computed from those alone. A
+// disposition only chooses where an issue is shown:
+//
+//   BLOCK      the issue's strongest action is BLOCK / BLOCK_DEPLOY
+//   EXCEPTION  the issue's strongest action is EXCEPTION
+//   REVIEW     a LOG issue whose evidence explicitly disagrees with itself
+//              (reviewReasons below). Non-blocking; shown with full detail.
+//   INFO       any other LOG issue. Non-blocking; a table row only.
+//
+// No disposition is written to security-gate.json, so nothing downstream can
+// mistake it for a policy action.
+
+export const DISPOSITIONS = ['BLOCK', 'EXCEPTION', 'REVIEW', 'INFO'];
+const DISPOSITION_RANK = { BLOCK: 0, EXCEPTION: 1, REVIEW: 2, INFO: 3 };
+const DISPOSITION_LABELS = { BLOCK: '⛔ BLOCK', EXCEPTION: '⚠️ EXCEPTION', REVIEW: '⚖️ REVIEW', INFO: 'ℹ️ INFO' };
+
+// Explicitly modeled evidence discrepancies. An `unknown` relationship is NOT a
+// reason on its own: no current scanner report proves ancestry, so it is the
+// normal state of every undeclared package (docs/evidence-model.md), and
+// flagging it would turn REVIEW into noise.
+export function reviewReasons(issue) {
+  const reasons = [];
+  if (issue?.evidence?.resolution?.status === 'conflicting') {
+    reasons.push('version-conflict');
+  }
+  return reasons;
+}
+
+export function presentationDisposition(issue) {
+  if (issue.action === 'EXCEPTION') return 'EXCEPTION';
+  if (issue.action === 'LOG') return reviewReasons(issue).length > 0 ? 'REVIEW' : 'INFO';
+  // BLOCK, BLOCK_DEPLOY, and anything unrecognized: fail toward visibility.
+  return 'BLOCK';
+}
+
+const isMalicious = (finding) => finding.policyRule === 'dependencies.malicious_package';
+
+function uniqueStrings(values) {
+  return [...new Set(values.filter((value) => typeof value === 'string' && value !== ''))];
+}
+
+// version: the effective version and whether it is established. A disputed
+// version is never returned as `version`.
+export function versionStatus(issue, members) {
+  const resolution = issue.evidence?.resolution;
+  if (resolution) {
+    if (resolution.status === 'conflicting') {
+      return { status: 'conflicting', versions: resolution.versions, text: `conflict: ${resolution.versions.join(' / ')}` };
+    }
+    if (resolution.status === 'consistent') {
+      return { status: 'consistent', version: resolution.version, text: resolution.version };
+    }
+    return { status: 'unknown', text: 'unknown' };
+  }
+  const reported = uniqueStrings(members.map((finding) => finding.installedVersion));
+  if (reported.length === 1) {
+    return { status: 'reported', version: reported[0], text: reported[0] };
+  }
+  if (reported.length > 1) {
+    return { status: 'conflicting', versions: reported, text: `conflict: ${reported.join(' / ')}` };
+  }
+  return { status: 'not-applicable', text: '—' };
+}
+
+// fix: what the records say, never promised when the version itself is disputed.
+export function fixStatus(members, version) {
+  if (members.some(isMalicious)) {
+    return { status: 'remove', text: 'remove the package' };
+  }
+  const versions = uniqueStrings([
+    ...members.flatMap(recordFixVersions),
+    ...members.flatMap((finding) => (Array.isArray(finding.packages) ? finding.packages.map((pkg) => pkg?.fixedInVersion) : []))
+  ]);
+  if (version.status === 'conflicting') {
+    return {
+      status: 'disputed',
+      versions,
+      text: versions.length > 0 ? `disputed — ${versions.join(', ')} reported` : 'disputed applicability'
+    };
+  }
+  // npm names the package it would change, which may be a parent.
+  const viaParent = members.find(
+    (finding) => finding.source === 'npm-audit' && finding.fixPackage && finding.fixPackage !== (finding.package || finding.id) && finding.fixedVersion
+  );
+  if (viaParent) {
+    return { status: 'fix-available', text: `fix via ${viaParent.fixPackage} ${viaParent.fixedVersion}` };
+  }
+  if (versions.length > 0) {
+    return { status: 'fixed-in', versions, text: `fixed in ${versions.join(', ')}` };
+  }
+  if (members.some((finding) => finding.fixAvailable === true)) {
+    return { status: 'fix-available', text: 'fix available' };
+  }
+  if (members.some((finding) => finding.fixAvailable === false)) {
+    return { status: 'no-fix', text: 'no fix reported' };
+  }
+  return { status: 'not-applicable', text: '—' };
+}
+
+function componentOf(issue, members, card) {
+  if (issue.package) return issue.package;
+  const [first] = members;
+  if (first?.source === 'npm-audit') return first.package || first.id;
+  if (card.package) return card.package;
+  if (card.location?.path) return `${card.location.path}${card.location.line ? `:${card.location.line}` : ''}`;
+  if (card.target) return card.target;
+  return '—';
+}
+
+function advisoryOf(issue, members) {
+  if (issue.primaryId && issue.package) return issue.primaryId;
+  const [first] = members;
+  if (first?.source === 'npm-audit') {
+    return first.url?.match(/GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}/i)?.[0] ?? '—';
+  }
+  return first?.id ?? '—';
+}
+
+function severityOf(members, card) {
+  if (members.some(isMalicious)) return 'malicious';
+  return ['critical', 'high', 'medium', 'low'].includes(card.severity) ? card.severity : 'unknown';
+}
+
+const PRESENTED_SEVERITY_RANK = { malicious: -1, ...SEVERITY_RANK };
+
+export function presentIssue(issue, findings) {
+  const members = issue.findings.map((index) => findings[index]);
+  const card = issue.card;
+  const version = versionStatus(issue, members);
+  return {
+    disposition: presentationDisposition(issue),
+    reviewReasons: reviewReasons(issue),
+    severity: severityOf(members, card),
+    component: componentOf(issue, members, card),
+    advisory: advisoryOf(issue, members),
+    relationship: issue.evidence?.relationship?.value ?? null,
+    version,
+    fix: fixStatus(members, version)
+  };
+}
+
+// Priority order: disposition, then severity, then first appearance (stable).
+function orderIssues(issues) {
+  return issues
+    .map((issue, index) => ({ issue, index }))
+    .sort(
+      (a, b) =>
+        DISPOSITION_RANK[a.issue.presentation.disposition] - DISPOSITION_RANK[b.issue.presentation.disposition] ||
+        (PRESENTED_SEVERITY_RANK[a.issue.presentation.severity] ?? 9) - (PRESENTED_SEVERITY_RANK[b.issue.presentation.severity] ?? 9) ||
+        a.index - b.index
+    )
+    .map(({ issue }) => issue);
+}
+
+// ---- scan health ------------------------------------------------------------------
+//
+// Scan health answers "did each scanner run and produce a trustworthy report",
+// never "did the code pass policy". It is derived exactly as the per-control
+// workflow outputs are (deriveScanControlResults), then refined by the scanner
+// execution record, which says WHY a control has no trustworthy report.
+
+const CONTROL_HEALTH = {
+  success: 'completed',
+  failure: 'unavailable',
+  untrusted: 'untrusted',
+  cancelled: 'cancelled',
+  skipped: 'skipped'
+};
+const HEALTH_LABELS = {
+  completed: '✅ completed',
+  unavailable: '⛔ unavailable',
+  untrusted: '⚠️ untrusted',
+  cancelled: '✖️ cancelled',
+  skipped: '⏭️ skipped',
+  unknown: '❔ unknown'
+};
+const NO_REPORT_STATES = new Set(['acquisition-failed', 'execution-failed', 'report-missing', 'incomplete']);
+
+function scannerLabelOf(scanner) {
+  return RECORDED_SCANNERS[scanner]?.label ?? scannerLabel(scanner);
+}
+
+// Null for a gate result that carries no per-control evidence at all (an image
+// gate, or a source gate result written before scan health existed).
+export function deriveScanHealth(gate, jobResults = null) {
+  const failures = Array.isArray(gate?.integrity?.failures) ? gate.integrity.failures : [];
+  const records = Array.isArray(gate?.scannerExecution?.records) ? gate.scannerExecution.records : [];
+  const haveJobs =
+    jobResults && SCAN_CONTROLS.some((control) => typeof jobResults[control.id] === 'string' && jobResults[control.id] !== '');
+  const attributed = failures.some((failure) => SCAN_CONTROLS.some((control) => control.id === failure?.control));
+  if (!haveJobs && !gate?.scannerExecution && !attributed) {
+    return null;
+  }
+  const derived = haveJobs ? deriveScanControlResults({ jobResults, gate }) : null;
+
+  return SCAN_CONTROLS.map((control) => {
+    const execution = records.find((record) => record?.control === control.id) ?? null;
+    const failure = failures.find((entry) => entry?.control === control.id) ?? null;
+    let status;
+    let reason;
+    if (derived) {
+      status = CONTROL_HEALTH[derived[control.id].result] ?? 'unavailable';
+      reason = derived[control.id].reason;
+    } else if (failure) {
+      status = 'untrusted';
+      reason = failure.reason;
+    } else if (gate?.integrity?.trusted === true) {
+      status = 'completed';
+      reason = "the gate evaluated this control's reports";
+    } else {
+      status = 'unknown';
+      reason = 'not evaluated: the gate stopped at another uninterpretable input';
+    }
+    // A control with no trustworthy report is UNAVAILABLE when the evidence
+    // shows no report was ever produced, UNTRUSTED when one was but failed.
+    if (status !== 'completed') {
+      if (execution && NO_REPORT_STATES.has(execution.state)) {
+        status = 'unavailable';
+      } else if (status === 'untrusted' && !execution && /missing report file/.test(failure?.reason ?? '')) {
+        status = 'unavailable';
+      }
+    }
+    return { id: control.id, label: control.job, status, reason, execution, integrityFailure: failure };
+  });
+}
+
+// One sentence on why a scanner produced nothing usable, from its record only.
+export function executionSentence(record) {
+  if (!record) return null;
+  const label = scannerLabelOf(record.scanner);
+  const attempts = record.acquisition?.attempts?.length ?? 0;
+  const retry = record.retryable ? ', retryable' : '';
+  switch (record.state) {
+    case 'acquisition-failed':
+      return (
+        `${label} could not start because its pinned scanner image could not be obtained` +
+        `${attempts > 0 ? ` after ${attempts} attempt${attempts === 1 ? '' : 's'}` : ''} (cause: ${record.cause}${retry}).`
+      );
+    case 'execution-failed':
+      return record.execution?.exitCode == null && record.cause === 'scanner-configuration'
+        ? `${label} was not run: ${record.detail} (cause: ${record.cause}).`
+        : `${label} started but failed — ${record.detail} (cause: ${record.cause}) — so it produced no usable report.`;
+    case 'report-missing':
+      return `${label} exited successfully but wrote no report (cause: ${record.cause}).`;
+    case 'report-invalid':
+      return `${label} ran, but its report failed validation: ${record.detail} (cause: ${record.cause}).`;
+    case 'incomplete':
+      return `${label}'s image was acquired, but the scan never recorded finishing: the step stopped before completion.`;
+    case 'unknown':
+      return `${label}'s execution record could not be interpreted (${record.unavailable ?? 'unexpected shape'}).`;
+    default:
+      return null;
+  }
+}
+
+const SUGGESTED_ACTIONS = {
+  'registry-network': 'Re-run the failed jobs. If the failure repeats, investigate scanner registry/network availability.',
+  'registry-rate-limit':
+    'Re-run the failed jobs after a short wait. If the failure repeats, the runner is being rate-limited by the scanner image registry.',
+  'registry-auth':
+    'Re-running is unlikely to help: the registry refused access to the pinned scanner image. Check that the pinned image is still published and pullable from this runner.',
+  'image-not-found':
+    'Re-running will not help: the registry reports that the pinned scanner image does not exist. The framework\'s pinned image reference needs attention.',
+  'scanner-configuration':
+    'Fix the scanner configuration named above (for Semgrep: `semgrep_configs`, `semgrep_paths`, and any local rule files), then re-run.',
+  'scanner-runtime':
+    'Inspect the scanner step in the job log. Re-run only if the log shows a transient cause, such as the runner running out of memory.',
+  'report-validation': 'Inspect the scanner step in the job log: the report it wrote could not be interpreted.'
+};
+const DEFAULT_SUGGESTED_ACTION =
+  'Diagnose the failed scanner or report step named in the integrity failure below, using the run log, then re-run.';
+
+// Gate status in terms a developer can act on. `kind` separates a vulnerability
+// POLICY block from a SCAN (availability / integrity) block.
+function assessGate({ verdict, verdictLabel, counts, scanHealth }) {
+  const blocking = isBlockingVerdict(verdict);
+  const kind = !blocking
+    ? 'pass'
+    : counts.integrity > 0 && counts.block === 0
+      ? 'scan'
+      : counts.integrity > 0
+        ? 'policy-and-scan'
+        : 'policy';
+  const unavailable = (scanHealth ?? []).filter((control) => control.status === 'unavailable');
+  const qualifier = unavailable.length > 0 ? 'scan unavailable' : 'scan untrusted';
+  const headline =
+    kind === 'scan' ? `${verdictLabel} — ${qualifier}` : kind === 'policy-and-scan' ? `${verdictLabel} — policy findings and ${qualifier}` : verdictLabel;
+
+  const problems = (scanHealth ?? []).filter((control) => !['completed', 'skipped'].includes(control.status) && control.status !== 'unknown');
+  const explanations = uniqueStrings(problems.map((control) => executionSentence(control.execution)));
+  const causes = uniqueStrings(problems.map((control) => control.execution?.cause));
+  const actions = uniqueStrings(causes.map((cause) => SUGGESTED_ACTIONS[cause]));
+  return {
+    kind,
+    headline,
+    securityState: counts.integrity > 0 ? 'UNKNOWN' : 'KNOWN',
+    scanProblems: problems.map((control) => control.id),
+    explanations,
+    suggestedActions: counts.integrity > 0 ? (actions.length > 0 ? actions : [DEFAULT_SUGGESTED_ACTION]) : []
+  };
+}
+
 // Normalize a gate JSON result into the report every renderer consumes.
 // `breakGlass` is the run's OBSERVED break-glass state (deriveBreakGlassState);
 // when omitted it is derived with no runtime evidence, which claims nothing.
@@ -1105,8 +1420,25 @@ export function buildReport({ gate, context = {}, mode = 'enforce', breakGlass }
   // per-record count (and is what "is this run clean?" is decided from).
   const issueCounts = summarizeIssues(issues, cards.length);
 
+  // Presentation, attached per issue and ordered once for every surface.
+  for (const issue of issues) {
+    issue.presentation = issue.card.isIntegrity ? null : presentIssue(issue, findings);
+  }
+  const ordered = orderIssues(issues.filter((issue) => issue.presentation));
+  const dispositionCounts = Object.fromEntries(
+    DISPOSITIONS.map((disposition) => [disposition.toLowerCase(), ordered.filter((issue) => issue.presentation.disposition === disposition).length])
+  );
+
+  const scanHealth = deriveScanHealth(gate, context.jobResults ?? null);
+  const gateStatus = assessGate({ verdict, verdictLabel: meta.label, counts, scanHealth });
+
   let blurb = meta.blurb;
-  if (isBlockingVerdict(verdict) && mode === 'log-only') {
+  if (gateStatus.kind === 'scan') {
+    blurb =
+      mode === 'log-only'
+        ? 'This is not a vulnerability-policy BLOCK: the scan could not be completed or trusted. Reported, NOT enforced, because this repository runs in log-only mode.'
+        : 'This is not a vulnerability-policy BLOCK: the scan could not be completed or trusted, so the gate fails closed.';
+  } else if (isBlockingVerdict(verdict) && mode === 'log-only') {
     blurb = 'Blocking findings reported — NOT enforced, because this repository runs in log-only mode.';
   } else if (breakGlassState.decision === 'approved') {
     blurb = 'Blocking findings were found; a verified break-glass approval overrode the BLOCK for this run only.';
@@ -1115,6 +1447,8 @@ export function buildReport({ gate, context = {}, mode = 'enforce', breakGlass }
   return {
     verdict,
     verdictLabel: meta.label,
+    headline: gateStatus.headline,
+    gateStatus,
     emoji: meta.emoji,
     blurb,
     context,
@@ -1123,6 +1457,9 @@ export function buildReport({ gate, context = {}, mode = 'enforce', breakGlass }
     counts,
     issues,
     issueCounts,
+    orderedIssues: ordered,
+    dispositionCounts,
+    scanHealth,
     isBreakGlassEligible,
     breakGlass: breakGlassState,
     breakGlassNotice: breakGlassNotice(breakGlassState),
@@ -1153,6 +1490,45 @@ function contextLine(context) {
 }
 
 // ---- Markdown renderer (PR comment AND $GITHUB_STEP_SUMMARY share it) --------
+//
+// Shape: gate status → scan health → issue counts → one compact triage table →
+// evidence-conflict callouts → integrity failures → collapsible per-issue
+// evidence for BLOCK / EXCEPTION / REVIEW only → one set of global notes.
+//
+// BOUNDED. A PR comment body over 65,536 characters is rejected by GitHub, and a
+// repository can have hundreds of findings, so every variable-length part has a
+// limit. Nothing is dropped silently: each omission states its exact count and
+// points to security-gate.json, which is always complete.
+
+export const SUMMARY_LIMITS = {
+  maxCharacters: 60_000,
+  tableRows: 100,
+  // Per-disposition caps for the non-blocking classes. BLOCK and EXCEPTION rows
+  // are limited only by `tableRows`, and fill it first.
+  tableRowsPerDisposition: { REVIEW: 30, INFO: 20 },
+  detailCards: 25,
+  callouts: 10,
+  integrityCards: 10,
+  cellCharacters: 72
+};
+
+// GitHub renders <details> in job summaries and PR comments; markdown inside
+// needs the blank lines around it. <summary> is HTML, so it is escaped and
+// carries no markdown.
+function escapeHtml(text) {
+  return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function cell(text, { code = false, limit = SUMMARY_LIMITS.cellCharacters } = {}) {
+  let value = String(text ?? '—').replace(/\s+/g, ' ').trim() || '—';
+  if (value.length > limit) {
+    value = `${value.slice(0, limit - 1)}…`;
+  }
+  value = value.replace(/\|/g, '\\|');
+  return code && value !== '—' ? `\`${value.replace(/`/g, "'")}\`` : value;
+}
+
+const titleOrDash = (value) => (value && value !== 'unknown' ? titleCase(value) : '—');
 
 function renderCardMarkdown(card) {
   const lines = [`**${card.title}**`];
@@ -1167,6 +1543,9 @@ function renderCardMarkdown(card) {
   }
   if (card.target) {
     facts.push(`📦 In image: \`${card.target}\``);
+  }
+  if (card.executionNote) {
+    facts.push(`🧰 ${card.executionNote}`);
   }
   if (card.severityNote) {
     facts.push(`📊 ${card.severityNote}`);
@@ -1206,50 +1585,266 @@ function renderCardMarkdown(card) {
   return lines.join('\n');
 }
 
-function renderGroupMarkdown(heading, cards, { collapseOver = 10 } = {}) {
-  if (cards.length === 0) {
-    return '';
+function renderScanHealth(report) {
+  const health = report.scanHealth;
+  if (!health) {
+    return [];
   }
-  const sorted = sortCards(cards);
-  const body = sorted.map(renderCardMarkdown).join('\n\n');
-  const title = `### ${heading} (${cards.length})`;
-  if (cards.length > collapseOver) {
-    return `${title}\n\n<details><summary>Show ${cards.length} findings</summary>\n\n${body}\n\n</details>`;
+  const completed = health.filter((control) => control.status === 'completed').length;
+  if (completed === health.length) {
+    return [`✅ **${completed}/${health.length}** scan controls completed — scanners ran and produced reports the gate accepted (scan health, not a policy result).`];
   }
-  return `${title}\n\n${body}`;
+  const rows = health.map((control) => {
+    const execution = control.execution;
+    const detail =
+      execution && execution.state !== 'success'
+        ? [execution.state, execution.cause, execution.retryable ? 'retryable' : null].filter(Boolean).join(' · ')
+        : control.status === 'completed'
+          ? ''
+          : control.integrityFailure?.reason ?? '';
+    return `| ${control.label} | ${HEALTH_LABELS[control.status] ?? control.status} | ${cell(detail || ' ', { limit: 120 })} |`;
+  });
+  return [
+    [
+      `**Scan health** — ${completed}/${health.length} scan controls completed. This is whether each scanner ran and produced a trustworthy report, not a policy result.`,
+      '',
+      '| Control | Scan | Detail |',
+      '| --- | --- | --- |',
+      ...rows
+    ].join('\n')
+  ];
 }
 
-export function renderMarkdown(report, { includeMarker = false } = {}) {
-  const { counts } = report;
-  const blocks = [];
-  if (includeMarker) {
-    blocks.push(PR_COMMENT_MARKER);
+function renderScanProblem(report) {
+  const status = report.gateStatus;
+  if (report.counts.integrity === 0) {
+    return [];
   }
-  blocks.push(`## ${report.emoji} Security gate: ${report.verdictLabel}`);
-  blocks.push(`_${report.blurb}_`);
-
-  const ctx = contextLine(report.context);
-  if (ctx) {
-    blocks.push(ctx);
+  const lines = [`**Security state: ${status.securityState}** — the findings list is unknown, not clean.`];
+  for (const explanation of status.explanations) {
+    lines.push('', explanation);
   }
+  lines.push('', `**Suggested action:** ${status.suggestedActions.join(' ')}`);
+  lines.push('', '**Do not generate a baseline from this run.**');
+  return [lines.join('\n')];
+}
 
-  // Headline counts are UNIQUE ISSUES; the raw record count is shown beside them
-  // whenever correlation merged anything, so neither number is hidden.
-  const shown = report.issueCounts ?? counts;
-  const summaryBits = [`**${shown.block}** blocking`, `**${shown.exception}** exception`, `**${shown.log}** logged`];
+function countsLine(report) {
+  const shown = report.issueCounts ?? report.counts;
+  const summaryBits = [`**${shown.block}** blocking`, `**${shown.exception}** exception`];
+  const dispositions = report.dispositionCounts;
+  summaryBits.push(
+    dispositions
+      ? `**${shown.log}** logged (**${dispositions.review}** review · **${dispositions.info}** info)`
+      : `**${shown.log}** logged`
+  );
   if (shown.integrity > 0) {
     summaryBits.push(`**${shown.integrity}** integrity failure${shown.integrity === 1 ? '' : 's'}`);
   }
-  let summaryLine = summaryBits.join(' · ');
+  let line = summaryBits.join(' · ');
   if (report.issueCounts && report.issueCounts.issues !== report.issueCounts.rawFindings) {
-    summaryLine +=
+    line +=
       ` — **${report.issueCounts.issues}** unique issue${report.issueCounts.issues === 1 ? '' : 's'} from ` +
       `**${report.issueCounts.rawFindings}** scanner findings (records that share advisory IDs are shown once)`;
   }
-  blocks.push(summaryLine);
+  return line;
+}
+
+// Which ordered issues get a table row, with exact per-disposition omissions.
+export function selectTableRows(ordered, limits = SUMMARY_LIMITS) {
+  const shown = [];
+  const omitted = { BLOCK: 0, EXCEPTION: 0, REVIEW: 0, INFO: 0 };
+  const perDisposition = { BLOCK: 0, EXCEPTION: 0, REVIEW: 0, INFO: 0 };
+  for (const issue of ordered) {
+    const { disposition } = issue.presentation;
+    const cap = limits.tableRowsPerDisposition[disposition] ?? Infinity;
+    if (shown.length < limits.tableRows && perDisposition[disposition] < cap) {
+      shown.push(issue);
+      perDisposition[disposition] += 1;
+    } else {
+      omitted[disposition] += 1;
+    }
+  }
+  return { shown, omitted };
+}
+
+function omissionText(omitted, noun) {
+  const parts = DISPOSITIONS.filter((disposition) => omitted[disposition] > 0).map(
+    (disposition) => `${omitted[disposition]} ${disposition}`
+  );
+  const total = DISPOSITIONS.reduce((sum, disposition) => sum + omitted[disposition], 0);
+  return total === 0
+    ? null
+    : `${total} ${noun}${total === 1 ? '' : 's'} not shown (${parts.join(', ')})`;
+}
+
+function renderTable(report, limits = SUMMARY_LIMITS) {
+  const ordered = report.orderedIssues ?? [];
+  if (ordered.length === 0) {
+    return { blocks: [], omitted: null };
+  }
+  const { shown, omitted } = selectTableRows(ordered, limits);
+  const rows = shown.map((issue) => {
+    const p = issue.presentation;
+    return `| ${DISPOSITION_LABELS[p.disposition]} | ${titleOrDash(p.severity)} | ${cell(p.component, { code: true })} | ${cell(p.advisory, { code: true })} | ${cell(p.relationship ?? '—')} | ${cell(p.version.text)} | ${cell(p.fix.text)} |`;
+  });
+  const lines = [
+    `### Issues (${ordered.length})`,
+    '',
+    '| Action | Severity | Component | Advisory / rule | Relationship | Version | Fix |',
+    '| --- | --- | --- | --- | --- | --- | --- |',
+    ...rows
+  ];
+  const note = omissionText(omitted, 'table row');
+  if (note) {
+    lines.push('', `_Showing ${shown.length} of ${ordered.length} issues; ${note}. Every issue, with full evidence, is in \`${evidenceFile(report)}\`._`);
+  }
+  return { blocks: [lines.join('\n')], omitted };
+}
+
+function conflictCallout(issue) {
+  const resolution = issue.evidence.resolution;
+  const sides = new Map();
+  for (const observation of resolution.observations) {
+    if (observation.version === null || observation.version === undefined) continue;
+    const key = versionKey(issue.ecosystem, observation.version);
+    if (!sides.has(key)) sides.set(key, { version: observation.version, who: new Set() });
+    sides.get(key).who.add(observation.scanner ? scannerLabel(observation.scanner) : `\`${observation.source}\` declaration`);
+  }
+  const text = [...sides.values()].map((side) => `${[...side.who].join(', ')}: ${side.version}`).join(' · ');
+  const declared = resolution.observations.some((observation) => observation.provenance === 'manifest-declared');
+  return (
+    `> ⚖️ **\`${issue.package}\` — ${issue.primaryId}** (${issue.presentation.disposition}): ${text}. ` +
+    `${declared ? 'The manifest declaration and the scanner results disagree' : 'The scanners disagree'} on the effective version. ` +
+    'Do not remediate until the version actually resolved is established.'
+  );
+}
+
+function renderCallouts(report) {
+  const conflicted = (report.orderedIssues ?? []).filter((issue) => issue.presentation.reviewReasons.includes('version-conflict'));
+  if (conflicted.length === 0) {
+    return [];
+  }
+  const shown = conflicted.slice(0, SUMMARY_LIMITS.callouts);
+  const lines = [`**Evidence conflicts (${conflicted.length})**`, '', shown.map(conflictCallout).join('\n>\n')];
+  if (conflicted.length > shown.length) {
+    lines.push('', `_${conflicted.length - shown.length} more evidence conflict(s) not shown; see \`${evidenceFile(report)}\`._`);
+  }
+  return [lines.join('\n')];
+}
+
+function renderIntegrity(report) {
+  const cards = (report.issues ?? []).map((issue) => issue.card).filter((card) => card.isIntegrity);
+  if (cards.length === 0) {
+    return [];
+  }
+  const shown = cards.slice(0, SUMMARY_LIMITS.integrityCards);
+  const lines = [
+    `### 🚨 Scan integrity failures — results UNKNOWN, fail-closed, not a code defect (${cards.length})`,
+    '',
+    shown.map((card) => renderCardMarkdown(withExecutionNote(card, report))).join('\n\n')
+  ];
+  if (cards.length > shown.length) {
+    lines.push('', `_${cards.length - shown.length} more integrity failure(s) not shown; see \`${evidenceFile(report)}\`._`);
+  }
+  return [lines.join('\n')];
+}
+
+// The integrity card names the report that could not be trusted; the execution
+// record, when there is one, names why. Both are kept.
+function withExecutionNote(card, report) {
+  const problems = (report.scanHealth ?? []).filter((control) => control.execution && control.execution.state !== 'success');
+  const notes = uniqueStrings(problems.map((control) => executionSentence(control.execution)));
+  return notes.length > 0 ? { ...card, executionNote: `Scanner execution: ${notes.join(' ')}` } : card;
+}
+
+const DETAIL_SECTIONS = [
+  ['BLOCK', '⛔ Blocking findings'],
+  ['EXCEPTION', '⚠️ Tracked exceptions (no fix available — passed deliberately)'],
+  ['REVIEW', '⚖️ Needs review — non-blocking, evidence disagrees']
+];
+
+function detailBlock(issue, open) {
+  const p = issue.presentation;
+  const summary = escapeHtml(`${DISPOSITION_LABELS[p.disposition]} · ${titleOrDash(p.severity)} · ${p.component} — ${p.advisory}`);
+  return `<details${open ? ' open' : ''}><summary>${summary}</summary>\n\n${renderCardMarkdown(issue.card)}\n\n</details>`;
+}
+
+// Per-issue evidence for BLOCK / EXCEPTION / REVIEW only, in priority order,
+// within `budget` characters and SUMMARY_LIMITS.detailCards cards. Once one card
+// does not fit, every later card is omitted too, so a smaller low-priority card
+// never displaces a higher-priority one.
+const SECTION_OVERHEAD = 240; // heading plus a possible omission note
+
+function renderDetails(report, budget) {
+  const blocks = [];
+  let used = 0;
+  let cards = 0;
+  let full = false;
+  for (const [disposition, heading] of DETAIL_SECTIONS) {
+    const issues = (report.orderedIssues ?? []).filter((issue) => issue.presentation.disposition === disposition);
+    if (issues.length === 0) continue;
+    used += SECTION_OVERHEAD;
+    const open = disposition === 'BLOCK' && issues.length <= 5;
+    const rendered = [];
+    for (const issue of issues) {
+      const block = detailBlock(issue, open);
+      full = full || cards >= SUMMARY_LIMITS.detailCards || used + block.length + 2 > budget;
+      if (full) break;
+      rendered.push(block);
+      used += block.length + 2;
+      cards += 1;
+    }
+    const omitted = issues.length - rendered.length;
+    const lines = [`### ${heading} (${issues.length})`];
+    if (rendered.length > 0) lines.push('', rendered.join('\n\n'));
+    if (omitted > 0) {
+      lines.push('', `_Full evidence shown for ${rendered.length} of ${issues.length}; ${omitted} not shown here — see \`${evidenceFile(report)}\`._`);
+    }
+    blocks.push(lines.join('\n'));
+  }
+  return blocks;
+}
+
+function evidenceFile(report) {
+  return report.context?.evidenceFile || 'security-gate.json';
+}
+
+function renderFooter(report) {
+  const notes = [];
+  if (report.issueCounts && report.issueCounts.issues !== report.issueCounts.rawFindings) {
+    notes.push(`Scanner records that share advisory aliases are correlated for display; every raw scanner record remains in \`${evidenceFile(report)}\`.`);
+  }
+  if ((report.dispositionCounts?.review ?? 0) > 0 || (report.dispositionCounts?.info ?? 0) > 0) {
+    notes.push('REVIEW and INFO label non-blocking (LOG) issues for triage — REVIEW means the evidence disagrees. Labels never change the policy verdict.');
+  }
+  if ((report.orderedIssues?.length ?? 0) > 0 || report.counts.integrity > 0) {
+    const readable = report.context?.evidenceMarkdownFile ? ` and every issue's full explanation in \`${report.context.evidenceMarkdownFile}\`` : '';
+    notes.push(
+      `Full evidence: \`${evidenceFile(report)}\`${readable}, in this run's artifacts${report.context?.runUrl ? ` ([run](${report.context.runUrl}))` : ''}.`
+    );
+  }
+  return notes.length > 0 ? [`---\n${notes.map((note) => `<sub>${note}</sub>`).join('<br>\n')}`] : [];
+}
+
+export function renderMarkdown(report, { includeMarker = false } = {}) {
+  const head = [];
+  if (includeMarker) {
+    head.push(PR_COMMENT_MARKER);
+  }
+  head.push(`## ${report.emoji} Security gate: ${report.headline ?? report.verdictLabel}`);
+  head.push(`_${report.blurb}_`);
+
+  const ctx = contextLine(report.context);
+  if (ctx) {
+    head.push(ctx);
+  }
+  head.push(...renderScanHealth(report));
+  head.push(...renderScanProblem(report));
+  head.push(countsLine(report));
 
   if (report.mode === 'log-only') {
-    blocks.push(
+    head.push(
       isBlockingVerdict(report.verdict)
         ? '> ℹ️ This repository runs in **log-only** mode: the blocking verdict above is reported but NOT enforced, and no Slack alert is sent.'
         : `> ℹ️ This repository runs in **log-only** mode. The verdict is ${report.verdictLabel}, so there is no blocking verdict to suppress. ` +
@@ -1257,39 +1852,58 @@ export function renderMarkdown(report, { includeMarker = false } = {}) {
     );
   }
   if (report.breakGlassNotice) {
-    blocks.push(`> ${report.breakGlassNotice}`);
+    head.push(`> ${report.breakGlassNotice}`);
   }
 
-  const displayed = Array.isArray(report.issues) ? report.issues.map((issue) => issue.card) : report.cards;
-  const blocking = displayed.filter((c) => (c.action === 'BLOCK' || c.action === 'BLOCK_DEPLOY') && !c.isIntegrity);
-  const integrity = displayed.filter((c) => c.isIntegrity);
-  const exceptions = displayed.filter((c) => c.action === 'EXCEPTION');
-  const logged = displayed.filter((c) => c.action === 'LOG');
-
-  // Actionable groups (integrity, blocking, exceptions) stay visible even at
-  // repo scale; only very large lists collapse. LOG noise collapses early.
-  const integritySection = renderGroupMarkdown(
-    '🚨 Scan integrity failures — results UNKNOWN, fail-closed, not a code defect',
-    integrity,
-    { collapseOver: 25 }
-  );
-  if (integritySection) blocks.push(integritySection);
-  const blockingSection = renderGroupMarkdown('⛔ Blocking findings', blocking, { collapseOver: 25 });
-  if (blockingSection) blocks.push(blockingSection);
-  const exceptionSection = renderGroupMarkdown(
-    '⚠️ Tracked exceptions (no fix available — passed deliberately)',
-    exceptions,
-    { collapseOver: 25 }
-  );
-  if (exceptionSection) blocks.push(exceptionSection);
-  const loggedSection = renderGroupMarkdown('📝 Logged (non-blocking)', logged, { collapseOver: 5 });
-  if (loggedSection) blocks.push(loggedSection);
-
+  const rest = [...renderCallouts(report), ...renderIntegrity(report)];
   if (report.cards.length === 0) {
-    blocks.push('No findings. 🎉');
+    rest.push('No findings. 🎉');
   }
+  const footer = renderFooter(report);
 
-  return blocks.filter(Boolean).join('\n\n') + '\n';
+  // Rows are capped by count; if unusually long cells still push the fixed part
+  // over the size limit, fewer rows are shown — and the omission says so.
+  let tableRows = SUMMARY_LIMITS.tableRows;
+  let table = renderTable(report, { ...SUMMARY_LIMITS, tableRows });
+  const fixedLength = () => [...head, ...table.blocks, ...rest, ...footer].join('\n\n').length;
+  while (tableRows > 0 && fixedLength() > SUMMARY_LIMITS.maxCharacters - 2_000) {
+    tableRows = Math.floor(tableRows / 2);
+    table = renderTable(report, { ...SUMMARY_LIMITS, tableRows });
+  }
+  head.push(...table.blocks, ...rest);
+  const fixed = [...head, ...footer].join('\n\n').length;
+  const details = renderDetails(report, Math.max(0, SUMMARY_LIMITS.maxCharacters - fixed - 2_000));
+
+  return [...head, ...details, ...footer].filter(Boolean).join('\n\n') + '\n';
+}
+
+// ---- full evidence document -----------------------------------------------------
+//
+// Every issue's full card — INFO included — in priority order, unbounded. It is
+// written as a run artifact next to security-gate.json, not posted anywhere, so
+// the triage summary can stay small without any per-issue explanation becoming
+// unavailable. It renders the SAME cards the summary's details use.
+export function renderEvidenceMarkdown(report) {
+  const blocks = [`# Security gate evidence: ${report.headline ?? report.verdictLabel}`, `_${report.blurb}_`];
+  const ctx = contextLine(report.context);
+  if (ctx) blocks.push(ctx);
+  blocks.push(...renderScanHealth(report), ...renderScanProblem(report), countsLine(report));
+  const integrity = (report.issues ?? []).map((issue) => issue.card).filter((card) => card.isIntegrity);
+  for (const card of integrity) {
+    blocks.push(`## 🚨 Scan integrity failure\n\n${renderCardMarkdown(withExecutionNote(card, report))}`);
+  }
+  for (const issue of report.orderedIssues ?? []) {
+    const p = issue.presentation;
+    blocks.push(
+      `## ${DISPOSITION_LABELS[p.disposition]} · ${titleOrDash(p.severity)} · ${p.component} — ${p.advisory}\n\n` +
+        `Relationship: ${p.relationship ?? '—'} · Version: ${p.version.text} · Fix: ${p.fix.text}\n\n${renderCardMarkdown(issue.card)}`
+    );
+  }
+  if (report.cards.length === 0) {
+    blocks.push('No findings.');
+  }
+  blocks.push(`Machine-readable evidence, including every raw scanner record: \`${evidenceFile(report)}\`.`);
+  return `${blocks.join('\n\n')}\n`;
 }
 
 // ---- Slack Block Kit renderer (concise: what/where/how many + link) ---------
@@ -1306,13 +1920,16 @@ function slackCardLine(card) {
 
 export function renderSlack(report, { detailUrl } = {}) {
   const counts = report.issueCounts ?? report.counts;
-  const headline = `${report.emoji} Security gate: ${report.verdictLabel}`;
+  const headline = `${report.emoji} Security gate: ${report.headline ?? report.verdictLabel}`;
   const fields = [
     { type: 'mrkdwn', text: `*Blocking*\n${counts.block}` },
     { type: 'mrkdwn', text: `*Exceptions*\n${counts.exception}` },
     { type: 'mrkdwn', text: `*Logged*\n${counts.log}` },
     { type: 'mrkdwn', text: `*Repository*\n${report.context.repository || 'n/a'}` }
   ];
+  if ((report.dispositionCounts?.review ?? 0) > 0) {
+    fields.splice(3, 0, { type: 'mrkdwn', text: `*Needs review*\n${report.dispositionCounts.review}` });
+  }
   if (counts.integrity > 0) {
     fields.splice(3, 0, { type: 'mrkdwn', text: `*Integrity failures*\n${counts.integrity}` });
   }
@@ -1328,15 +1945,31 @@ export function renderSlack(report, { detailUrl } = {}) {
     { type: 'section', fields }
   ];
 
+  if (report.counts.integrity > 0 && report.gateStatus) {
+    const status = report.gateStatus;
+    const text = [
+      ...status.explanations,
+      `*Security state:* ${status.securityState}`,
+      `*Suggested action:* ${status.suggestedActions.join(' ')}`,
+      'Do not generate a baseline from this run.'
+    ].join('\n');
+    blocks.push({ type: 'section', text: { type: 'mrkdwn', text: toSlackMrkdwn(text) } });
+  }
+
   if (report.breakGlassNotice) {
     blocks.push({ type: 'section', text: { type: 'mrkdwn', text: toSlackMrkdwn(report.breakGlassNotice) } });
   }
 
-  // Concise: show the most severe blocking/integrity findings only; full detail
-  // lives in the PR comment / job summary, which is linked below.
-  const displayed = Array.isArray(report.issues) ? report.issues.map((issue) => issue.card) : report.cards;
-  const actionable = displayed.filter((c) => c.action === 'BLOCK' || c.action === 'BLOCK_DEPLOY' || c.isIntegrity);
-  const highlights = sortCards(actionable).slice(0, 5);
+  // Concise: integrity failures and BLOCK issues only, in the same priority
+  // order as every other surface; full detail lives in the PR comment / job
+  // summary, which is linked below.
+  const actionable = Array.isArray(report.orderedIssues)
+    ? [
+        ...report.issues.map((issue) => issue.card).filter((card) => card.isIntegrity),
+        ...report.orderedIssues.filter((issue) => issue.presentation.disposition === 'BLOCK').map((issue) => issue.card)
+      ]
+    : sortCards(report.cards.filter((c) => c.action === 'BLOCK' || c.action === 'BLOCK_DEPLOY' || c.isIntegrity));
+  const highlights = actionable.slice(0, 5);
   if (highlights.length > 0) {
     const shown = highlights.map(slackCardLine).join('\n');
     const remaining = actionable.length - highlights.length;

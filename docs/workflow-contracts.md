@@ -145,6 +145,24 @@ the pinned version. OSV-Scanner reserves distinct codes, so its failures are als
 caught by status. npm audit keeps its existing handling: its error output is
 recognised in the report (`error`), and it never used exit status as a signal here.
 
+### Scanner image acquisition is separate from scanner execution
+
+The SAST step runs Semgrep in three phases (`scanner-execution.mjs`):
+
+| Phase | What | Retried |
+| --- | --- | --- |
+| acquire | `docker pull` of the **pinned digest** (an image already on the runner is used as is) | **yes**, only for a registry failure its error text shows to be transient (`registry-network`, `registry-rate-limit`): at most **3 attempts**, waiting 5 s then 10 s, each attempt logged as `attempt N/3`. Auth, not-found and unrecognized failures fail at once. |
+| run | `docker run --pull=never` of the already-acquired image, exactly once | **never** — a crash, invalid rule config, OOM or any non-zero exit fails the step |
+| complete | judge the exit status and the report | no — non-zero exit, missing report or invalid report fails the step |
+
+Nothing is masked (`|| true`, `continue-on-error`), the image identity is fixed by
+digest (no tag, no `:latest`, no mirror), and a failure in any phase still leaves
+no trustworthy `semgrep.json`, so the gate still fails closed. Each phase writes
+`reports/scanner-execution-semgrep.json`, which `sast-reports` uploads even on
+failure; the gate copies it into `security-gate.json` → `scannerExecution`
+([evidence-model.md](evidence-model.md#scanner-execution-evidence)). The record
+never affects a verdict.
+
 The Secret scanning job likewise validates both reports before upload, so all three
 scanning jobs' `success` means the same thing. Both are deliberate tightenings in the
 fail-closed direction: a malformed secret report, or an exit-1-with-no-findings, used
@@ -439,6 +457,32 @@ notifier given no state at all claims nothing.
 
 Routing chooses surfaces only; it never changes the verdict.
 
+### Scan unavailable is not a policy BLOCK
+
+When every blocking finding is a report-integrity failure, the headline says
+**`BLOCK — scan unavailable`** (no trustworthy report was produced: the job failed,
+or the execution record shows acquisition/execution failure or a missing report)
+or **`BLOCK — scan untrusted`** (a report exists but could not be interpreted), and
+states *This is not a vulnerability-policy BLOCK*. The summary then shows scan
+health per control, **Security state: UNKNOWN**, the execution record's cause, a
+suggested action chosen from that cause (e.g. *Re-run the failed jobs. If the
+failure repeats, investigate scanner registry/network availability.* for
+`registry-network`), and *Do not generate a baseline from this run.* The verdict,
+`integrity_trusted`, routing and break-glass ineligibility are unchanged. The
+notifier receives each scanner job's result (`*_JOB_RESULT`) so scan health uses
+the same derivation as the per-control outputs.
+
+### The summary is bounded triage; full evidence is in artifacts
+
+The job summary and PR comment render gate status, scan health, counts, one
+compact row per unique issue, conflict callouts, and collapsible full cards for
+BLOCK / EXCEPTION / REVIEW only, within fixed limits that state every omission
+exactly. REVIEW and INFO are presentation labels for LOG issues and never change
+policy. `security-gate.json` stays complete, and `security-gate-evidence.md`
+(uploaded with it; `image-gate-evidence.md` / `image-gate-prepush-evidence.md` for
+the image gates) holds every issue's full card. Details:
+[evidence-model.md § Presentation](evidence-model.md#presentation-a-triage-view-over-this-model).
+
 ### Reproduce commands match what the run scanned with
 
 With no `reproduce_commands` override, the command is built from this run's own
@@ -537,7 +581,9 @@ rules, wording and known limits are in [evidence-model.md](evidence-model.md).
 `severitySource`, `installedVersion`, `fixVersions`, `aliases`, `ecosystem`
 (pip-audit / OSV-Scanner); `correlation` (see above), whose package-scoped issues
 carry `evidence`; `dependencyEvidence`, the run-level record behind it
-([evidence-model.md](evidence-model.md)); and, on a report-integrity
+([evidence-model.md](evidence-model.md)); `scannerExecution`, the scanner
+execution records (present on every source gate result, including a
+report-integrity one); and, on a report-integrity
 failure, `control` on the finding and on `integrity.failures[]` naming the control
 whose input could not be interpreted (`secret-scan`, `dependency-scan`, `sast`,
 `source-gate`). Image gate findings may carry `scannerSeverity`,

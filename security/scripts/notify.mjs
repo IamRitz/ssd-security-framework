@@ -17,13 +17,14 @@
 // is untouched; this module only adds the read-only developer feedback surfaces
 // around it.
 
-import { appendFile, readFile, stat } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import { appendFile, readFile, stat, writeFile } from 'node:fs/promises';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
   buildReport,
   deriveBreakGlassState,
+  renderEvidenceMarkdown,
   renderMarkdown,
   renderSlack,
   resolveReproduceCommands,
@@ -196,8 +197,10 @@ export async function dispatch({
   slackUrl,
   token,
   summaryPath,
+  evidencePath,
   fetchImpl,
   appendImpl,
+  writeImpl = writeFile,
   logger = console
 }) {
   const report = buildReport({ gate, context, mode, breakGlass });
@@ -225,6 +228,16 @@ export async function dispatch({
     } catch (error) {
       failures.push(`job summary (${error.message})`);
       logger.error?.(`NOTIFY: job summary write failed: ${error.message}`);
+    }
+  }
+
+  // 1b. The full evidence document: every issue's complete explanation, which
+  //     the bounded summary and comment do not repeat. Local, best effort.
+  if (evidencePath) {
+    try {
+      await writeImpl(evidencePath, renderEvidenceMarkdown(report));
+    } catch (error) {
+      logger.error?.(`NOTIFY: evidence document write failed: ${error.message}`);
     }
   }
 
@@ -369,7 +382,17 @@ async function main() {
   const gate = JSON.parse(await readFile(options.gate, 'utf8'));
   const env = process.env;
   const headRepository = env.PR_HEAD_REPOSITORY || '';
+  // Written next to the gate result and uploaded with it.
+  const evidencePath = join(dirname(options.gate), `${basename(options.gate, '.json')}-evidence.md`);
   const context = {
+    evidenceFile: basename(options.gate),
+    evidenceMarkdownFile: basename(evidencePath),
+    // Each scanner job's own result (source workflow only), for scan health.
+    jobResults: {
+      'secret-scan': env.SECRET_SCAN_JOB_RESULT,
+      'dependency-scan': env.DEPENDENCY_SCAN_JOB_RESULT,
+      sast: env.SAST_JOB_RESULT
+    },
     repository: env.GITHUB_REPOSITORY,
     sha: env.GITHUB_SHA,
     prNumber: env.PR_NUMBER || null,
@@ -405,7 +428,8 @@ async function main() {
     breakGlass: await breakGlassStateFromEnv(env, { gate, mode }),
     slackUrl: env.SECURITY_NOTIFY_SLACK_URL,
     token: env.GITHUB_TOKEN,
-    summaryPath: env.GITHUB_STEP_SUMMARY
+    summaryPath: env.GITHUB_STEP_SUMMARY,
+    evidencePath
   });
 
   const bg = performed.breakGlass;

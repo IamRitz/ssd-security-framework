@@ -203,7 +203,118 @@ headline as before.
 An EXCEPTION keeps the tracked-exception explanation, and a malicious package keeps
 "remove it" as its remediation. Both still show the relationship and resolution
 lines. The raw scanner records ("Observed by", advisory ids, fixed versions with
-their sources) remain listed under every issue.
+their sources) remain listed in every issue's full card. The bounded job summary
+and PR comment show that card for BLOCK, EXCEPTION and REVIEW issues; every card,
+INFO included, is in the evidence document (see below).
+
+## Presentation: a triage view over this model
+
+The job summary, PR comment and Slack message are a **triage surface**, not the
+evidence database. They read the same correlated issues and evidence objects as
+everything else, and add nothing to `security-gate.json`.
+
+Default summary shape (`renderMarkdown` in `format-findings.mjs`):
+
+1. gate status — `PASS`, `BLOCK`, or `BLOCK — scan unavailable` / `scan untrusted`
+2. scan health per control (see [Scanner execution evidence](#scanner-execution-evidence))
+3. issue counts, with the raw scanner-record count beside them
+4. one compact table, one row per unique issue:
+   `Action | Severity | Component | Advisory / rule | Relationship | Version | Fix`
+5. evidence-conflict callouts
+6. integrity failures, in full
+7. collapsible (`<details>`) full cards for BLOCK, EXCEPTION and REVIEW issues only
+8. global notes, stated once (correlation, what REVIEW/INFO mean, where full evidence is)
+
+### Presentation disposition (never policy)
+
+| Disposition | Assigned when | Shown as |
+| --- | --- | --- |
+| `BLOCK` | the issue's strongest policy action is `BLOCK` / `BLOCK_DEPLOY` | row + full card (expanded when ≤ 5) |
+| `EXCEPTION` | strongest action is `EXCEPTION` | row + full card (collapsed) |
+| `REVIEW` | strongest action is `LOG` **and** the evidence explicitly disagrees with itself | row + conflict callout + full card (collapsed) |
+| `INFO` | any other `LOG` issue | row only |
+
+`REVIEW` reasons are explicit and enumerable (`reviewReasons`). Schema version 1 has
+one: `version-conflict` (`resolution.status: "conflicting"`). An `unknown`
+relationship is **not** a reason on its own: no current scanner report proves
+ancestry, so it is the normal state of every undeclared package. Disposition is
+computed in `buildReport`, never written to `security-gate.json`, and never read
+by the verdict, counts, routing or break-glass.
+
+Row fields follow the evidence rules above:
+
+| Field | Values |
+| --- | --- |
+| Relationship | `direct` / `transitive` / `unknown` from `evidence.relationship`; `—` for issues with no package evidence |
+| Version | the consistent version; `unknown`; or `conflict: 3.19 / 3.9.0`. A disputed version is never shown alone. |
+| Fix | `fixed in X` · `fix available` · `fix via <parent> X` (npm) · `no fix reported` · `disputed — X reported` when the version itself conflicts · `remove the package` (malicious) |
+
+### Bounds
+
+A PR comment body over 65,536 characters is rejected by GitHub, so the summary is
+bounded by construction (`SUMMARY_LIMITS`): at most 60,000 characters, 100 table
+rows (BLOCK and EXCEPTION first; at most 30 REVIEW and 20 INFO), 25 full cards,
+10 conflict callouts, 10 integrity cards, and 72 characters per table cell. When
+anything is left out the summary states the exact count per disposition and points
+to `security-gate.json`. Nothing is dropped silently.
+
+### Full evidence
+
+- `security-gate.json`: complete machine evidence — raw findings, correlation,
+  `dependencyEvidence`, `scannerExecution`.
+- `security-gate-evidence.md` (uploaded with the gate result): every issue's full
+  card in priority order, INFO included, unbounded.
+
+Interchange formats such as SARIF 2.1.0 (static analysis) or CycloneDX
+vulnerability/VEX (component vulnerabilities) could be exported from these objects
+later. They are not implemented, and the internal model is not shaped to match them.
+
+## Scanner execution evidence
+
+A scanner has three separate states, and they are never merged:
+
+| Fact | Question | Where it lives |
+| --- | --- | --- |
+| **execution** | did the scanner get its image, run, and write a valid report? | `scannerExecution.records[]` (`scanner-execution.mjs`) |
+| **report trust** | could the gate interpret the report? | `integrity` (fail-closed) |
+| **findings** | what does the report say? | raw `findings[]` (policy) |
+
+A missing report is still a report-integrity BLOCK whatever the execution record
+says. The record only explains why, so a developer can tell "the image could not
+be pulled — re-run" from "Semgrep crashed" from "a rule file is invalid".
+
+Record (`reports/scanner-execution-semgrep.json`, uploaded in `sast-reports` even
+when the scan failed; copied into `security-gate.json` → `scannerExecution`):
+
+```jsonc
+{
+  "schemaVersion": 1,
+  "scanner": "semgrep",
+  "control": "sast",
+  "image": "semgrep/semgrep@sha256:…",       // the pinned digest, never a tag
+  "state": "acquisition-failed",              // success | acquisition-failed | execution-failed |
+                                              // report-missing | report-invalid | incomplete
+  "cause": "registry-network",                // registry-network | registry-rate-limit | registry-auth |
+                                              // image-not-found | scanner-runtime | scanner-configuration |
+                                              // report-validation | unknown | null
+  "retryable": true,
+  "acquisition": { "source": null, "maxAttempts": 3, "attempts": [
+    { "attempt": 1, "outcome": "failed", "exitCode": 1, "cause": "registry-network", "retryable": true, "detail": "…connection reset by peer" }
+  ]},
+  "execution": { "exitCode": 0 },             // null when the scanner never ran
+  "report": { "path": "reports/semgrep.json", "present": true, "valid": true, "summary": "…" },
+  "detail": "…"
+}
+```
+
+A cause is named only from direct evidence: the registry's own error text for
+acquisition, a documented Semgrep or container exit status for execution. Anything
+else is `unknown`. `incomplete` means the image was acquired but the run was never
+recorded (the step stopped). A gate reading an unreadable record keeps it as
+`state: "unknown"`; it never becomes success.
+
+Only Semgrep writes a record in schema version 1. Other scanners' failures still
+surface as their job's result and any integrity failure, without a cause.
 
 ## Using the model for benchmarking
 

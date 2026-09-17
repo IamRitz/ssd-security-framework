@@ -248,6 +248,7 @@ jobs:
           path: |
             reports/trivy-image.json
             reports/image-gate-prepush.json
+            reports/image-gate-prepush-evidence.md
             reports/DO-NOT-BASELINE.txt
           if-no-files-found: warn
           retention-days: 14
