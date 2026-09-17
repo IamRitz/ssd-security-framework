@@ -274,13 +274,19 @@ jobs:
       registry: ecr
       deploy_target: framework-gated
       break_glass_enabled: true
+      # PER-CONTROL evidence. Never feed `needs.source-security.result` to every
+      # source control: it is the AGGREGATE, so a policy BLOCK would report all
+      # three scanners as failed although they ran and produced usable reports.
+      # A scanning control succeeds when its scanner produced trustworthy
+      # evidence — findings included. Whether that evidence satisfies policy is
+      # the source-gate control, explained by its verdict and integrity outputs.
       observed: >-
-        {"secret-scan":{"status":"${{ needs.source-security.result }}","evidence":"source-security job"},
-         "dependency-scan":{"status":"${{ needs.source-security.result }}","evidence":"source-security job"},
-         "sast":{"status":"${{ needs.source-security.result }}","evidence":"source-security job"},
-         "source-gate":{"status":"${{ needs.source-security.result }}","evidence":"source-security job"},
-         "image-scan-prepush":{"status":"${{ needs.image-security.result }}","evidence":"pre-push Trivy gate"},
+        {"secret-scan":{"status":"${{ needs.source-security.outputs.secret_scan_result }}","evidence":"Secret scanning job (per-control output)"},
+         "dependency-scan":{"status":"${{ needs.source-security.outputs.dependency_scan_result }}","evidence":"Dependency scanning job (per-control output)"},
+         "sast":{"status":"${{ needs.source-security.outputs.sast_result }}","evidence":"SAST job (per-control output)"},
+         "source-gate":{"status":"${{ needs.source-security.outputs.source_gate_result }}","verdict":"${{ needs.source-security.outputs.verdict }}","gate_mode":"${{ needs.source-security.outputs.gate_mode }}","integrity_trusted":"${{ needs.source-security.outputs.integrity_trusted }}","evidence":"source-gate job"},
+         "image-scan-prepush":{"status":"${{ needs.image-security.result }}","verdict":"${{ needs.image-security.outputs.verdict }}","gate_mode":"${{ needs.image-security.outputs.gate_mode }}","integrity_trusted":"${{ needs.image-security.outputs.integrity_trusted }}","evidence":"pre-push Trivy gate"},
          "break-glass":{"status":"pass","evidence":"lambda transport configured for this repo"},
          "registry-scan-collect":{"status":"${{ needs.ecr-collect.result }}","evidence":"ECR push + scan polled by digest"},
-         "artifact-gate":{"status":"${{ needs.artifact-gate.result }}","evidence":"normalized report gated at the pushed digest"},
+         "artifact-gate":{"status":"${{ needs.artifact-gate.result }}","verdict":"${{ needs.artifact-gate.outputs.verdict }}","evidence":"normalized report gated at the pushed digest"},
          "gated-deploy":{"status":"${{ needs.deploy.result }}","evidence":"SSM deploy pinned to the gated digest"}}

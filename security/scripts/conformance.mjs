@@ -82,34 +82,54 @@ const DELIVERY_ONLY = ['delivery'];
 //
 // `phases` lists the execution phases in which the control is EXPECTED to run.
 // Outside those phases it is `deferred`, never `pass`.
+//
+// `kind` decides what a result MEANS, because two different questions hide
+// behind "did it pass?":
+//
+//   scan      did the scanner execute and produce TRUSTWORTHY EVIDENCE? A scan
+//             that finds vulnerabilities has succeeded. It fails only when no
+//             trustworthy report exists (crash, cancellation, integrity failure).
+//   gate      did that evidence SATISFY SECURITY POLICY? A blocking verdict is a
+//             gate failure — never a scanner failure.
+//   delivery  did the delivery step (collection, deploy) complete?
+//   approval  is the approval channel in place?
+//
+// A finding is not a scanner failure, and a report must never say it is.
 export const CONTROLS = [
   {
     id: 'secret-scan',
     name: 'Secret scanning (Gitleaks + TruffleHog)',
+    kind: 'scan',
     phases: SOURCE_PHASES,
     appliesWhen: () => true
   },
   {
     id: 'dependency-scan',
     name: 'Dependency scanning (npm audit / pip-audit / OSV-Scanner)',
+    kind: 'scan',
     phases: SOURCE_PHASES,
     appliesWhen: () => true
   },
   {
     id: 'sast',
     name: 'SAST (Semgrep)',
+    kind: 'scan',
     phases: SOURCE_PHASES,
     appliesWhen: () => true
   },
   {
     id: 'source-gate',
     name: 'Source security gate',
+    kind: 'gate',
+    gateLabel: 'the source security policy gate',
     phases: SOURCE_PHASES,
     appliesWhen: () => true
   },
   {
     id: 'image-scan-prepush',
     name: 'Pre-push image scan (Trivy) and image gate',
+    kind: 'gate',
+    gateLabel: 'the pre-push image gate',
     // Runs on the PR too: the whole point is catching an image problem BEFORE
     // the image is pushed anywhere.
     phases: SOURCE_PHASES,
@@ -120,6 +140,7 @@ export const CONTROLS = [
   {
     id: 'registry-scan-collect',
     name: 'Registry scan collection (push, poll by digest, normalize)',
+    kind: 'delivery',
     phases: DELIVERY_ONLY,
     appliesWhen: ({ artifact_type: artifactType, registry }) => {
       if (artifactType !== 'container') {
@@ -134,6 +155,8 @@ export const CONTROLS = [
   {
     id: 'artifact-gate',
     name: 'Artifact gate over the normalized registry report',
+    kind: 'gate',
+    gateLabel: 'the artifact gate',
     phases: DELIVERY_ONLY,
     appliesWhen: ({ artifact_type: artifactType, registry }) => {
       if (artifactType !== 'container') {
@@ -148,6 +171,7 @@ export const CONTROLS = [
   {
     id: 'gated-deploy',
     name: 'Deploy gated on the artifact verdict',
+    kind: 'delivery',
     phases: DELIVERY_ONLY,
     appliesWhen: ({ deploy_target: deployTarget }) => {
       if (deployTarget === 'self-managed') {
@@ -162,6 +186,7 @@ export const CONTROLS = [
   {
     id: 'break-glass',
     name: 'Break-glass approval for an eligible BLOCK',
+    kind: 'approval',
     phases: SOURCE_PHASES,
     appliesWhen: (_capabilities, { breakGlassEnabled }) =>
       breakGlassEnabled === true ||
@@ -280,9 +305,127 @@ export async function loadExemptions(path) {
   return entries.map(validateExemption);
 }
 
+const PASSED_STATUSES = new Set(['pass', 'passed', 'success', 'applied']);
+const BLOCKING_VERDICTS = new Set(['BLOCK', 'BLOCK_DEPLOY']);
+
+function text(value) {
+  return typeof value === 'string' ? value.trim() : value === undefined || value === null ? '' : String(value).trim();
+}
+
+// Turns one observed result into { passed, reason?, detail? } with a reason a
+// newcomer can read and that states only what the evidence supports.
+//
+// Optional evidence a caller may add beside `status` for a gate control:
+//   verdict            the gate's verdict output (PASS, BLOCK, BLOCK_DEPLOY, ...)
+//   gate_mode          the mode the gate actually ran in (echoed output)
+//   integrity_trusted  'false' when a scan report could not be interpreted
+// Without them the reason says only what the status proves.
+export function explainObserved(control, result) {
+  const status = text(result?.status).toLowerCase();
+  const verdict = text(result?.verdict).toUpperCase();
+  const mode = text(result?.gate_mode ?? result?.gateMode).toLowerCase();
+  const trusted = text(result?.integrity_trusted ?? result?.integrityTrusted).toLowerCase();
+  const kind = control.kind ?? 'other';
+  const gateLabel = control.gateLabel ?? 'the gate';
+
+  if (PASSED_STATUSES.has(status)) {
+    if (kind === 'scan') {
+      return {
+        passed: true,
+        detail:
+          'scanner executed and produced trustworthy evidence; any findings are judged by the policy gate, not counted as a scanner failure'
+      };
+    }
+    if (kind === 'gate' && verdict !== '') {
+      if (BLOCKING_VERDICTS.has(verdict)) {
+        const suppressed =
+          mode === 'log-only'
+            ? `verdict ${verdict} reported but NOT enforced (gate_mode=log-only)`
+            : `verdict ${verdict} did not fail the gate job (gate_mode=${mode || 'unknown'}); only a verified break-glass approval permits that in enforce mode`;
+        return {
+          passed: true,
+          detail: trusted === 'false' ? `${suppressed}; a scan report could not be trusted, so results are UNKNOWN` : suppressed
+        };
+      }
+      return {
+        passed: true,
+        detail: `policy verdict ${verdict}${mode === 'log-only' ? ' (gate_mode=log-only; no blocking verdict to suppress)' : ''}`
+      };
+    }
+    return { passed: true };
+  }
+
+  if (status === '') {
+    return {
+      passed: false,
+      reason: 'no result was supplied (empty status); absence of evidence is not evidence the control ran'
+    };
+  }
+  if (status === 'skipped') {
+    return { passed: false, reason: 'the job was skipped, so the control did not execute' };
+  }
+  if (status === 'cancelled') {
+    return {
+      passed: false,
+      reason:
+        kind === 'scan'
+          ? 'the scanner job was cancelled before producing a trustworthy report; findings are UNKNOWN, not clean'
+          : 'the job was cancelled before the control completed'
+    };
+  }
+
+  if (kind === 'scan') {
+    if (status === 'untrusted') {
+      return {
+        passed: false,
+        reason:
+          'the scanner job completed, but the security gate could not interpret its report (report-integrity failure); findings are UNKNOWN, not clean'
+      };
+    }
+    if (['failure', 'fail', 'failed'].includes(status)) {
+      return {
+        passed: false,
+        reason:
+          'the scanner job failed, so no trustworthy report was produced; findings are UNKNOWN, not clean. (Findings alone never fail a scanning control.)'
+      };
+    }
+  }
+
+  if (kind === 'gate' && ['failure', 'fail', 'failed'].includes(status)) {
+    if (BLOCKING_VERDICTS.has(verdict) && trusted === 'false') {
+      return {
+        passed: false,
+        reason: `${gateLabel} failed closed: a scan report could not be trusted (report-integrity failure), so the verdict is ${verdict}; results are UNKNOWN, not clean`
+      };
+    }
+    if (BLOCKING_VERDICTS.has(verdict)) {
+      return {
+        passed: false,
+        reason: `${gateLabel} returned a blocking result (verdict ${verdict}): the scan evidence did not satisfy security policy`
+      };
+    }
+    if (verdict !== '') {
+      return {
+        passed: false,
+        reason: `the gate job failed although its verdict was ${verdict}, so the gate did not complete; treated as failed (fail-closed)`
+      };
+    }
+    return {
+      passed: false,
+      reason: 'the gate job failed; no verdict was supplied to say whether policy blocked or the job errored'
+    };
+  }
+
+  if (['failure', 'fail', 'failed'].includes(status)) {
+    return { passed: false, reason: 'the job failed' };
+  }
+  return { passed: false, reason: `unrecognized result '${result?.status}'; treated as failed (fail-closed)` };
+}
+
 // Builds the conformance report.
 //
-// `observed` maps control id -> { status: 'pass'|'fail'|..., evidence: string }.
+// `observed` maps control id -> { status: 'pass'|'fail'|..., evidence: string },
+// optionally with gate evidence (see explainObserved).
 // A control that applies AND is expected in this phase but was never observed is
 // `failed`: absence of evidence is not evidence the control ran.
 export function buildConformance({
@@ -303,6 +446,7 @@ export function buildConformance({
     const base = {
       id: control.id,
       name: control.name,
+      kind: control.kind,
       phases: control.phases
     };
 
@@ -378,14 +522,15 @@ export function buildConformance({
       continue;
     }
 
-    const passed = ['pass', 'passed', 'success', 'applied'].includes(
-      String(result.status).toLowerCase()
-    );
+    const explained = explainObserved(control, result);
     controls.push({
       ...base,
       appliesToRepository: true,
-      status: passed ? 'applied' : 'failed',
-      reason: passed ? undefined : `observed result '${result.status}'`,
+      status: explained.passed ? 'applied' : 'failed',
+      reason: explained.passed ? undefined : explained.reason,
+      detail: explained.detail,
+      observedStatus: text(result.status),
+      ...(text(result.verdict) !== '' ? { verdict: text(result.verdict) } : {}),
       evidence: result.evidence ?? undefined
     });
   }
@@ -422,6 +567,8 @@ export function renderMarkdown(report) {
     exempt: '⚠️ exempt',
     failed: '❌ failed'
   };
+  const { summary } = report;
+  const plural = (count, word) => `**${count}** ${word}${count === 1 ? '' : 's'}`;
   const lines = [
     '## Conformance',
     '',
@@ -431,9 +578,16 @@ export function renderMarkdown(report) {
       `\`registry=${report.capabilities.registry}\` ` +
       `\`deploy_target=${report.capabilities.deploy_target}\``,
     '',
-    `This repository requires **${report.summary.requiredByRepository}** controls; ` +
-      `**${report.summary.applied}** executed successfully in this run, ` +
-      `**${report.summary.deferred}** run in another phase.`,
+    `This repository requires ${plural(summary.requiredByRepository, 'control')}. In this \`${report.phase}\` run: ` +
+      `**${summary.applied}** applied (executed successfully), ` +
+      `**${summary.failed}** failed, ` +
+      `**${summary.deferred}** deferred to another phase, ` +
+      `**${summary.exempt}** exempt. ` +
+      `${plural(summary.notApplicable, 'control')} ${summary.notApplicable === 1 ? 'is' : 'are'} not applicable to this repository.`,
+    '',
+    '> **Scanning controls** answer *did the scanner execute and produce trustworthy evidence?* ' +
+      'A scanner that finds vulnerabilities has still been applied. **Gate controls** answer ' +
+      '*did that evidence satisfy security policy?* A finding is not a scanner failure.',
     '',
     '| Control | Status | Why |',
     '| --- | --- | --- |'
@@ -442,7 +596,7 @@ export function renderMarkdown(report) {
     const why =
       control.status === 'exempt'
         ? `${control.reason} — owner ${control.owner}, expires ${control.expires}`
-        : (control.reason ?? '');
+        : (control.reason ?? control.detail ?? '');
     lines.push(`| ${control.name} | ${symbol[control.status]} | ${why} |`);
   }
   if (report.warnings.length > 0) {

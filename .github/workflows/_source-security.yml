@@ -170,6 +170,38 @@ on:
       integrity_trusted:
         description: '`false` when a scanner could not interpret its input. A `false` here means the findings list is UNKNOWN, not clean — never baseline from such a run.'
         value: ${{ jobs.source-gate.outputs.integrity_trusted }}
+      # PER-CONTROL EVIDENCE. The caller's `needs.<job>.result` is the AGGREGATE of
+      # every job below, so a policy BLOCK makes it `failure` even though every
+      # scanner ran and produced a usable report. Conformance must be fed these
+      # instead: a scanner that FINDS vulnerabilities has succeeded as a scanning
+      # control; whether its findings satisfy policy is `source_gate_result`.
+      secret_scan_result:
+        description: >-
+          Secret scanning control: `success` (Gitleaks and TruffleHog executed and produced reports
+          the gate accepted — NOT "no secrets found") | `failure` | `cancelled` | `skipped` |
+          `untrusted` (the job completed but the gate could not interpret its report). Empty when
+          the source-gate job could not publish it; treat empty as missing evidence.
+        value: ${{ jobs.source-gate.outputs.secret_scan_result }}
+      dependency_scan_result:
+        description: >-
+          Dependency scanning control (npm audit / pip-audit / OSV-Scanner), same vocabulary as
+          secret_scan_result. `success` means trustworthy reports were produced, not that no
+          vulnerabilities were found.
+        value: ${{ jobs.source-gate.outputs.dependency_scan_result }}
+      sast_result:
+        description: >-
+          SAST control (Semgrep), same vocabulary as secret_scan_result. `success` means a
+          trustworthy report was produced, not that no issues were found.
+        value: ${{ jobs.source-gate.outputs.sast_result }}
+      source_gate_result:
+        description: >-
+          Source security gate control: the source-gate job's own result — `success` | `failure` |
+          `cancelled`. `failure` in enforce mode means a BLOCK verdict (policy or fail-closed
+          integrity) that was not overridden, or a gate step that errored; read `verdict` and
+          `integrity_trusted` for which. In log-only a BLOCK is reported, not enforced, so this is
+          `success`. Empty when the job never reached its last step (skipped, or cancelled before
+          it) — treat empty as missing evidence.
+        value: ${{ jobs.source-gate.outputs.source_gate_result }}
 
 permissions:
   contents: read
@@ -330,6 +362,14 @@ jobs:
           node "$SSD_TOOLKIT/scripts/normalize-trufflehog.mjs" \
             reports/trufflehog.raw.jsonl reports/trufflehog.json
 
+      - name: Validate secret scan reports
+        # A successful Secret scanning job means both scanners produced reports
+        # the gate can interpret — the same meaning the dependency and SAST jobs'
+        # results carry. It never means "no secrets were found".
+        run: |
+          node "$SSD_TOOLKIT/scripts/validate-secret-report.mjs" gitleaks reports/gitleaks.json
+          node "$SSD_TOOLKIT/scripts/validate-secret-report.mjs" trufflehog reports/trufflehog.json
+
       - name: Upload secret scan reports
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -445,15 +485,28 @@ jobs:
         # Python's npm-audit-equivalent. Pinned tool version; audits the pinned
         # requirements.txt with --no-deps so dependency RESOLUTION never runs (no
         # untrusted setup.py execution), the same discipline as npm ci vs install.
+        #
+        # EXIT STATUS IS DATA, NOT A STEP FAILURE. pip-audit exits 1 when it finds
+        # vulnerabilities, which is a working scan. It ALSO exits 1 on a fatal error
+        # (verified in 2.10.1), so the status is captured and judged together with
+        # the report by check-scanner-exit.mjs: exit 1 is accepted only with a
+        # well-formed report that actually lists findings. A fatal error exits
+        # before any report is written, so it still fails this step — closed.
+        # No `continue-on-error`, no `|| true`.
+        id: pip-audit
         if: steps.detect.outputs.requirements_txt != ''
-        continue-on-error: true
         run: |
+          set +e
           docker run --rm \
             -v "$GITHUB_WORKSPACE:/repo:ro" \
             -v "$GITHUB_WORKSPACE/reports:/reports" \
             -w /repo \
             python@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea \
             sh -c 'pip install --quiet --no-cache-dir pip-audit==2.10.1 && pip-audit --requirement requirements.txt --no-deps --format json > /reports/pip-audit.json'
+          scanner_status=$?
+          set -e
+          node "$SSD_TOOLKIT/scripts/check-scanner-exit.mjs" \
+            pip-audit "$scanner_status" reports/pip-audit.json
 
       - name: Validate pip-audit report
         if: steps.detect.outputs.requirements_txt != ''
@@ -481,17 +534,27 @@ jobs:
         # vulnerable package still exits 1 with the advisory present — the flag
         # changes the empty case only, and suppresses no finding.
         #
-        # `continue-on-error` is kept because exit 1 means "vulnerabilities
-        # found", which the GATE judges rather than the scanner. That does mask a
-        # genuine scanner crash, which is precisely why the validate step below
-        # is fail-closed on an empty or unparseable report.
-        continue-on-error: true
+        # EXIT STATUS IS DATA, NOT A STEP FAILURE. Exit 1 means "vulnerabilities
+        # found", which the GATE judges rather than the scanner. The status is
+        # captured and checked against the report by check-scanner-exit.mjs
+        # instead of being masked with `continue-on-error` (which also hid a real
+        # crash, and still painted a red "exit code 1" on a working scan):
+        #   0 + valid report          clean (or findings the gate still evaluates)
+        #   1 + report with findings  findings found — the step succeeds
+        #   1 + report with none      disagreement — fail closed
+        #   127 / 128 / anything else scanner or container failure — fail closed
+        id: osv-scanner
         run: |
+          set +e
           docker run --rm \
             -v "$GITHUB_WORKSPACE:/repo:ro" \
             ghcr.io/google/osv-scanner@sha256:5116601dedc01c1c580eb92371883ec052fc4c13c3fbc109d621a63ac416d475 \
             scan source --recursive --allow-no-lockfiles /repo --format=json \
             > reports/osv-scanner.json
+          scanner_status=$?
+          set -e
+          node "$SSD_TOOLKIT/scripts/check-scanner-exit.mjs" \
+            osv-scanner "$scanner_status" reports/osv-scanner.json
 
       - name: Validate OSV-Scanner report
         run: |
@@ -677,6 +740,10 @@ jobs:
       break_glass_eligible: ${{ steps.verdict.outputs.break_glass_eligible }}
       gate_mode: ${{ inputs.gate_mode }}
       integrity_trusted: ${{ steps.verdict.outputs.integrity_trusted }}
+      secret_scan_result: ${{ steps.controls.outputs.secret_scan_result }}
+      dependency_scan_result: ${{ steps.controls.outputs.dependency_scan_result }}
+      sast_result: ${{ steps.controls.outputs.sast_result }}
+      source_gate_result: ${{ steps.gate-result.outputs.source_gate_result }}
 
     steps:
       - name: Check out the consumer repository
@@ -892,6 +959,29 @@ jobs:
           echo "break_glass_eligible=$eligible" >> "$GITHUB_OUTPUT"
           echo "integrity_trusted=$trusted" >> "$GITHUB_OUTPUT"
           echo "SECURITY GATE: $verdict (break-glass eligible: $eligible, scan trusted: $trusted)"
+
+      - name: Publish per-control scan evidence
+        # Each scanning control is answered from ITS OWN job result, never from
+        # the aggregate a caller sees, and is downgraded to `untrusted` only when
+        # the gate attributed a report-integrity failure to that control's report.
+        # A BLOCK verdict downgrades nothing here: findings are not a scanner
+        # failure. If this step cannot run its script, every control is published
+        # as `failure` — missing evidence never reads as success.
+        id: controls
+        if: always()
+        env:
+          SECRET_SCAN_JOB_RESULT: ${{ needs.secret-scanning.result }}
+          DEPENDENCY_SCAN_JOB_RESULT: ${{ needs.dependency-scanning.result }}
+          SAST_JOB_RESULT: ${{ needs.sast.result }}
+        run: |
+          if ! node "$SSD_TOOLKIT/scripts/source-control-results.mjs" --gate reports/security-gate.json; then
+            echo "::warning::Per-control scan evidence could not be computed; publishing failure for every scanning control."
+            {
+              echo "secret_scan_result=failure"
+              echo "dependency_scan_result=failure"
+              echo "sast_result=failure"
+            } >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Generate the first Semgrep baseline (bootstrap only)
         # The bootstrap deadlock resolved: a brand-new repo could not produce a
@@ -1131,7 +1221,21 @@ jobs:
           BREAK_GLASS_OUTCOME: ${{ steps.break-glass.outcome }}
         run: |
           if [ "$GATE_MODE" = "log-only" ]; then
-            echo "::warning::gate_mode=log-only — verdict $VERDICT is reported but NOT enforced. This repository's security gate is not blocking."
+            # The wording depends on the verdict. A PASS has no blocking verdict to
+            # suppress, so it must not read as "not enforced"; a BLOCK must say
+            # plainly that it was suppressed. Both keep log-only visible: it is a
+            # rollout mode and a merge bypass, never a steady state.
+            case "$VERDICT" in
+              BLOCK)
+                echo "::warning::Security gate verdict: BLOCK, but gate_mode=log-only so the BLOCK is reported and NOT enforced. This repository's security gate is not blocking merges."
+                ;;
+              PASS|PASS-WITH-EXCEPTIONS)
+                echo "::warning::Security gate verdict: $VERDICT. gate_mode=log-only; no blocking verdict exists, so nothing was suppressed. log-only is a rollout mode and a merge bypass: a future BLOCK would be reported without failing this job."
+                ;;
+              *)
+                echo "::warning::Security gate verdict is unavailable ('${VERDICT}'), and gate_mode=log-only so nothing is enforced. Treat this run as UNKNOWN, not clean."
+                ;;
+            esac
             exit 0
           fi
           if [ "$VERDICT" = "BLOCK" ]; then
@@ -1143,3 +1247,15 @@ jobs:
             exit 1
           fi
           echo "Security gate verdict is $VERDICT."
+
+      - name: Publish the source gate control result
+        # MUST stay the last step. `job.status` here is the job's status after
+        # every earlier step — including the enforcement above — which is exactly
+        # the result the caller's aggregate reports for this job. Published as its
+        # own output so a caller can evidence the gate control without inferring
+        # it from the aggregate of all four jobs.
+        id: gate-result
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: echo "source_gate_result=$JOB_STATUS" >> "$GITHUB_OUTPUT"

@@ -108,6 +108,35 @@ node -e '
   console.log(`     required=${s.requiredByRepository} applied=${s.applied} N/A=${s.notApplicable} deferred=${s.deferred}`);
 ' "$RPT/conformance.json"
 pass "no AWS, no image, no deploy required — and nothing deferred"
+
+echo "-- 1g. scanners succeed, policy BLOCKs: 3 scanning controls applied, the gate failed"
+# The live-run regression: evidence is per control, so a BLOCK verdict fails the
+# source-gate control and nothing else.
+cp "$FIXTURES/live-python-source-only/osv-scanner.json" reports/osv-scanner.json
+cp "$FIXTURES/live-python-source-only/pip-audit.json" reports/pip-audit.json
+echo 'requests==2.32.5' > requirements.txt
+node "$GATE" --policy "$POLICY" --baseline "$BASELINE" >/dev/null 2>&1 || true
+[ "$(field "$RPT/security-gate.json" verdict)" = "BLOCK" ] || fail "expected a policy BLOCK from the live OSV report"
+[ "$(field "$RPT/security-gate.json" integrity.trusted)" = "true" ] || fail "a policy BLOCK must not be an integrity failure"
+[ "$(field "$RPT/security-gate.json" correlation.summary.issues)" -lt "$(field "$RPT/security-gate.json" correlation.summary.rawFindings)" ] \
+  || fail "aliased OSV records were not correlated into fewer developer issues"
+SECRET_SCAN_JOB_RESULT=success DEPENDENCY_SCAN_JOB_RESULT=success SAST_JOB_RESULT=success GITHUB_OUTPUT="$RPT/controls.out" \
+  node "$TOOLKIT/security/scripts/source-control-results.mjs" --gate reports/security-gate.json >/dev/null
+grep -qx 'dependency_scan_result=success' "$RPT/controls.out" || fail "a scanner that found vulnerabilities was not reported as a successful scan"
+node "$CONF" --artifact-type library --registry none --deploy-target none --phase pr \
+  --break-glass false \
+  --observed '{"secret-scan":{"status":"success"},"dependency-scan":{"status":"success"},"sast":{"status":"success"},"source-gate":{"status":"failure","verdict":"BLOCK","integrity_trusted":"true"}}' \
+  --output reports/conformance-block.json >/dev/null 2>&1 || true
+node -e '
+  const r = require(process.argv[1]); const s = r.summary;
+  if (s.applied !== 3 || s.failed !== 1) throw new Error(JSON.stringify(s));
+  const gate = r.controls.find((c) => c.id === "source-gate");
+  if (!/returned a blocking result/.test(gate.reason)) throw new Error(gate.reason);
+  console.log(`     applied=${s.applied} failed=${s.failed}: ${gate.reason}`);
+' "$RPT/conformance-block.json"
+cp "$FIXTURES"/clean/osv-scanner.json reports/osv-scanner.json
+rm -f requirements.txt reports/pip-audit.json
+pass "a finding is not a scanner failure: only the source gate control failed"
 echo
 
 echo "=============================================================="

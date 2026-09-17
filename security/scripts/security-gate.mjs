@@ -3,6 +3,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { correlationRecord } from './correlate-findings.mjs';
 import { detectEcosystems } from './detect-ecosystems.mjs';
 
 const VALID_ACTIONS = new Set(['BLOCK', 'BLOCK_DEPLOY', 'EXCEPTION', 'LOG']);
@@ -26,6 +27,32 @@ const DEFAULT_PATHS = {
 function assert(condition, message) {
   if (!condition) {
     throw new Error(message);
+  }
+}
+
+// Which source-security control an input belongs to. A report-integrity failure
+// is attributed to the control whose evidence could not be interpreted, so a
+// caller can tell "the dependency scanner's report was unusable" from "the gate's
+// own inputs (policy, baseline) were unusable" — the scanner that produced a
+// valid report is not blamed for a gate-side failure, and vice versa.
+//
+//   secret-scan      Gitleaks / TruffleHog reports
+//   dependency-scan  npm audit / pip-audit / OSV-Scanner reports
+//   sast             the Semgrep report
+//   source-gate      everything the gate itself owns: policy, the Semgrep
+//                    baseline, ecosystem detection, and anything unattributed
+export const INTEGRITY_CONTROLS = ['secret-scan', 'dependency-scan', 'sast', 'source-gate'];
+
+// Runs `work` and stamps any error it throws with the control it belongs to.
+// An error already stamped by a narrower scope keeps its attribution.
+async function attributed(control, work) {
+  try {
+    return await work();
+  } catch (error) {
+    if (error && typeof error === 'object' && error.control === undefined) {
+      error.control = control;
+    }
+    throw error;
   }
 }
 
@@ -706,17 +733,25 @@ function evaluateSemgrep(policy, report, baseline, findings, bootstrap = false) 
   assert(Array.isArray(report.errors), 'Semgrep report is missing errors array');
   assert(Array.isArray(report.paths?.scanned), 'Semgrep report is missing paths.scanned array');
   assert(report.errors.length === 0, `Semgrep report contains ${report.errors.length} errors`);
-  assert(baseline?.schemaVersion === 1, 'Semgrep baseline has unsupported schemaVersion');
-  assert(Array.isArray(baseline.findings), 'Semgrep baseline is missing findings array');
 
-  const knownFingerprints = new Set(
-    baseline.findings.map((finding) => {
-      assert(typeof finding.fingerprint === 'string', 'baseline finding is missing fingerprint');
-      assert(typeof finding.checkId === 'string', 'baseline finding is missing checkId');
-      assert(typeof finding.path === 'string', 'baseline finding is missing path');
-      return finding.fingerprint;
-    })
-  );
+  // The baseline is the gate's accepted state, not scanner output: a broken
+  // baseline is a source-gate integrity failure, never blamed on Semgrep.
+  let knownFingerprints;
+  try {
+    assert(baseline?.schemaVersion === 1, 'Semgrep baseline has unsupported schemaVersion');
+    assert(Array.isArray(baseline.findings), 'Semgrep baseline is missing findings array');
+    knownFingerprints = new Set(
+      baseline.findings.map((finding) => {
+        assert(typeof finding.fingerprint === 'string', 'baseline finding is missing fingerprint');
+        assert(typeof finding.checkId === 'string', 'baseline finding is missing checkId');
+        assert(typeof finding.path === 'string', 'baseline finding is missing path');
+        return finding.fingerprint;
+      })
+    );
+  } catch (error) {
+    error.control = 'source-gate';
+    throw error;
+  }
 
   for (const finding of report.results) {
     const fingerprint = semgrepFingerprint(finding);
@@ -792,7 +827,10 @@ export function summarizeIntegrity(findings) {
     trusted: failures.length === 0,
     failures: failures.map((finding) => ({
       source: finding.source,
-      reason: finding.reason
+      reason: finding.reason,
+      // Optional (additive): the control whose input failed. Absent on gates
+      // that do not attribute, and on results written before it existed.
+      ...(typeof finding.control === 'string' ? { control: finding.control } : {})
     }))
   };
 }
@@ -868,39 +906,46 @@ export async function runSecurityGate(options = {}) {
   let result;
 
   try {
-    const policy = parseSimplePolicy(await readFile(paths.policy, 'utf8'));
-    validatePolicy(policy);
+    const policy = await attributed('source-gate', async () => {
+      const parsed = parseSimplePolicy(await readFile(paths.policy, 'utf8'));
+      validatePolicy(parsed);
+      return parsed;
+    });
     // A language-native dependency report is REQUIRED (fail-closed on a missing
     // file) only when the scanner that produces it would actually run — i.e. its
     // audit-target file exists (package-lock.json for npm audit, requirements.txt
     // for pip-audit). Otherwise its absence is a clean skip. OSV-Scanner is always
     // required and covers every ecosystem's lockfiles, so dependency coverage is
     // never fully absent even when a language-native report is skipped.
-    const ecosystems = await detectEcosystems(paths.repoDir);
+    const ecosystems = await attributed('source-gate', () => detectEcosystems(paths.repoDir));
     const [gitleaks, trufflehog, osv, semgrep, baseline, npmAudit, pipAudit] = await Promise.all([
-      readJson(paths.gitleaks, 'Gitleaks'),
-      readJson(paths.trufflehog, 'TruffleHog'),
-      readJson(paths.osv, 'OSV-Scanner'),
-      readJson(paths.semgrep, 'Semgrep'),
-      readBaseline(paths.baseline, bootstrap),
-      ecosystems.packageLock
-        ? readJson(paths.npmAudit, 'npm audit')
-        : readOptionalJson(paths.npmAudit, 'npm audit'),
-      ecosystems.requirementsTxt
-        ? readJson(paths.pipAudit, 'pip-audit')
-        : readOptionalJson(paths.pipAudit, 'pip-audit')
+      attributed('secret-scan', () => readJson(paths.gitleaks, 'Gitleaks')),
+      attributed('secret-scan', () => readJson(paths.trufflehog, 'TruffleHog')),
+      attributed('dependency-scan', () => readJson(paths.osv, 'OSV-Scanner')),
+      attributed('sast', () => readJson(paths.semgrep, 'Semgrep')),
+      attributed('source-gate', () => readBaseline(paths.baseline, bootstrap)),
+      attributed('dependency-scan', () =>
+        ecosystems.packageLock
+          ? readJson(paths.npmAudit, 'npm audit')
+          : readOptionalJson(paths.npmAudit, 'npm audit')
+      ),
+      attributed('dependency-scan', () =>
+        ecosystems.requirementsTxt
+          ? readJson(paths.pipAudit, 'pip-audit')
+          : readOptionalJson(paths.pipAudit, 'pip-audit')
+      )
     ]);
     const findings = [];
 
-    evaluateSecrets(policy, gitleaks, trufflehog, findings);
+    await attributed('secret-scan', () => evaluateSecrets(policy, gitleaks, trufflehog, findings));
     if (npmAudit !== null) {
-      evaluateNpmAudit(policy, npmAudit, findings);
+      await attributed('dependency-scan', () => evaluateNpmAudit(policy, npmAudit, findings));
     }
     if (pipAudit !== null) {
-      evaluatePipAudit(policy, pipAudit, findings);
+      await attributed('dependency-scan', () => evaluatePipAudit(policy, pipAudit, findings));
     }
-    evaluateOsv(policy, osv, findings);
-    evaluateSemgrep(policy, semgrep, baseline, findings, bootstrap);
+    await attributed('dependency-scan', () => evaluateOsv(policy, osv, findings));
+    await attributed('sast', () => evaluateSemgrep(policy, semgrep, baseline, findings, bootstrap));
     markBreakGlassEligibility(policy, findings);
 
     const summary = summarize(findings);
@@ -916,6 +961,9 @@ export async function runSecurityGate(options = {}) {
       integrity: summarizeIntegrity(findings),
       bootstrap: bootstrapState(bootstrap),
       findings,
+      // Developer-facing grouping of `findings` (additive). `summary` above stays
+      // the raw per-record count; `correlation.summary` counts unique issues.
+      correlation: correlationRecord(findings),
       breakGlass: breakGlassSummary(verdict, findings)
     };
   } catch (error) {
@@ -925,6 +973,10 @@ export async function runSecurityGate(options = {}) {
       action: 'BLOCK',
       policyRule: 'gate.report_integrity',
       reason: error.message,
+      // The gate stops at the first uninterpretable input, so exactly one
+      // control is known to have failed; the others were not re-validated here
+      // (their own scanner jobs validated them before upload).
+      control: INTEGRITY_CONTROLS.includes(error?.control) ? error.control : 'source-gate',
       breakGlassEligible: false
     };
     result = {
@@ -933,6 +985,7 @@ export async function runSecurityGate(options = {}) {
       integrity: summarizeIntegrity([finding]),
       bootstrap: bootstrapState(bootstrap),
       findings: [finding],
+      correlation: correlationRecord([finding]),
       breakGlass: breakGlassSummary('BLOCK', [finding])
     };
   }

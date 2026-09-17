@@ -65,6 +65,11 @@ async function readReport(scanner, reportPath) {
   }
 }
 
+// The parsed report, with the same fail-closed read errors as validation.
+export async function readDependencyReport(scanner, reportPath) {
+  return readReport(scanner, reportPath);
+}
+
 // Returns a short human-readable summary. Throws on anything that means the
 // report cannot be trusted; the caller's non-zero exit is the fail-closed signal.
 export async function validateDependencyReport(scanner, reportPath) {

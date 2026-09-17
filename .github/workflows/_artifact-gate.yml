@@ -212,7 +212,18 @@ jobs:
           VERDICT: ${{ steps.verdict.outputs.verdict }}
         run: |
           if [ "$GATE_MODE" = "log-only" ]; then
-            echo "::warning::gate_mode=log-only — artifact gate verdict $VERDICT is reported but NOT enforced."
+            # Verdict-specific: a DEPLOY has nothing to suppress; a BLOCK_DEPLOY does.
+            case "$VERDICT" in
+              BLOCK_DEPLOY)
+                echo "::warning::Artifact gate verdict: BLOCK_DEPLOY, but gate_mode=log-only so the BLOCK_DEPLOY is reported and NOT enforced."
+                ;;
+              DEPLOY|DEPLOY-WITH-EXCEPTIONS)
+                echo "::warning::Artifact gate verdict: $VERDICT. gate_mode=log-only; no blocking verdict exists, so nothing was suppressed. log-only is a rollout mode: a future BLOCK_DEPLOY would be reported without failing this job."
+                ;;
+              *)
+                echo "::warning::Artifact gate verdict is unavailable ('${VERDICT}'), and gate_mode=log-only so nothing is enforced. Treat this run as UNKNOWN, not clean."
+                ;;
+            esac
             exit 0
           fi
           if [ "$VERDICT" = "BLOCK_DEPLOY" ]; then

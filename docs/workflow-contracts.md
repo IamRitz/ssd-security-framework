@@ -65,9 +65,90 @@ one. **Callers must never use `secrets: inherit`.**
 | `break_glass_eligible` | `true` when the BLOCK consists only of eligible findings |
 | `gate_mode` | the mode this run actually evaluated under, echoed back |
 | `integrity_trusted` | `false` when a scanner could not interpret its input — findings are UNKNOWN, not clean |
+| `secret_scan_result` | Secret scanning control — `success` \| `failure` \| `cancelled` \| `skipped` \| `untrusted` (since v1.1.x) |
+| `dependency_scan_result` | Dependency scanning control — same vocabulary (since v1.1.x) |
+| `sast_result` | SAST control — same vocabulary (since v1.1.x) |
+| `source_gate_result` | Source security gate control — the `source-gate` job's own status: `success` \| `failure` \| `cancelled` (since v1.1.x) |
 
 `gate_mode` is echoed back deliberately: a caller that reports the mode it
 *believes* it passed can display "enforce" while the gate ran in log-only.
+
+### Per-control results: scanning is not the same as passing policy
+
+A caller's `needs.source-security.result` is the **aggregate** of four jobs. When
+the gate BLOCKs, it is `failure` — even though every scanner ran and produced a
+usable report. Feeding that one value to all four conformance controls reports
+three working scanners as failed. The per-control outputs exist so that never
+happens: **use them for conformance, and keep the aggregate for the required
+`security-gate` check**, which really is "did this PR pass".
+
+Two different questions, answered separately:
+
+| Control kind | Question | `success` means | Not a failure |
+| --- | --- | --- | --- |
+| scanning (`secret_scan_result`, `dependency_scan_result`, `sast_result`) | did the scanner **execute and produce trustworthy evidence**? | the scanner job succeeded — it validates its own report before upload — and the gate did not reject that report | **findings**. A scanner that finds vulnerabilities has done its job. |
+| gate (`source_gate_result`) | did that evidence **satisfy security policy**? | the gate job finished without an enforced BLOCK | — |
+
+Scanning result values:
+
+| Value | Meaning |
+| --- | --- |
+| `success` | trustworthy report produced — **not** "no vulnerabilities found" |
+| `failure` | the scanner job failed (crash, unexpected exit status, missing/empty/malformed report): findings are UNKNOWN |
+| `cancelled` / `skipped` | the scanner job did not complete / did not run |
+| `untrusted` | the scanner job succeeded, but the gate attributed a report-integrity failure **to this control's report** (`integrity.failures[].control`): findings are UNKNOWN |
+
+How each value is derived, and how it fails closed:
+
+- Each scanning result comes from **that scanner job's own result** (`needs.<job>.result`
+  inside `source-gate`), never from the aggregate, and is downgraded to `untrusted`
+  only by an integrity failure the gate attributed to that control. A BLOCK verdict
+  downgrades nothing.
+- An integrity failure in the gate's **own** inputs — the policy, the Semgrep
+  baseline — is attributed to `source-gate` and blames no scanner. The gate stops at
+  the first uninterpretable input, so only that one is attributed; the other reports
+  were validated by their own scanner jobs before upload.
+- If the per-control step cannot run its script, it publishes `failure` for every
+  scanning control. `source_gate_result` is published by the job's **last** step from
+  `job.status`, which already reflects the enforcement step. If the `source-gate` job
+  is skipped, or cancelled before those steps, the outputs are **empty**: a consumer
+  must treat empty as missing evidence (conformance reports it `failed`), never as
+  success.
+- `source_gate_result` is `success` for a BLOCK in `log-only` (reported, not
+  enforced) and for a BLOCK overridden by a verified break-glass approval. Pass
+  `verdict`, `gate_mode` and `integrity_trusted` alongside it (see `_conformance.yml`)
+  so the report says which.
+
+### Scanner exit status is data
+
+pip-audit and OSV-Scanner exit **1 when they find vulnerabilities**. Those steps
+used to run under `continue-on-error`, which painted GitHub's red "Process
+completed with exit code 1" on a working scan *and* hid a genuine crash the same
+way. They now capture the exit status and judge it together with the report
+(`check-scanner-exit.mjs`):
+
+| Exit | Report | Step |
+| --- | --- | --- |
+| 0 | valid, no findings | passes — clean |
+| 1 | valid, **≥ 1** finding | passes — findings found (a `::notice::`, not an error) |
+| 0 | valid, findings present | passes — every finding is still in the report and evaluated by the gate |
+| 1 | valid, **no** findings | **fails** — the scanner signalled something the report does not show |
+| any other (OSV 127/128, docker 125, …) | any | **fails** — scanner or container failure |
+| any | missing, empty, or malformed | **fails** — findings UNKNOWN, not clean |
+
+**Known limitation — pip-audit.** pip-audit (verified in the pinned 2.10.1) exits 1
+both for "vulnerabilities found" and for fatal errors, so its exit code alone cannot
+distinguish them. The report does: a fatal error exits before any report is written,
+so it fails as an empty/unparseable report. A crash occurring *after* a complete,
+well-formed report was written would be indistinguishable; no such path exists in
+the pinned version. OSV-Scanner reserves distinct codes, so its failures are also
+caught by status. npm audit keeps its existing handling: its error output is
+recognised in the report (`error`), and it never used exit status as a signal here.
+
+The Secret scanning job likewise validates both reports before upload, so all three
+scanning jobs' `success` means the same thing. Both are deliberate tightenings in the
+fail-closed direction: a malformed secret report, or an exit-1-with-no-findings, used
+to surface only as a gate integrity BLOCK and now also fails the scanner job itself.
 
 ## `_image-scan-prepush.yml`
 
@@ -185,7 +266,7 @@ Which controls apply to this repository, and what happened to each.
 | `deploy_target` | string | `none` — `framework-gated` \| `self-managed` \| `none` |
 | `phase` | string | `pr` — `pr` \| `delivery`. Which part of the lifecycle THIS run is. |
 | `break_glass_enabled` | boolean | `false` |
-| `observed` | string (JSON) | **required** — control id → `{status, evidence}` |
+| `observed` | string (JSON) | **required** — control id → `{status, evidence}`, optionally with gate evidence `verdict`, `gate_mode`, `integrity_trusted` |
 | `exemptions_path` | string | `security/exemptions.json` |
 
 | Output | Meaning |
@@ -238,12 +319,60 @@ the exemptions is **failed**: absence of evidence is not evidence the control ra
 Supplying evidence for a control this phase does not run produces a **warning**
 and is not honoured.
 
+### What a result means depends on the kind of control
+
+Each control has a `kind` (recorded in the report), and the reason printed for a
+failure is derived from it and from whatever evidence the caller supplied — never
+just "observed result 'failure'":
+
+| Kind | Controls | A failure means |
+| --- | --- | --- |
+| `scan` | `secret-scan`, `dependency-scan`, `sast` | no trustworthy report exists (`failure`, `cancelled`, `skipped`, `untrusted`). **Findings never fail a scanning control.** |
+| `gate` | `source-gate`, `image-scan-prepush`, `artifact-gate` | the evidence did not satisfy policy, or the gate itself failed |
+| `delivery` | `registry-scan-collect`, `gated-deploy` | the delivery step did not complete |
+| `approval` | `break-glass` | the approval channel is not in place |
+
+Optional gate evidence in an `observed` entry, used only to explain:
+
+| Field | Effect |
+| --- | --- |
+| `verdict` | `failure` + `BLOCK`/`BLOCK_DEPLOY` → "*the source security policy gate returned a blocking result (verdict BLOCK)*". `failure` with a non-blocking verdict → the gate job errored. `success` + `BLOCK` → applied, noting the BLOCK was not enforced (log-only) or was overridden. |
+| `gate_mode` | distinguishes "not enforced (log-only)" from a break-glass override |
+| `integrity_trusted` | `false` + BLOCK → "*failed closed: a scan report could not be trusted*" rather than a policy BLOCK |
+
+An empty or unrecognized `status` is `failed` with that stated as the reason.
+Applied controls carry a `detail` (e.g. *policy verdict PASS*), and the summary
+reads: *requires N controls. In this run: A applied (executed successfully), F
+failed, D deferred to another phase, E exempt.* The report's `schemaVersion` stays
+2: `kind`, `detail`, `observedStatus` and `verdict` on a control are optional
+additions.
+
+For the live source-only run where all three scanners succeeded and the gate
+BLOCKed, the per-control wiring reports:
+
+| Control | Status | Why |
+| --- | --- | --- |
+| Secret scanning | ✅ applied | scanner executed and produced trustworthy evidence |
+| Dependency scanning | ✅ applied | scanner executed and produced trustworthy evidence |
+| SAST | ✅ applied | scanner executed and produced trustworthy evidence |
+| Source security gate | ❌ failed | the source security policy gate returned a blocking result (verdict BLOCK) |
+
 ## `gate_mode`
 
 | Mode | Blocking verdict | Slack | Use |
 | --- | --- | --- | --- |
 | `enforce` (default) | fails the job | on BLOCK, unless an interactive break-glass request for it was delivered | Steady state |
 | `log-only` | reported, job passes | never | Onboarding |
+
+Log-only messages depend on the verdict, on every surface (gate job annotations,
+the shipped `security-gate` aggregate, the conformance job, the PR comment):
+
+| Situation | Message (gist) |
+| --- | --- |
+| PASS / DEPLOY + `log-only` | *verdict PASS. gate_mode=log-only; no blocking verdict exists, so nothing was suppressed* — plus a reminder that log-only is a rollout mode. Never "not enforced", never "GREEN BY CONFIGURATION". |
+| BLOCK / BLOCK_DEPLOY + `log-only` | *verdict BLOCK, but gate_mode=log-only so the BLOCK is reported and NOT enforced*; the aggregate keeps **GREEN BY CONFIGURATION, not by verdict** |
+| verdict unavailable + `log-only` | nothing is enforced; treat the run as UNKNOWN, not clean |
+| BLOCK + `enforce` | the job fails (unchanged) |
 
 `log-only` suppresses **every** failure, including a fail-closed
 report-integrity BLOCK. That is the point of the onboarding phase, and it is why
@@ -329,13 +458,76 @@ is no finding to reproduce.
 | permission | HTTP 403 on a same-repo PR, or no token: the caller did not grant `pull-requests: write` | failure (the step is `continue-on-error`) |
 | API failure | anything else | failure |
 
+### Correlated issues: raw findings versus what a developer fixes
+
+Scanners overlap. In the live run that motivated this, one `requests`
+vulnerability arrived as pip-audit `PYSEC-2026-2275` (BLOCK — pip-audit reports no
+severity, so the framework classifies it high, fail-closed) **and** as OSV-Scanner
+`PYSEC-2026-2275` and `GHSA-gc5v-m9x4-r6x2` (both LOG, CVSS-derived medium), all
+aliasing `CVE-2026-25645`. It rendered as "1 blocking, 2 logged" for one thing to
+upgrade.
+
+There are now two layers, kept apart on purpose:
+
+| Layer | Where | What it is |
+| --- | --- | --- |
+| **raw findings** | `security-gate.json` → `findings`, `summary` | one entry per scanner record. The policy input and output. **Unchanged**: every record keeps its source, severity derivation, policy rule, action and break-glass eligibility. The verdict is computed from these alone. |
+| **issues** | `security-gate.json` → `correlation` (additive, `schemaVersion: 1`) | a grouping for people. Each issue lists the indexes of the raw findings it covers. |
+
+Records correlate **only** when identity is evidenced: same package-scoped source
+(pip-audit — always PyPI — or OSV-Scanner with a recorded ecosystem), same
+ecosystem, same package (PyPI names compared per PEP 503, all others exactly), and
+advisory identifiers connected through each record's own `id` and `aliases`. The
+alias graph is an equivalence relation, so a chain A→B→C is one issue. Two
+unrelated advisories on one package stay separate; the same advisory on a
+different package or ecosystem stays separate. npm audit (one entry per package,
+no advisory id), secrets, SAST, image findings and integrity failures are never
+merged.
+
+An issue's `action` is the **strongest** action among its records
+(BLOCK_DEPLOY/BLOCK > EXCEPTION > LOG); `actions` lists every underlying action.
+The least severe interpretation is never chosen, and nothing is averaged.
+
+```jsonc
+"correlation": {
+  "schemaVersion": 1,
+  "summary": { "issues": 2, "rawFindings": 5, "block": 1, "exception": 0, "log": 1, "integrity": 0 },
+  "issues": [{
+    "key": "PyPI:requests:0", "correlated": true, "action": "BLOCK", "actions": ["BLOCK", "LOG"],
+    "findings": [0, 1, 2], "sources": ["pip-audit", "osv-scanner"],
+    "package": "requests", "ecosystem": "PyPI", "installedVersions": ["2.32.5"],
+    "primaryId": "CVE-2026-25645",
+    "advisoryIds": ["CVE-2026-25645", "GHSA-gc5v-m9x4-r6x2", "PYSEC-2026-2275"],
+    "highestSeverity": "high", "breakGlassEligible": true
+  }]
+}
+```
+
+**Counts.** Two numbers, both defined, neither silently replacing the other:
+
+- `summary.block` / `.exception` / `.log` — **raw finding counts**, one per scanner
+  record. Unchanged in meaning; the documented contract.
+- `correlation.summary.block` / `.exception` / `.log` / `.integrity` — **unique
+  issue counts** by each issue's strongest action; `issues` is their total and
+  `rawFindings` the number of records they were built from.
+
+The PR comment, job summary and Slack headline **unique issues**, and state the raw
+count beside them whenever correlation merged anything (*1 blocking · 0 exception ·
+1 logged — 2 unique issues from 5 scanner findings*). A correlated issue renders as
+one card listing every record — scanner, id, action, and that record's own severity
+derivation — plus all advisory ids and fixed versions with the scanners that list
+them. A single-record issue renders exactly as before.
+
 ### Gate result fields added for guidance (additive, optional)
 
 `security-gate.json` findings may carry: `registryUrl` and `scannerSeverity`
 (Semgrep); `ruleDescription` (Gitleaks); `location` and `verificationErrored`
 (TruffleHog); `fixPackage`, `fixIsSemVerMajor`, `viaPackages` (npm audit);
 `severitySource`, `installedVersion`, `fixVersions`, `aliases`, `ecosystem`
-(pip-audit / OSV-Scanner). Image gate findings may carry `scannerSeverity`,
+(pip-audit / OSV-Scanner); `correlation` (see above); and, on a report-integrity
+failure, `control` on the finding and on `integrity.failures[]` naming the control
+whose input could not be interpreted (`secret-scan`, `dependency-scan`, `sast`,
+`source-gate`). Image gate findings may carry `scannerSeverity`,
 `installedVersion`, `target`, `fixAvailability`, `packages`. None is read by any
 decision, fingerprint, or baseline; existing fields keep their meaning.
 

@@ -18,6 +18,8 @@
 // observed (whether a break-glass request was sent, which Semgrep config held a
 // rule), nothing is claimed.
 
+import { correlateFindings, summarizeIssues } from './correlate-findings.mjs';
+
 export const PR_COMMENT_MARKER = '<!-- security-gate-findings -->';
 
 const SEVERITY_RANK = { critical: 0, high: 1, medium: 2, low: 3, none: 4, unknown: 5 };
@@ -563,6 +565,168 @@ function classify(finding, context, gate) {
   }
 }
 
+// ---- correlated issues --------------------------------------------------------
+//
+// Cards above are one per RAW finding. A developer, though, fixes vulnerabilities,
+// not scanner records: pip-audit's PYSEC-2026-2275 and OSV-Scanner's
+// PYSEC-2026-2275 and GHSA-gc5v-m9x4-r6x2 for the same `requests` are one thing to
+// upgrade. correlate-findings.mjs groups records whose identity is proven by
+// package scope + advisory ids/aliases; here a group of more than one record is
+// rendered as ONE card that keeps every record's own evidence visible: which
+// scanner, which id, which action, and how its severity was derived. Nothing is
+// averaged, and the least severe interpretation is never chosen — the issue takes
+// the strongest action any record received.
+
+const SCANNER_LABELS = { 'pip-audit': 'pip-audit', 'osv-scanner': 'OSV-Scanner' };
+
+function scannerLabel(source) {
+  return SCANNER_LABELS[source] || source;
+}
+
+// How THIS record's severity came to be, attributed to whoever decided it.
+function severityDerivation(finding) {
+  if (finding.policyRule === 'dependencies.malicious_package') {
+    return 'malicious-package advisory; severity does not apply (always blocks)';
+  }
+  const severity = (finding.severity || 'unknown').toLowerCase();
+  if (finding.source === 'pip-audit') {
+    return `severity unavailable from pip-audit; framework classifies ${severity} (fail-closed)`;
+  }
+  if (typeof finding.cvssScore === 'number') {
+    return `CVSS v3 base score ${finding.cvssScore} from the OSV record; framework classifies ${severity} by policy thresholds`;
+  }
+  if (finding.severitySource === 'framework-default') {
+    return `no CVSS v3 score in the record; framework classifies ${severity} (fail-closed)`;
+  }
+  return `classified ${severity}`;
+}
+
+function recordFixVersions(finding) {
+  if (Array.isArray(finding.fixVersions)) {
+    return finding.fixVersions.filter((version) => typeof version === 'string' && version !== '');
+  }
+  return typeof finding.fixedVersion === 'string' && finding.fixedVersion !== '' ? [finding.fixedVersion] : [];
+}
+
+function correlatedCard(issue, members, memberCards, context, gate) {
+  const pkg = issue.package;
+  const versions = issue.installedVersions ?? [];
+  const versionText = versions.length === 0 ? '' : ` ${versions.join(' / ')}`;
+  const malicious = members.some((finding) => finding.policyRule === 'dependencies.malicious_package');
+  const isException = issue.action === 'EXCEPTION';
+
+  // One line per distinct record. Identical records (OSV-Scanner lists the same
+  // package once per lockfile it was found in) are shown once, counted.
+  const lines = new Map();
+  for (const finding of members) {
+    const fixes = recordFixVersions(finding);
+    const key = [finding.source, finding.id, finding.installedVersion, finding.action, finding.policyRule, finding.cvssScore].join('\0');
+    const existing = lines.get(key);
+    if (existing) {
+      existing.times += 1;
+      continue;
+    }
+    lines.set(key, {
+      times: 1,
+      text:
+        `${scannerLabel(finding.source)} / \`${finding.id}\`` +
+        `${finding.installedVersion && versions.length > 1 ? ` (installed ${finding.installedVersion})` : ''}` +
+        ` → **${finding.action}** (\`${finding.policyRule}\`) — ${severityDerivation(finding)}` +
+        `; ${fixes.length > 0 ? `fixed in ${fixes.join(', ')}` : 'no fixed version listed'}`
+    });
+  }
+  const observedBy = [...lines.values()].map(({ text, times }) => (times > 1 ? `${text} (reported ${times}×)` : text));
+
+  // Fixed versions with the scanners that list each, so provenance survives.
+  const fixProvenance = new Map();
+  for (const finding of members) {
+    for (const version of recordFixVersions(finding)) {
+      if (!fixProvenance.has(version)) fixProvenance.set(version, new Set());
+      fixProvenance.get(version).add(scannerLabel(finding.source));
+    }
+  }
+  const fixSummary = [...fixProvenance.entries()]
+    .map(([version, sources]) => `${version} (${[...sources].join(', ')})`)
+    .join('; ');
+
+  const derivations = [...new Set(members.map((finding) => (finding.severity || 'unknown').toLowerCase()))];
+  const strongest = members.filter((finding) => finding.action === issue.action);
+  const strongestText = [...new Set(strongest.map((finding) => `${scannerLabel(finding.source)} / \`${finding.id}\``))].join(', ');
+  const severityNote =
+    derivations.length > 1
+      ? `Severity: the records disagree (${derivations.join(' vs ')}), and each derivation is listed below as recorded. ` +
+        `This issue takes the strongest policy action any record received — **${issue.action}**, from ${strongestText} — ` +
+        'and discards no record\'s interpretation.'
+      : `Severity: every record is classified ${derivations[0]}; see each record's derivation below. Policy action: **${issue.action}**.`;
+
+  const summary = members.map((finding) => finding.summary).find((value) => typeof value === 'string' && value !== '');
+  const whatItMeans =
+    `${summary ? `${sentence(summary)} ` : ''}` +
+    `${members.length} scanner records describe the same vulnerability in \`${pkg}\`: their advisory IDs and aliases ` +
+    'connect them, so they are shown as one issue. Every record is kept below and in the gate result.';
+
+  let howToFix;
+  if (malicious) {
+    howToFix =
+      'Remove the package, and treat any machine or CI environment that installed it as potentially compromised. ' +
+      'Policy never allows break-glass for a malicious package.';
+  } else if (isException) {
+    howToFix = EXCEPTION_FIX;
+  } else if (fixProvenance.size === 1) {
+    const [version] = fixProvenance.keys();
+    const example = upgradeExample(issue.ecosystem, pkg, version);
+    howToFix = `The records list fixed version ${version}. Upgrade \`${pkg}\` to it${example ? ` — e.g. ${example}` : ''}.`;
+  } else if (fixProvenance.size > 1) {
+    howToFix =
+      `The records list fixed versions ${[...fixProvenance.keys()].join(', ')}. Upgrade \`${pkg}\` to a fixed version on a ` +
+      'release line that includes the fix.';
+  } else {
+    howToFix = `No scanner record lists a fixed version for \`${pkg}\`.`;
+  }
+
+  const reproduceAll = [...new Set(memberCards.map((card) => card.reproduce).filter(Boolean))];
+  const highest = issue.highestSeverity || 'unknown';
+
+  return {
+    id: issue.primaryId,
+    source: issue.sources.join('+'),
+    severity: malicious ? 'critical' : highest,
+    action: issue.action,
+    policyRule: strongest[0]?.policyRule,
+    package: pkg,
+    isException,
+    isIntegrity: false,
+    location: null,
+    deepLink: null,
+    target: null,
+    reproduce: reproduceAll[0] || null,
+    reproduceAll,
+    fixAvailable: fixProvenance.size > 0 ? true : members.some((finding) => finding.fixAvailable === true),
+    fixedVersion: fixProvenance.size === 1 ? [...fixProvenance.keys()][0] : null,
+    referenceUrl: `https://osv.dev/vulnerability/${encodeURIComponent(issue.primaryId)}`,
+    kind: malicious ? 'malicious-package' : 'dependency',
+    correlated: true,
+    advisoryIds: issue.advisoryIds,
+    observedBy,
+    fixSummary: fixSummary || null,
+    title: `${malicious ? 'Known-malicious package ' : ''}\`${pkg}\`${versionText} — ${issue.primaryId}`,
+    whatItMeans,
+    severityNote,
+    evidenceNote: null,
+    howToFix
+  };
+}
+
+// Issues over the raw cards. `cards[i]` is the card for `findings[i]`.
+export function buildIssues(findings, cards, context = {}, gate = null) {
+  return correlateFindings(findings).map((issue) => {
+    const members = issue.findings.map((index) => findings[index]);
+    const memberCards = issue.findings.map((index) => cards[index]);
+    const card = memberCards.length === 1 ? memberCards[0] : correlatedCard(issue, members, memberCards, context, gate);
+    return { ...issue, card, cards: memberCards };
+  });
+}
+
 // ---- break-glass state -------------------------------------------------------
 //
 // Facts kept distinct. Each later one requires evidence of its own and is NEVER
@@ -727,6 +891,7 @@ export function buildReport({ gate, context = {}, mode = 'enforce', breakGlass }
   const meta = VERDICTS[verdict] || VERDICTS.BLOCK;
   const findings = Array.isArray(gate?.findings) ? gate.findings : [];
   const cards = findings.map((finding) => classify(finding, context, gate));
+  const issues = buildIssues(findings, cards, context, gate);
   const isBreakGlassEligible = gate?.breakGlass?.eligible === true;
   const breakGlassState =
     breakGlass ?? deriveBreakGlassState({ verdict, eligible: isBreakGlassEligible, mode });
@@ -738,6 +903,10 @@ export function buildReport({ gate, context = {}, mode = 'enforce', breakGlass }
     log: cards.filter((c) => c.action === 'LOG').length,
     integrity: cards.filter((c) => c.isIntegrity).length
   };
+
+  // What every surface headlines: UNIQUE issues. `counts` stays the raw
+  // per-record count (and is what "is this run clean?" is decided from).
+  const issueCounts = summarizeIssues(issues, cards.length);
 
   let blurb = meta.blurb;
   if (isBlockingVerdict(verdict) && mode === 'log-only') {
@@ -755,6 +924,8 @@ export function buildReport({ gate, context = {}, mode = 'enforce', breakGlass }
     mode,
     cards,
     counts,
+    issues,
+    issueCounts,
     isBreakGlassEligible,
     breakGlass: breakGlassState,
     breakGlassNotice: breakGlassNotice(breakGlassState),
@@ -806,7 +977,18 @@ function renderCardMarkdown(card) {
   if (card.evidenceNote) {
     facts.push(`🔎 ${card.evidenceNote}`);
   }
-  if (card.reproduce) {
+  if (Array.isArray(card.advisoryIds) && card.advisoryIds.length > 0) {
+    facts.push(`🏷️ Advisory IDs: ${list(card.advisoryIds)}`);
+  }
+  if (Array.isArray(card.observedBy) && card.observedBy.length > 0) {
+    facts.push(`🔎 Observed by:${card.observedBy.map((line) => `\n  - ${line}`).join('')}`);
+  }
+  if (card.fixSummary) {
+    facts.push(`🧩 Fixed version(s): ${card.fixSummary}`);
+  }
+  if (Array.isArray(card.reproduceAll) && card.reproduceAll.length > 1) {
+    facts.push(`🔁 Reproduce locally: ${card.reproduceAll.map((command) => `\`${command}\``).join(' · ')}`);
+  } else if (card.reproduce) {
     facts.push(`🔁 Reproduce locally: \`${card.reproduce}\``);
   }
   if (card.howToFix) {
@@ -848,23 +1030,38 @@ export function renderMarkdown(report, { includeMarker = false } = {}) {
     blocks.push(ctx);
   }
 
-  const summaryBits = [`**${counts.block}** blocking`, `**${counts.exception}** exception`, `**${counts.log}** logged`];
-  if (counts.integrity > 0) {
-    summaryBits.push(`**${counts.integrity}** integrity failure${counts.integrity === 1 ? '' : 's'}`);
+  // Headline counts are UNIQUE ISSUES; the raw record count is shown beside them
+  // whenever correlation merged anything, so neither number is hidden.
+  const shown = report.issueCounts ?? counts;
+  const summaryBits = [`**${shown.block}** blocking`, `**${shown.exception}** exception`, `**${shown.log}** logged`];
+  if (shown.integrity > 0) {
+    summaryBits.push(`**${shown.integrity}** integrity failure${shown.integrity === 1 ? '' : 's'}`);
   }
-  blocks.push(summaryBits.join(' · '));
+  let summaryLine = summaryBits.join(' · ');
+  if (report.issueCounts && report.issueCounts.issues !== report.issueCounts.rawFindings) {
+    summaryLine +=
+      ` — **${report.issueCounts.issues}** unique issue${report.issueCounts.issues === 1 ? '' : 's'} from ` +
+      `**${report.issueCounts.rawFindings}** scanner findings (records that share advisory IDs are shown once)`;
+  }
+  blocks.push(summaryLine);
 
   if (report.mode === 'log-only') {
-    blocks.push('> ℹ️ This repository runs in **log-only** mode: findings are reported but do not block, and no Slack alert is sent.');
+    blocks.push(
+      isBlockingVerdict(report.verdict)
+        ? '> ℹ️ This repository runs in **log-only** mode: the blocking verdict above is reported but NOT enforced, and no Slack alert is sent.'
+        : `> ℹ️ This repository runs in **log-only** mode. The verdict is ${report.verdictLabel}, so there is no blocking verdict to suppress. ` +
+            'log-only is a rollout mode: a future BLOCK would be reported without blocking the merge, and no Slack alert is sent.'
+    );
   }
   if (report.breakGlassNotice) {
     blocks.push(`> ${report.breakGlassNotice}`);
   }
 
-  const blocking = report.cards.filter((c) => (c.action === 'BLOCK' || c.action === 'BLOCK_DEPLOY') && !c.isIntegrity);
-  const integrity = report.cards.filter((c) => c.isIntegrity);
-  const exceptions = report.cards.filter((c) => c.action === 'EXCEPTION');
-  const logged = report.cards.filter((c) => c.action === 'LOG');
+  const displayed = Array.isArray(report.issues) ? report.issues.map((issue) => issue.card) : report.cards;
+  const blocking = displayed.filter((c) => (c.action === 'BLOCK' || c.action === 'BLOCK_DEPLOY') && !c.isIntegrity);
+  const integrity = displayed.filter((c) => c.isIntegrity);
+  const exceptions = displayed.filter((c) => c.action === 'EXCEPTION');
+  const logged = displayed.filter((c) => c.action === 'LOG');
 
   // Actionable groups (integrity, blocking, exceptions) stay visible even at
   // repo scale; only very large lists collapse. LOG noise collapses early.
@@ -905,7 +1102,7 @@ function slackCardLine(card) {
 }
 
 export function renderSlack(report, { detailUrl } = {}) {
-  const { counts } = report;
+  const counts = report.issueCounts ?? report.counts;
   const headline = `${report.emoji} Security gate: ${report.verdictLabel}`;
   const fields = [
     { type: 'mrkdwn', text: `*Blocking*\n${counts.block}` },
@@ -915,6 +1112,12 @@ export function renderSlack(report, { detailUrl } = {}) {
   ];
   if (counts.integrity > 0) {
     fields.splice(3, 0, { type: 'mrkdwn', text: `*Integrity failures*\n${counts.integrity}` });
+  }
+  if (report.issueCounts && report.issueCounts.issues !== report.issueCounts.rawFindings) {
+    fields.push({
+      type: 'mrkdwn',
+      text: `*Scanner findings*\n${report.issueCounts.rawFindings} (${report.issueCounts.issues} unique)`
+    });
   }
   const blocks = [
     { type: 'header', text: { type: 'plain_text', text: headline } },
@@ -928,7 +1131,8 @@ export function renderSlack(report, { detailUrl } = {}) {
 
   // Concise: show the most severe blocking/integrity findings only; full detail
   // lives in the PR comment / job summary, which is linked below.
-  const actionable = report.cards.filter((c) => c.action === 'BLOCK' || c.action === 'BLOCK_DEPLOY' || c.isIntegrity);
+  const displayed = Array.isArray(report.issues) ? report.issues.map((issue) => issue.card) : report.cards;
+  const actionable = displayed.filter((c) => c.action === 'BLOCK' || c.action === 'BLOCK_DEPLOY' || c.isIntegrity);
   const highlights = sortCards(actionable).slice(0, 5);
   if (highlights.length > 0) {
     const shown = highlights.map(slackCardLine).join('\n');
