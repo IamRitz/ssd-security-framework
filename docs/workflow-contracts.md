@@ -119,7 +119,12 @@ else.
     // fix-aware sources only, and REQUIRED there: a missing or non-boolean value
     // is a report-integrity BLOCK_DEPLOY, never a default to "no fix".
     "fixAvailable": true,
-    "package": "openssl", "fixedVersion": "3.3.2-r0"   // optional context
+    "package": "openssl", "fixedVersion": "3.3.2-r0",  // optional context
+    // Optional scanner evidence (since v1.1.x), used only for developer
+    // guidance and never for a decision: the scanner's own severity and fix
+    // value beside the framework's interpretation of them, and per-package fixes.
+    "scannerSeverity": "UNTRIAGED", "fixAvailability": "PARTIAL",
+    "packages": [{ "name": "openssl", "version": "3.3.1-r0", "fixedInVersion": "3.3.2-r0" }]
   }],
   "severityCounts": { "critical": 0, "high": 0, "medium": 0, "low": 0 }
 }
@@ -237,7 +242,7 @@ and is not honoured.
 
 | Mode | Blocking verdict | Slack | Use |
 | --- | --- | --- | --- |
-| `enforce` (default) | fails the job | on BLOCK | Steady state |
+| `enforce` (default) | fails the job | on BLOCK, unless an interactive break-glass request for it was delivered | Steady state |
 | `log-only` | reported, job passes | never | Onboarding |
 
 `log-only` suppresses **every** failure, including a fail-closed
@@ -264,6 +269,75 @@ green. Three things contain that, none of which is the mode itself:
    the reports artifact in **every** mode.
 3. **CODEOWNERS** on the callers, the baseline, and the exemptions file —
    advisory until branch protection requires Code Owner review.
+
+## Developer feedback: every statement is observed state
+
+One normalized report (`format-findings.mjs`) feeds all three surfaces — Slack,
+the PR comment, and `$GITHUB_STEP_SUMMARY` — so they cannot disagree. Every
+sentence in it must be backed by something the gate recorded or the workflow
+observed. Where a value is the framework's own interpretation, it says so: a
+pip-audit advisory is "classified high by the framework (fail-closed)", never
+"pip-audit reported high"; a Semgrep rule is linked to the Registry only when
+its own `metadata.source` says it came from there, never because its id is
+dotted (a local rule file's directory becomes a dotted id prefix too).
+
+### Break-glass: eligibility is not invocation
+
+Five facts are kept distinct, and no later one is inferred from an earlier one:
+
+| Fact | Evidence |
+| --- | --- |
+| **eligible** | the gate result's `breakGlass.eligible` (policy) |
+| **enabled** | the `break_glass_enabled` input |
+| *requestPathEntered* (internal) | the eligibility-check step succeeded — proves only that the approval path began |
+| **requested** | the **Request break-glass decision** step itself ran (a later transport or credential step can stop the path before it) |
+| **delivered** | the request step succeeded: the broker accepted a pending request |
+| **decision** | the poll step's outcome (the same signal the enforce step uses) plus `break-glass-decision.json`: `approved`, `denied`, `expired`/`timeout`, or `decision-unavailable` |
+
+The workflow hands the notifier `BREAK_GLASS_ENABLED` and each break-glass
+step's `outcome`. A step whose condition was false reports `skipped`, so a
+disabled, failed, or never-entered request is never described as sent. A
+notifier given no state at all claims nothing.
+
+| Situation | What developers read | Plain BLOCK Slack alert |
+| --- | --- | --- |
+| eligible, break-glass disabled | eligible by policy, **not enabled** for this repo; no request made | **sent** |
+| enabled, BLOCK not eligible | not eligible: includes a never-overridable finding | sent |
+| eligible, path stopped before the request step | no request was attempted; **no override is active** | sent |
+| eligible, request step ran and failed | request attempted but not confirmed delivered; **no override is active** | sent |
+| request delivered, then approved / denied / timed out | entered review, request sent; then the decision | suppressed — the interactive request already reached approvers |
+| `gate_mode: log-only` | eligible by policy, but log-only enforces nothing; no request made | suppressed (log-only) |
+
+Routing chooses surfaces only; it never changes the verdict.
+
+### Reproduce commands match what the run scanned with
+
+With no `reproduce_commands` override, the command is built from this run's own
+configuration: every configured Semgrep config and path, the Gitleaks config and
+TruffleHog exclude-paths file when present, the scanned image tarball for Trivy,
+and `aws ecr describe-image-scan-findings` for the exact digest for registry
+findings. When the configuration is not known, a finding gets **no** command
+rather than one that would not reproduce it. Integrity failures get none — there
+is no finding to reproduce.
+
+### The PR comment: not applicable, not permitted, or failed
+
+| Outcome | Meaning | Notifier step |
+| --- | --- | --- |
+| not applicable | no PR for this run (`push`, `schedule`, `workflow_dispatch` without `pr_number`, the post-push artifact gate) | expected — logged, not a failure |
+| fork read-only | HTTP 403 on a fork PR: `pull_request` gives fork code a read-only token by design | expected — explained in the job summary |
+| permission | HTTP 403 on a same-repo PR, or no token: the caller did not grant `pull-requests: write` | failure (the step is `continue-on-error`) |
+| API failure | anything else | failure |
+
+### Gate result fields added for guidance (additive, optional)
+
+`security-gate.json` findings may carry: `registryUrl` and `scannerSeverity`
+(Semgrep); `ruleDescription` (Gitleaks); `location` and `verificationErrored`
+(TruffleHog); `fixPackage`, `fixIsSemVerMajor`, `viaPackages` (npm audit);
+`severitySource`, `installedVersion`, `fixVersions`, `aliases`, `ecosystem`
+(pip-audit / OSV-Scanner). Image gate findings may carry `scannerSeverity`,
+`installedVersion`, `target`, `fixAvailability`, `packages`. None is read by any
+decision, fingerprint, or baseline; existing fields keep their meaning.
 
 ## Portability rules
 

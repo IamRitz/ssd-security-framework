@@ -558,3 +558,80 @@ describe('synthetic break-glass runs are isolated from production by constructio
     assert.ok(eligibility >= 0 && resolve > eligibility && oidc > resolve);
   });
 });
+
+// The developer-feedback notifier describes break-glass from OBSERVED state. The
+// state channel is the step outcomes, so the wiring is the contract: a renamed
+// step id silently becomes '' and the notifier would report "request failed" for
+// a request that was sent (or the reverse). Nothing fails at runtime, so it is
+// asserted here.
+describe('the notifier receives the break-glass state it describes', () => {
+  const source = readExecutable('_source-security.yml');
+  const gate = source.slice(source.indexOf('  source-gate:'));
+
+  // One step's block: from its `- name:` line to the next step.
+  function step(name) {
+    const start = gate.indexOf(`- name: ${name}`);
+    assert.ok(start >= 0, `step "${name}" is missing`);
+    const next = gate.indexOf('\n      - name:', start + 1);
+    return gate.slice(start, next === -1 ? undefined : next);
+  }
+
+  const notify = step('Post developer-readable findings (Slack + PR comment + job summary)');
+
+  it('each break-glass step the notifier reads has the id it reads', () => {
+    assert.match(step('Confirm the BLOCK is eligible before loading any approval credential'), /\n\s+id: break-glass-check\n/);
+    assert.match(step('Request break-glass decision'), /\n\s+id: break-glass-request\n/);
+    assert.match(step('Wait for verified break-glass decision'), /\n\s+id: break-glass\n/);
+  });
+
+  it('passes enabled + every step outcome explicitly', () => {
+    assert.match(notify, /BREAK_GLASS_ENABLED: \$\{\{ inputs\.break_glass_enabled \}\}/);
+    assert.match(notify, /BREAK_GLASS_CHECK_OUTCOME: \$\{\{ steps\.break-glass-check\.outcome \}\}/);
+    assert.match(notify, /BREAK_GLASS_REQUEST_OUTCOME: \$\{\{ steps\.break-glass-request\.outcome \}\}/);
+    assert.match(notify, /BREAK_GLASS_POLL_OUTCOME: \$\{\{ steps\.break-glass\.outcome \}\}/);
+  });
+
+  it('approval in the feedback is the same signal enforcement uses', () => {
+    assert.match(
+      step('Enforce the gate verdict'),
+      /BREAK_GLASS_OUTCOME: \$\{\{ steps\.break-glass\.outcome \}\}/,
+      'enforcement and feedback must read the same poll-step outcome'
+    );
+  });
+
+  it('runs after every break-glass step, and even when they fail', () => {
+    assert.ok(gate.indexOf('Wait for verified break-glass decision') < gate.indexOf('Post developer-readable findings'));
+    assert.match(notify, /\n\s+if: always\(\)\n/);
+    assert.match(notify, /\n\s+continue-on-error: true\n/, 'feedback must never decide the job result');
+  });
+
+  it('passes the scan configuration its reproduce commands are built from', () => {
+    for (const [env, input] of [
+      ['SEMGREP_CONFIGS', 'semgrep_configs'],
+      ['SEMGREP_PATHS', 'semgrep_paths'],
+      ['GITLEAKS_CONFIG', 'gitleaks_config'],
+      ['TRUFFLEHOG_EXCLUDE_PATHS', 'trufflehog_exclude_paths']
+    ]) {
+      assert.match(notify, new RegExp(`${env}: \\$\\{\\{ inputs\\.${input} \\}\\}`));
+    }
+  });
+
+  it('holds no approval credential', () => {
+    assert.ok(!/secrets\./.test(notify), 'the notifier must not receive the break-glass secret');
+  });
+
+  it('image gates pass no break-glass state: they have no break-glass path', () => {
+    for (const file of ['_image-scan-prepush.yml', '_artifact-gate.yml']) {
+      assert.ok(!/BREAK_GLASS_/.test(readExecutable(file)), `${file} must not claim break-glass state`);
+    }
+  });
+
+  it('no workflow runs on pull_request_target (fork code never gets a writable token)', () => {
+    for (const file of readdirSync(WORKFLOW_DIR).filter((name) => name.endsWith('.yml'))) {
+      assert.ok(!/pull_request_target/.test(readExecutable(file)), `${file} must not use pull_request_target`);
+    }
+    for (const path of ['examples/container-ecr/security.yml', 'examples/container-ecr/deploy.yml', 'examples/source-only/security.yml', 'examples/python-self-managed/security.yml']) {
+      assert.ok(!/^\s*pull_request_target\s*:/m.test(readFileSync(path, 'utf8')), `${path} must not use pull_request_target`);
+    }
+  });
+});

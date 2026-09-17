@@ -257,7 +257,12 @@ function evaluateSecrets(policy, gitleaks, trufflehog, findings) {
       policyRule: isDemoDummy ? 'secrets.demo_dummy' : 'secrets.unverified',
       reason: isDemoDummy
         ? 'Dedicated non-credential marker activated on a never-merged demo branch'
-        : 'Gitleaks pattern match is not provider-verified'
+        : 'Gitleaks pattern match is not provider-verified',
+      // Optional developer context: the matching rule's own description. Gitleaks
+      // never verifies a credential, so no verification fact is recorded here.
+      ...(typeof finding.Description === 'string' && finding.Description !== ''
+        ? { ruleDescription: finding.Description }
+        : {})
     });
   }
 
@@ -268,13 +273,25 @@ function evaluateSecrets(policy, gitleaks, trufflehog, findings) {
     );
     assert(typeof finding.Verified === 'boolean', 'TruffleHog finding is missing Verified');
     const state = finding.Verified ? 'verified' : 'unverified';
+    // Optional location: TruffleHog's git source metadata, when it carries one.
+    const git = finding.SourceMetadata?.Data?.Git;
+    const location =
+      typeof git?.file === 'string' && git.file !== ''
+        ? `${git.file}:${Number.isInteger(git.line) ? git.line : '?'}`
+        : undefined;
     addFinding(findings, policy, {
       source: 'trufflehog',
       id: finding.DetectorName,
       policyRule: `secrets.${state}`,
       reason: finding.Verified
         ? 'TruffleHog verified the credential with its provider'
-        : 'TruffleHog did not verify the credential'
+        : 'TruffleHog did not verify the credential',
+      ...(location ? { location } : {}),
+      // `--results=unknown` includes credentials whose verification ERRORED.
+      // Recorded as a flag only; the error text is not copied into the report.
+      ...(!finding.Verified && typeof finding.VerificationError === 'string' && finding.VerificationError !== ''
+        ? { verificationErrored: true }
+        : {})
     });
   }
 }
@@ -315,10 +332,19 @@ function evaluateNpmAudit(policy, report, findings) {
     const advisory = Array.isArray(vulnerability.via)
       ? vulnerability.via.find((entry) => entry && typeof entry === 'object')
       : undefined;
-    const fixedVersion =
+    // npm's fixAvailable is `true`, `false`, or an object naming the package
+    // npm would change to resolve it — which is often NOT the vulnerable package
+    // itself (a parent that pulls in a fixed transitive copy). The target is
+    // recorded separately so no surface tells a developer to install a version
+    // of the vulnerable package that does not exist.
+    const fixObject =
       vulnerability.fixAvailable && typeof vulnerability.fixAvailable === 'object'
-        ? vulnerability.fixAvailable.version
+        ? vulnerability.fixAvailable
         : undefined;
+    const fixedVersion = fixObject?.version;
+    const viaPackages = Array.isArray(vulnerability.via)
+      ? vulnerability.via.filter((entry) => typeof entry === 'string' && entry !== '')
+      : [];
 
     addFinding(findings, policy, {
       source: 'npm-audit',
@@ -328,6 +354,9 @@ function evaluateNpmAudit(policy, report, findings) {
       policyRule,
       reason: `${severity} npm advisory; fix ${fixAvailable ? 'available' : 'not available'}`,
       ...(typeof fixedVersion === 'string' ? { fixedVersion } : {}),
+      ...(typeof fixObject?.name === 'string' && fixObject.name !== '' ? { fixPackage: fixObject.name } : {}),
+      ...(typeof fixObject?.isSemVerMajor === 'boolean' ? { fixIsSemVerMajor: fixObject.isSemVerMajor } : {}),
+      ...(viaPackages.length > 0 ? { viaPackages } : {}),
       ...(advisory?.title ? { title: advisory.title } : {}),
       ...(advisory?.url ? { url: advisory.url } : {})
     });
@@ -378,7 +407,8 @@ function evaluatePipAudit(policy, report, findings) {
           id: vulnerability.id,
           package: dependency.name,
           policyRule: 'dependencies.malicious_package',
-          reason: 'pip-audit malicious-package advisory blocks regardless of severity'
+          reason: 'pip-audit malicious-package advisory blocks regardless of severity',
+          ...(typeof dependency.version === 'string' ? { installedVersion: dependency.version } : {})
         });
         continue;
       }
@@ -395,11 +425,21 @@ function evaluatePipAudit(policy, report, findings) {
         id: vulnerability.id,
         package: dependency.name,
         severity: 'high',
+        // The severity above is the framework's fail-closed default, not a value
+        // pip-audit reported. Recorded so no surface attributes it to pip-audit.
+        severitySource: 'framework-default',
         fixAvailable,
         policyRule,
         reason: `Python advisory (pip-audit reports no severity; treated as high); fix ${
           fixAvailable ? 'available' : 'not available'
-        }`
+        }`,
+        ...(typeof dependency.version === 'string' ? { installedVersion: dependency.version } : {}),
+        ...(fixAvailable
+          ? { fixVersions: vulnerability.fix_versions.filter((version) => typeof version === 'string') }
+          : {}),
+        ...(Array.isArray(vulnerability.aliases) && vulnerability.aliases.length > 0
+          ? { aliases: vulnerability.aliases.filter((alias) => typeof alias === 'string') }
+          : {})
       });
     }
   }
@@ -511,6 +551,30 @@ function osvHasFix(vulnerability, scannedPackage) {
   });
 }
 
+// The `fixed` events behind osvHasFix, for developer guidance only. They are
+// listed as OSV records them: a fixed event on one release line is not proof
+// that the installed version's line has a fix, so no surface claims it is.
+function osvFixedVersions(vulnerability, scannedPackage) {
+  const versions = new Set();
+  for (const entry of vulnerability.affected) {
+    if (
+      entry.package?.name !== scannedPackage.name ||
+      (scannedPackage.ecosystem && entry.package.ecosystem !== scannedPackage.ecosystem) ||
+      !Array.isArray(entry.ranges)
+    ) {
+      continue;
+    }
+    for (const range of entry.ranges) {
+      for (const event of range.events ?? []) {
+        if (typeof event.fixed === 'string' && event.fixed !== '') {
+          versions.add(event.fixed);
+        }
+      }
+    }
+  }
+  return [...versions];
+}
+
 function evaluateOsv(policy, report, findings) {
   assert(report && typeof report === 'object', 'OSV-Scanner report must be an object');
   // OSV-Scanner is written in Go, and Go marshals an empty slice as `null`, so a
@@ -554,7 +618,11 @@ function evaluateOsv(policy, report, findings) {
             id: vulnerability.id,
             package: dependency.package.name,
             policyRule: 'dependencies.malicious_package',
-            reason: 'OSV malicious-package advisory blocks regardless of severity'
+            reason: 'OSV malicious-package advisory blocks regardless of severity',
+            installedVersion: dependency.package.version,
+            ...(typeof dependency.package.ecosystem === 'string'
+              ? { ecosystem: dependency.package.ecosystem }
+              : {})
           });
           continue;
         }
@@ -563,6 +631,7 @@ function evaluateOsv(policy, report, findings) {
         // No CVSS v3 score (common for PyPI/PYSEC advisories) => fail-closed high.
         const severity = score === null ? 'high' : osvSeverity(policy, score);
         const fixAvailable = osvHasFix(vulnerability, dependency.package);
+        const fixVersions = fixAvailable ? osvFixedVersions(vulnerability, dependency.package) : [];
         const suffix = ['critical', 'high'].includes(severity)
           ? `_${fixAvailable ? 'with_fix' : 'no_fix'}`
           : '';
@@ -575,7 +644,18 @@ function evaluateOsv(policy, report, findings) {
           package: dependency.package.name,
           severity,
           ...(score === null ? {} : { cvssScore: score }),
+          // `cvss`: derived from the record's CVSS v3 score by the policy
+          // thresholds. `framework-default`: no CVSS v3 score, fail-closed high.
+          severitySource: score === null ? 'framework-default' : 'cvss',
           fixAvailable,
+          installedVersion: dependency.package.version,
+          ...(typeof dependency.package.ecosystem === 'string'
+            ? { ecosystem: dependency.package.ecosystem }
+            : {}),
+          ...(fixVersions.length > 0 ? { fixVersions } : {}),
+          ...(Array.isArray(vulnerability.aliases) && vulnerability.aliases.length > 0
+            ? { aliases: vulnerability.aliases.filter((alias) => typeof alias === 'string') }
+            : {}),
           policyRule: `dependencies.${severity}${suffix}`,
           reason: `${severity} OSV advisory (${
             score === null ? 'no CVSS score; treated as high' : `CVSS ${score}`
@@ -599,6 +679,13 @@ function semgrepFingerprint(finding) {
   return createHash('sha256')
     .update(`${finding.check_id}\0${finding.path}\0${finding.extra.lines.trim()}`)
     .digest('hex');
+}
+
+function semgrepRegistryUrl(finding) {
+  const source = finding.extra?.metadata?.source;
+  return typeof source === 'string' && /^https:\/\/semgrep\.dev\/r\/[^\s/]+$/.test(source)
+    ? source
+    : null;
 }
 
 function semgrepSeverity(policy, finding) {
@@ -648,7 +735,16 @@ function evaluateSemgrep(policy, report, baseline, findings, bootstrap = false) 
       // is known. `unbaselined` says the honest thing: not yet accepted.
       baselineState: bootstrap ? 'unbaselined' : existing ? 'existing' : 'new',
       policyRule: `sast.${severity}${suffix}`,
-      reason: `${severity} Semgrep finding is ${existing ? 'baseline-known' : 'new'}`,
+      reason: `${severity} Semgrep finding is ${
+        bootstrap ? 'unbaselined' : existing ? 'baseline-known' : 'new'
+      }`,
+      scannerSeverity: finding.extra.severity,
+      // A Semgrep Registry rule carries its registry page in `metadata.source`.
+      // That metadata is the ONLY evidence a rule came from the Registry: a local
+      // rule's check_id is also dotted (the config's directory becomes a prefix,
+      // e.g. security/semgrep/x.yml -> security.semgrep.<id>), so a registry URL
+      // is never constructed from the id.
+      ...(semgrepRegistryUrl(finding) ? { registryUrl: semgrepRegistryUrl(finding) } : {}),
       // Human context for the developer-readable formatter (Semgrep rules carry a
       // `message`); optional, so a minimal report still evaluates.
       ...(typeof finding.extra?.message === 'string' && finding.extra.message !== ''

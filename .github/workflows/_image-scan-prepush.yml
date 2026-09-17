@@ -212,8 +212,12 @@ jobs:
           GATE_MODE: ${{ inputs.gate_mode }}
           GITHUB_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+          PR_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
           SECURITY_NOTIFY_SLACK_URL: ${{ inputs.slack_notify_url }}
           SECURITY_REPRODUCE_COMMANDS: ${{ inputs.reproduce_commands }}
+          # The tarball Trivy scanned, for an accurate reproduce command. Image
+          # gates have no break-glass, so no BREAK_GLASS_* state is passed.
+          SSD_IMAGE_TARBALL: ${{ inputs.image_tarball }}
         run: node "$SSD_TOOLKIT/scripts/notify.mjs" --gate reports/image-gate-prepush.json
 
       - name: Flag an untrusted image scan (blocks baseline generation)

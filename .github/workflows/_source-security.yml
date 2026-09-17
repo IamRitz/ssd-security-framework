@@ -75,12 +75,14 @@ on:
       reproduce_commands:
         description: >-
           JSON object mapping finding source (gitleaks, trufflehog, npm-audit, pip-audit,
-          osv-scanner, semgrep, trivy, ecr-image-scan) to the command a developer runs
-          locally to reproduce it. Empty uses portable direct scanner invocations.
+          osv-scanner, semgrep, trivy, ecr-image-scan, ecr-enhanced-scan) to the command a
+          developer runs locally to reproduce it. Empty uses direct scanner invocations built
+          from this run's own configuration (Semgrep configs and paths, Gitleaks config,
+          TruffleHog exclude-paths).
         type: string
         default: ''
       slack_notify_url:
-        description: Slack incoming-webhook URL for developer-readable BLOCK alerts. Empty disables Slack.
+        description: Slack incoming-webhook URL for developer-readable BLOCK alerts. Empty disables Slack. Suppressed only in log-only mode, or when an interactive break-glass request for the BLOCK was actually delivered.
         type: string
         default: ''
       pr_number:
@@ -940,6 +942,7 @@ jobs:
           exit 1
 
       - name: Confirm the BLOCK is eligible before loading any approval credential
+        id: break-glass-check
         if: ${{ steps.evaluate.outcome == 'failure' && inputs.gate_mode != 'log-only' && inputs.break_glass_enabled }}
         run: node "$SSD_TOOLKIT/scripts/break-glass-notify.mjs" --check-only
 
@@ -1009,6 +1012,7 @@ jobs:
           role-session-name: break-glass-gate
 
       - name: Request break-glass decision
+        id: break-glass-request
         if: ${{ steps.evaluate.outcome == 'failure' && inputs.gate_mode != 'log-only' && inputs.break_glass_enabled }}
         env:
           BREAK_GLASS_TRANSPORT: ${{ inputs.break_glass_transport }}
@@ -1043,16 +1047,35 @@ jobs:
       - name: Post developer-readable findings (Slack + PR comment + job summary)
         # Feedback only — never fails the gate (the gate's own verdict decides the
         # job result). Routing: BLOCK -> Slack + PR + summary; EXCEPTION -> PR +
-        # summary; break-glass eligible -> no plain ping (the interactive request
-        # owns Slack); gate_mode=log-only -> no Slack at all.
+        # summary; gate_mode=log-only -> no Slack at all.
+        #
+        # Break-glass ELIGIBILITY never suppresses Slack. Only a request that was
+        # actually DELIVERED does (the interactive message already reached
+        # approvers). The notifier cannot observe that from the gate report, so
+        # the run's break-glass state is passed explicitly: whether it is enabled,
+        # and the outcome of each break-glass step. A skipped step reports
+        # 'skipped', so a disabled, failed, or never-entered request is never
+        # described as sent.
         if: always()
         continue-on-error: true
         env:
           GATE_MODE: ${{ inputs.gate_mode }}
           GITHUB_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+          # Distinguishes a fork PR's expected read-only-token denial from a
+          # misconfigured permission. Read-only context; no trust decision rests on it.
+          PR_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
           SECURITY_NOTIFY_SLACK_URL: ${{ inputs.slack_notify_url }}
           SECURITY_REPRODUCE_COMMANDS: ${{ inputs.reproduce_commands }}
+          BREAK_GLASS_ENABLED: ${{ inputs.break_glass_enabled }}
+          BREAK_GLASS_CHECK_OUTCOME: ${{ steps.break-glass-check.outcome }}
+          BREAK_GLASS_REQUEST_OUTCOME: ${{ steps.break-glass-request.outcome }}
+          BREAK_GLASS_POLL_OUTCOME: ${{ steps.break-glass.outcome }}
+          # What the scans actually ran with, so "reproduce locally" matches them.
+          SEMGREP_CONFIGS: ${{ inputs.semgrep_configs }}
+          SEMGREP_PATHS: ${{ inputs.semgrep_paths }}
+          GITLEAKS_CONFIG: ${{ inputs.gitleaks_config }}
+          TRUFFLEHOG_EXCLUDE_PATHS: ${{ inputs.trufflehog_exclude_paths }}
         run: node "$SSD_TOOLKIT/scripts/notify.mjs" --gate reports/security-gate.json
 
       - name: Flag an untrusted scan (blocks baseline generation)

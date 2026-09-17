@@ -36,6 +36,15 @@ The order of operations matters more than any individual check:
 3. Only then is the invoker role assumed (or the shared secret read).
 4. The request is sent, and CI polls for a **verified** decision.
 
+What the developer is told follows the same order, and never skips ahead:
+**eligible** (policy) does not mean **enabled** (this repo), which does not mean
+a request was **sent**, which does not mean a **decision** exists. An eligible
+BLOCK in a repo with break-glass disabled reads "eligible by policy, but not
+enabled for this repository", and still gets the normal BLOCK Slack alert. Only
+a request the broker actually accepted suppresses that alert, and only a
+verified approval is described as an override. See
+[workflow-contracts.md § developer feedback](workflow-contracts.md#developer-feedback-every-statement-is-observed-state).
+
 Only an `approved` decision lets the gate job succeed. Denied, expired,
 malformed, unreachable, and timed-out all remain failed. There is no path where
 an absent or unparseable answer becomes an approval.
@@ -156,7 +165,9 @@ Changing the map is an environment change and needs the handler restarted.
 **Break-glass is unavailable, and that is a supported, recorded configuration.**
 
 Leave `break_glass_enabled: false` (the default). An eligible BLOCK then behaves
-like any other BLOCK: it fails, and the remedy is to fix the finding. The
+like any other BLOCK: it fails, the normal BLOCK alert is sent, and the remedy is
+to fix the finding. Developers are told the finding is eligible by policy but
+that break-glass is not enabled here — never that a request was sent. The
 conformance report marks the control **N/A** with the reason
 `break_glass_enabled=false` — not as a gap, and not as an exemption.
 

@@ -5,18 +5,25 @@
 //   EXCEPTION-only                   -> PR comment + job summary (no ping)
 //   clean PASS / DEPLOY              -> PR comment + job summary (no ping)
 //   gate_mode: log-only              -> never Slack
-//   break-glass eligible BLOCK       -> no plain ping (interactive Slack owns it)
+//   break-glass request DELIVERED    -> no plain ping (the interactive request
+//                                       already reached approvers)
 //
-// The existing interactive break-glass Slack flow (break-glass-notify.mjs +
-// n8n) is untouched and remains the primary approval path; this module only
-// adds the read-only developer feedback surfaces around it.
+// Break-glass ELIGIBILITY never suppresses Slack on its own. Whether a request
+// was actually made and delivered is observed state, passed in explicitly by
+// the workflow (BREAK_GLASS_* below) — never inferred from the gate's policy
+// eligibility. See deriveBreakGlassState in format-findings.mjs.
+//
+// The interactive break-glass flow itself (break-glass-notify.mjs + the broker)
+// is untouched; this module only adds the read-only developer feedback surfaces
+// around it.
 
-import { appendFile, readFile } from 'node:fs/promises';
+import { appendFile, readFile, stat } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
   buildReport,
+  deriveBreakGlassState,
   renderMarkdown,
   renderSlack,
   resolveReproduceCommands,
@@ -33,6 +40,16 @@ export async function writeStepSummary(markdown, { summaryPath, appendImpl = app
   return true;
 }
 
+// A GitHub API response the notifier could not act on, with its status kept so
+// the caller can tell "not permitted" from "broken".
+export class GitHubApiError extends Error {
+  constructor(message, status) {
+    super(message);
+    this.name = 'GitHubApiError';
+    this.status = status;
+  }
+}
+
 // Find-by-marker then update, so repeated pushes update one comment instead of
 // stacking walls of findings on the PR.
 //
@@ -40,16 +57,34 @@ export async function writeStepSummary(markdown, { summaryPath, appendImpl = app
 // e.g. flip an earlier ⛔ BLOCK to ✅ once fixed — but do NOT create a new one.
 // A PR that was always clean then gets no status comment at all, rather than a
 // "No findings" comment nobody needed.
+//
+// A skip carries a `category`:
+//   not-applicable  no pull request is associated with this run (push, schedule,
+//                   workflow_dispatch without pr_number, a post-push gate). The
+//                   expected state — never an error.
+//   permission      no token was provided at all.
+//   clean-no-comment clean run with nothing to update.
 export async function upsertPrComment({
   repository,
   prNumber,
   token,
   body,
   updateOnly = false,
+  eventName = null,
   fetchImpl = globalThis.fetch
 }) {
-  if (!repository || !prNumber || !token) {
-    return { skipped: true, reason: 'missing repository, prNumber or token' };
+  if (!prNumber) {
+    return {
+      skipped: true,
+      category: 'not-applicable',
+      reason: `no pull request is associated with this run (event: ${eventName || 'unknown'})`
+    };
+  }
+  if (!repository) {
+    return { skipped: true, category: 'not-applicable', reason: 'no repository context for this run' };
+  }
+  if (!token) {
+    return { skipped: true, category: 'permission', reason: 'no GitHub token was provided to the notifier' };
   }
   const api = `https://api.github.com/repos/${repository}/issues/${prNumber}/comments`;
   const headers = {
@@ -62,11 +97,7 @@ export async function upsertPrComment({
   const timeout = () => globalThis.AbortSignal.timeout(15_000);
   const listResponse = await fetchImpl(`${api}?per_page=100`, { headers, signal: timeout() });
   if (!listResponse.ok) {
-    // 403 here is the expected, safe outcome on a fork PR: the pull_request event
-    // (not pull_request_target) forces a read-only GITHUB_TOKEN, so no comment is
-    // ever written from untrusted fork code. Surfaced as a delivery note, not a
-    // silent absence — the full findings still land in the local job summary.
-    throw new Error(`listing PR comments failed: HTTP ${listResponse.status}`);
+    throw new GitHubApiError(`listing PR comments failed: HTTP ${listResponse.status}`, listResponse.status);
   }
   const existing = (await listResponse.json()).find(
     (comment) => typeof comment.body === 'string' && comment.body.includes(PR_COMMENT_MARKER)
@@ -78,14 +109,18 @@ export async function upsertPrComment({
       { method: 'PATCH', headers, body: JSON.stringify({ body }), signal: timeout() }
     );
     if (!patch.ok) {
-      throw new Error(`updating PR comment failed: HTTP ${patch.status}`);
+      throw new GitHubApiError(`updating PR comment failed: HTTP ${patch.status}`, patch.status);
     }
     return { updated: true, id: existing.id };
   }
 
   if (updateOnly) {
     // Clean run and no prior findings comment to resolve — post nothing.
-    return { skipped: true, reason: 'clean run with no existing comment to update' };
+    return {
+      skipped: true,
+      category: 'clean-no-comment',
+      reason: 'clean run with no existing comment to update'
+    };
   }
 
   const create = await fetchImpl(api, {
@@ -95,9 +130,37 @@ export async function upsertPrComment({
     signal: timeout()
   });
   if (!create.ok) {
-    throw new Error(`creating PR comment failed: HTTP ${create.status}`);
+    throw new GitHubApiError(`creating PR comment failed: HTTP ${create.status}`, create.status);
   }
   return { created: true };
+}
+
+// Classify a thrown PR-comment error. A 403 on a FORK pull request is the
+// expected, safe outcome: the `pull_request` event (never `pull_request_target`)
+// gives fork code a read-only token, so no comment can be written. Anywhere else
+// a 403 means the calling workflow did not grant `pull-requests: write`, which is
+// a configuration problem worth failing loudly on. Anything else is an API failure.
+export function classifyPrCommentError(error, { isForkPullRequest = false } = {}) {
+  const status = error?.status;
+  if ((status === 403 || status === 401) && isForkPullRequest) {
+    return {
+      category: 'fork-read-only',
+      expected: true,
+      reason:
+        `GitHub denied the comment (HTTP ${status}) on a fork pull request. Fork PRs get a read-only token by ` +
+        'design, so the findings are in this job summary instead.'
+    };
+  }
+  if (status === 403 || status === 401) {
+    return {
+      category: 'permission',
+      expected: false,
+      reason:
+        `GitHub denied the comment (HTTP ${status}). The calling workflow must grant \`pull-requests: write\` ` +
+        'to the security job.'
+    };
+  }
+  return { category: 'api-failure', expected: false, reason: error?.message || String(error) };
 }
 
 export async function postSlack({ url, message, fetchImpl = globalThis.fetch }) {
@@ -116,12 +179,20 @@ export async function postSlack({ url, message, fetchImpl = globalThis.fetch }) 
   return { posted: true };
 }
 
+const SLACK_SUPPRESSED = {
+  'log-only': 'NOTIFY: Slack suppressed — gate_mode is log-only',
+  'break-glass-request-delivered':
+    'NOTIFY: Slack suppressed — an interactive break-glass request was delivered for this BLOCK',
+  'non-blocking-verdict': 'NOTIFY: Slack not routed — verdict is not blocking'
+};
+
 // --- orchestration -----------------------------------------------------------
 
 export async function dispatch({
   gate,
   context = {},
   mode = 'enforce',
+  breakGlass,
   slackUrl,
   token,
   summaryPath,
@@ -129,10 +200,17 @@ export async function dispatch({
   appendImpl,
   logger = console
 }) {
-  const report = buildReport({ gate, context, mode });
+  const report = buildReport({ gate, context, mode, breakGlass });
   const { routing } = report;
-  const performed = { verdict: report.verdict, slack: false, prComment: false, summary: false };
+  const performed = {
+    verdict: report.verdict,
+    slack: false,
+    prComment: false,
+    summary: false,
+    breakGlass: report.breakGlass
+  };
   const failures = [];
+  const notes = [];
 
   // 1. Job summary FIRST and unconditionally — it is a local file write with no
   //    network, so the full, plain-language explanation lands even if every
@@ -166,15 +244,30 @@ export async function dispatch({
         token,
         body: renderMarkdown(report, { includeMarker: true }),
         updateOnly: clean,
+        eventName: context.eventName,
         fetchImpl
       });
       performed.prComment = !result.skipped;
       if (result.skipped) {
-        logger.log?.(`NOTIFY: PR comment skipped: ${result.reason}`);
+        performed.prCommentSkip = result.category;
+        if (result.category === 'permission') {
+          failures.push(`PR comment (${result.reason})`);
+          logger.error?.(`NOTIFY: PR comment not posted: ${result.reason}`);
+        } else {
+          const label = result.category === 'not-applicable' ? 'not applicable' : 'skipped';
+          logger.log?.(`NOTIFY: PR comment ${label}: ${result.reason}`);
+        }
       }
     } catch (error) {
-      failures.push(`PR comment (${error.message})`);
-      logger.error?.(`NOTIFY: PR comment failed: ${error.message}`);
+      const classified = classifyPrCommentError(error, { isForkPullRequest: context.isForkPullRequest });
+      performed.prCommentSkip = classified.category;
+      if (classified.expected) {
+        notes.push(`PR comment not posted: ${classified.reason}`);
+        logger.log?.(`NOTIFY: PR comment not posted (expected): ${classified.reason}`);
+      } else {
+        failures.push(`PR comment (${classified.reason})`);
+        logger.error?.(`NOTIFY: PR comment failed [${classified.category}]: ${classified.reason}`);
+      }
     }
   }
 
@@ -190,31 +283,32 @@ export async function dispatch({
       logger.error?.(`NOTIFY: Slack notification failed: ${error.message}`);
     }
   } else {
-    logger.log?.(
-      report.mode === 'log-only'
-        ? 'NOTIFY: Slack suppressed — gate_mode is log-only'
-        : report.isBreakGlassEligible
-          ? 'NOTIFY: Slack suppressed — interactive break-glass request owns the Slack channel'
-          : 'NOTIFY: Slack not routed for this verdict'
-    );
+    logger.log?.(SLACK_SUPPRESSED[routing.slackReason] || `NOTIFY: Slack not routed (${routing.slackReason})`);
   }
 
-  // If a remote surface failed, record it in the local summary too, so the
-  // failure is visible as "notification failed" rather than a silently missing
-  // channel. Best effort — never throws.
-  if (failures.length > 0 && routing.summary && performed.summary) {
-    try {
-      await writeStepSummary(
+  // Record remote-surface outcomes in the local summary too, so a failure is
+  // visible as "notification failed" rather than a silently missing channel, and
+  // an expected non-delivery is explained rather than looking like a failure.
+  // Best effort — never throws.
+  if (routing.summary && performed.summary && (failures.length > 0 || notes.length > 0)) {
+    const lines = [];
+    if (failures.length > 0) {
+      lines.push(
         `\n> ⚠️ **Notification delivery incomplete:** ${failures.join('; ')}. ` +
-          'The findings above are complete; only remote delivery failed.\n',
-        { summaryPath, appendImpl }
+          'The findings above are complete; only remote delivery failed.\n'
       );
+    }
+    for (const note of notes) {
+      lines.push(`\n> ℹ️ ${note}\n`);
+    }
+    try {
+      await writeStepSummary(lines.join(''), { summaryPath, appendImpl });
     } catch {
       // The primary summary already landed; a footer failure is not worth crashing.
     }
   }
 
-  return { ...performed, failures };
+  return { ...performed, failures, notes };
 }
 
 // --- CLI ---------------------------------------------------------------------
@@ -231,41 +325,101 @@ function parseArguments(argv) {
   return options;
 }
 
+// Optional JSON artifact: absent or unreadable is "no evidence", never an error.
+async function readOptionalJson(path) {
+  try {
+    return JSON.parse(await readFile(path, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+async function fileExists(path) {
+  try {
+    return (await stat(path)).isFile();
+  } catch {
+    return false;
+  }
+}
+
+const words = (value) =>
+  typeof value === 'string' ? value.split(/\s+/).filter((word) => word !== '') : [];
+
+// The break-glass state channel. Unset BREAK_GLASS_ENABLED means the caller did
+// not pass the state at all (a gate with no break-glass concept, or an older
+// workflow): `enabled` is then unknown and nothing is claimed.
+export async function breakGlassStateFromEnv(env, { gate, mode }) {
+  const rawEnabled = env.BREAK_GLASS_ENABLED;
+  const enabled = rawEnabled === 'true' ? true : rawEnabled === 'false' ? false : null;
+  return deriveBreakGlassState({
+    verdict: gate?.verdict,
+    eligible: gate?.breakGlass?.eligible === true,
+    mode,
+    enabled,
+    checkOutcome: env.BREAK_GLASS_CHECK_OUTCOME || '',
+    requestOutcome: env.BREAK_GLASS_REQUEST_OUTCOME || '',
+    pollOutcome: env.BREAK_GLASS_POLL_OUTCOME || '',
+    request: await readOptionalJson(env.BREAK_GLASS_REQUEST_PATH || 'reports/break-glass-request.json'),
+    decision: await readOptionalJson(env.BREAK_GLASS_DECISION_PATH || 'reports/break-glass-decision.json')
+  });
+}
+
 async function main() {
   const options = parseArguments(process.argv.slice(2));
   const gate = JSON.parse(await readFile(options.gate, 'utf8'));
+  const env = process.env;
+  const headRepository = env.PR_HEAD_REPOSITORY || '';
   const context = {
-    repository: process.env.GITHUB_REPOSITORY,
-    sha: process.env.GITHUB_SHA,
-    prNumber: process.env.PR_NUMBER || null,
+    repository: env.GITHUB_REPOSITORY,
+    sha: env.GITHUB_SHA,
+    prNumber: env.PR_NUMBER || null,
+    eventName: env.GITHUB_EVENT_NAME || null,
+    isForkPullRequest: headRepository !== '' && headRepository !== env.GITHUB_REPOSITORY,
     runUrl:
-      process.env.GITHUB_SERVER_URL && process.env.GITHUB_REPOSITORY && process.env.GITHUB_RUN_ID
-        ? `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`
+      env.GITHUB_SERVER_URL && env.GITHUB_REPOSITORY && env.GITHUB_RUN_ID
+        ? `${env.GITHUB_SERVER_URL}/${env.GITHUB_REPOSITORY}/actions/runs/${env.GITHUB_RUN_ID}`
         : null,
     // Per-repo "reproduce this locally" commands. Unset falls back to direct
     // scanner invocations that hold in any repo, never to this repo's Makefile.
-    reproduceCommands: resolveReproduceCommands(process.env.SECURITY_REPRODUCE_COMMANDS)
+    reproduceCommands: resolveReproduceCommands(env.SECURITY_REPRODUCE_COMMANDS),
+    // What this run actually scanned with, so reproduce commands match it. A
+    // config file is named only if it exists — the scan jobs omit absent ones.
+    scan: {
+      semgrepConfigs: words(env.SEMGREP_CONFIGS),
+      semgrepPaths: words(env.SEMGREP_PATHS),
+      gitleaksConfig: env.GITLEAKS_CONFIG && (await fileExists(env.GITLEAKS_CONFIG)) ? env.GITLEAKS_CONFIG : null,
+      trufflehogExcludePaths:
+        env.TRUFFLEHOG_EXCLUDE_PATHS && (await fileExists(env.TRUFFLEHOG_EXCLUDE_PATHS))
+          ? env.TRUFFLEHOG_EXCLUDE_PATHS
+          : null,
+      imageTarball: env.SSD_IMAGE_TARBALL || null
+    }
   };
   // gate_mode drives Slack suppression; a repo still in log-only pages no one.
-  const mode = (process.env.GATE_MODE || options.mode || 'enforce').toLowerCase();
+  const mode = (env.GATE_MODE || options.mode || 'enforce').toLowerCase();
 
   const performed = await dispatch({
     gate,
     context,
     mode,
-    slackUrl: process.env.SECURITY_NOTIFY_SLACK_URL,
-    token: process.env.GITHUB_TOKEN,
-    summaryPath: process.env.GITHUB_STEP_SUMMARY
+    breakGlass: await breakGlassStateFromEnv(env, { gate, mode }),
+    slackUrl: env.SECURITY_NOTIFY_SLACK_URL,
+    token: env.GITHUB_TOKEN,
+    summaryPath: env.GITHUB_STEP_SUMMARY
   });
 
+  const bg = performed.breakGlass;
   console.log(
-    `Notified verdict=${performed.verdict} slack=${performed.slack} pr=${performed.prComment} summary=${performed.summary}`
+    `Notified verdict=${performed.verdict} slack=${performed.slack} pr=${performed.prComment} summary=${performed.summary} ` +
+      `break-glass: eligible=${bg.eligible} enabled=${bg.enabled ?? 'unknown'} pathEntered=${bg.requestPathEntered} requested=${bg.requested} ` +
+      `delivered=${bg.delivered} decision=${bg.decision}`
   );
   // Mark the step failed in its own log when a remote surface could not be
   // delivered. The gate's verdict is decided by a different step, so this never
   // masks (or manufactures) the pass/fail signal; with continue-on-error on the
   // workflow step it does not fail the job — it just makes the delivery gap
-  // legible to anyone reading the run.
+  // legible to anyone reading the run. Expected non-delivery (no PR, fork PR) is
+  // not a failure.
   if (performed.failures.length > 0) {
     process.exitCode = 1;
   }

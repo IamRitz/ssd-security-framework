@@ -119,7 +119,21 @@ function registryFinding(policy, finding, mode) {
       ? { fixedVersion: finding.fixedVersion }
       : {}),
     ...(typeof finding.title === 'string' && finding.title !== '' ? { title: finding.title } : {}),
-    ...(typeof finding.url === 'string' ? { url: finding.url } : {})
+    ...(typeof finding.url === 'string' ? { url: finding.url } : {}),
+    // Optional scanner evidence, passed through for developer guidance only.
+    ...(typeof finding.scannerSeverity === 'string' ? { scannerSeverity: finding.scannerSeverity } : {}),
+    ...(typeof finding.fixAvailability === 'string' ? { fixAvailability: finding.fixAvailability } : {}),
+    ...(Array.isArray(finding.packages)
+      ? {
+          packages: finding.packages
+            .filter((pkg) => pkg && typeof pkg.name === 'string')
+            .map((pkg) => ({
+              name: pkg.name,
+              ...(typeof pkg.version === 'string' ? { version: pkg.version } : {}),
+              ...(typeof pkg.fixedInVersion === 'string' ? { fixedInVersion: pkg.fixedInVersion } : {})
+            }))
+        }
+      : {})
   };
 }
 
@@ -257,6 +271,12 @@ function evaluateTrivy(policy, report) {
         id: vulnerability.VulnerabilityID,
         package: vulnerability.PkgName,
         severity,
+        // Trivy's own rating; UNKNOWN is classified high by trivySeverity.
+        ...(typeof vulnerability.Severity === 'string' ? { scannerSeverity: vulnerability.Severity } : {}),
+        ...(typeof vulnerability.InstalledVersion === 'string'
+          ? { installedVersion: vulnerability.InstalledVersion }
+          : {}),
+        ...(typeof result.Target === 'string' ? { target: result.Target } : {}),
         fixAvailable,
         action: policyAction(policy, policyRule),
         policyRule,
@@ -283,7 +303,12 @@ function evaluateTrivy(policy, report) {
         severity: 'critical',
         action: 'BLOCK_DEPLOY',
         policyRule: 'image.secret',
-        reason: `secret detected in image layer (${secret.Title ?? secret.RuleID})`
+        reason: `secret detected in image layer (${secret.Title ?? secret.RuleID})`,
+        // Trivy's own rating (the gate classifies every image secret critical),
+        // and where inside the IMAGE it was found — not a repository path.
+        ...(typeof secret.Severity === 'string' ? { scannerSeverity: secret.Severity } : {}),
+        ...(typeof secret.Title === 'string' && secret.Title !== '' ? { title: secret.Title } : {}),
+        ...(typeof result.Target === 'string' ? { target: result.Target } : {})
       });
     }
   }

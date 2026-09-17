@@ -183,8 +183,10 @@ jobs:
           echo "ARTIFACT GATE: $verdict"
 
       - name: Post developer-readable artifact-gate findings (Slack + summary)
-        # Post-push — no PR to comment on, so this surfaces the job summary and
-        # (on BLOCK_DEPLOY) a Slack alert. Feedback only.
+        # Post-push — no PR to comment on (the notifier reports the PR comment as
+        # not applicable, not as a failure), so this surfaces the job summary and
+        # (on BLOCK_DEPLOY) a Slack alert. Feedback only. No break-glass exists
+        # for image gates, so no BREAK_GLASS_* state is passed.
         if: always()
         continue-on-error: true
         env:
