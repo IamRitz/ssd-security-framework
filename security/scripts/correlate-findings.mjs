@@ -35,6 +35,13 @@
 // (BLOCK_DEPLOY/BLOCK > EXCEPTION > LOG). This never changes a verdict — the gate
 // already decided it from the raw findings — it only stops a blocking record from
 // being displayed as if it were also two separate logged ones.
+//
+// Each package-scoped issue also carries `evidence` (dependency-evidence.mjs):
+// relationship (direct / transitive / unknown) and version resolution
+// (consistent / conflicting / unknown), each with its provenance. Like the
+// grouping, it is presentation evidence and is never read by a policy decision.
+
+import { issueDependencyEvidenceSafely, normalizePackageName } from './dependency-evidence.mjs';
 
 const PACKAGE_SCOPED_SOURCES = new Set(['pip-audit', 'osv-scanner']);
 
@@ -46,13 +53,6 @@ export function isIntegrityFinding(finding) {
     finding?.id === 'report-integrity' ||
     (typeof finding?.policyRule === 'string' && finding.policyRule.endsWith('report_integrity'))
   );
-}
-
-// PEP 503: PyPI names compare case-insensitively with runs of -, _ and . equal.
-// Every other ecosystem is compared exactly: guessing a normalization rule for
-// an ecosystem would risk merging two genuinely different packages.
-function normalizePackage(ecosystem, name) {
-  return ecosystem === 'PyPI' ? name.toLowerCase().replace(/[-_.]+/g, '-') : name;
 }
 
 // The package scope a finding's identifiers live in, or null when the finding
@@ -71,7 +71,7 @@ function packageScope(finding) {
   if (typeof ecosystem !== 'string' || ecosystem === '') {
     return null;
   }
-  return { ecosystem, package: finding.package, key: `${ecosystem}\0${normalizePackage(ecosystem, finding.package)}` };
+  return { ecosystem, package: finding.package, key: `${ecosystem}\0${normalizePackageName(ecosystem, finding.package)}` };
 }
 
 function identifiers(finding) {
@@ -115,7 +115,8 @@ class DisjointSet {
 
 // Returns issues in first-appearance order. Each issue lists the indexes of the
 // findings it groups; the findings themselves are never copied or modified.
-export function correlateFindings(findings) {
+// `dependencyEvidence` is the gate result's run-level record, when there is one.
+export function correlateFindings(findings, dependencyEvidence = null) {
   const list = Array.isArray(findings) ? findings : [];
   const sets = new DisjointSet(list.length);
   const firstHolder = new Map();
@@ -146,10 +147,10 @@ export function correlateFindings(findings) {
     groups.get(root).push(index);
   });
 
-  return [...groups.values()].map((indexes) => describeIssue(list, indexes));
+  return [...groups.values()].map((indexes) => describeIssue(list, indexes, dependencyEvidence));
 }
 
-function describeIssue(findings, indexes) {
+function describeIssue(findings, indexes, dependencyEvidence) {
   const members = indexes.map((index) => findings[index]);
   const first = members[0];
   const scope = packageScope(first);
@@ -180,6 +181,7 @@ function describeIssue(findings, indexes) {
     issue.installedVersions = [
       ...new Set(members.map((finding) => finding.installedVersion).filter((version) => typeof version === 'string'))
     ];
+    issue.evidence = issueDependencyEvidenceSafely(issue, members, dependencyEvidence);
   } else {
     issue.primaryId = first.id;
   }
@@ -208,8 +210,8 @@ export function summarizeIssues(issues, rawFindingCount) {
 
 // The machine-readable block recorded in a gate result. Additive: `findings`
 // and `summary` keep their meaning (raw per-record counts).
-export function correlationRecord(findings) {
-  const issues = correlateFindings(findings);
+export function correlationRecord(findings, dependencyEvidence = null) {
+  const issues = correlateFindings(findings, dependencyEvidence);
   return {
     schemaVersion: 1,
     basis: 'package-scoped advisory id + alias graph (pip-audit, osv-scanner); all other findings stand alone',

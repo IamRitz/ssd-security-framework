@@ -516,7 +516,18 @@ count beside them whenever correlation merged anything (*1 blocking · 0 excepti
 1 logged — 2 unique issues from 5 scanner findings*). A correlated issue renders as
 one card listing every record — scanner, id, action, and that record's own severity
 derivation — plus all advisory ids and fixed versions with the scanners that list
-them. A single-record issue renders exactly as before.
+them.
+
+**Dependency evidence.** Every package-scoped issue also carries `evidence`:
+the dependency **relationship** (`direct` / `transitive` / `unknown`, with its
+basis) and the **version resolution** (`consistent` / `conflicting` / `unknown`,
+with every scanner's and manifest's observation and a deterministic
+confidence), backed by a run-level `dependencyEvidence` record. Relationship and
+effective version are separate from the advisory match and from the policy
+action. The feedback states a conflict rather than headlining one scanner's
+version, and offers a pin command only for a proven direct dependency whose
+evidence agrees. Nothing here is read by a policy decision. The full schema,
+rules, wording and known limits are in [evidence-model.md](evidence-model.md).
 
 ### Gate result fields added for guidance (additive, optional)
 
@@ -524,7 +535,9 @@ them. A single-record issue renders exactly as before.
 (Semgrep); `ruleDescription` (Gitleaks); `location` and `verificationErrored`
 (TruffleHog); `fixPackage`, `fixIsSemVerMajor`, `viaPackages` (npm audit);
 `severitySource`, `installedVersion`, `fixVersions`, `aliases`, `ecosystem`
-(pip-audit / OSV-Scanner); `correlation` (see above); and, on a report-integrity
+(pip-audit / OSV-Scanner); `correlation` (see above), whose package-scoped issues
+carry `evidence`; `dependencyEvidence`, the run-level record behind it
+([evidence-model.md](evidence-model.md)); and, on a report-integrity
 failure, `control` on the finding and on `integrity.failures[]` naming the control
 whose input could not be interpreted (`secret-scan`, `dependency-scan`, `sast`,
 `source-gate`). Image gate findings may carry `scannerSeverity`,

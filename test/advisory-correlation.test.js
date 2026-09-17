@@ -130,7 +130,11 @@ describe('the live requests + idna run', () => {
     // Not duplicated as extra LOG entries.
     const logged = markdown.slice(markdown.indexOf('### 📝'));
     assert.doesNotMatch(logged, /requests/);
-    assert.match(logged, /\*\*`idna` 3\.9\.0 — CVE-2026-45409\*\*/);
+    // pip-audit listed idna 3.19 (no advisory) while OSV-Scanner matched 3.9.0:
+    // neither version is headlined as the one in use.
+    assert.match(logged, /\*\*`idna` — CVE-2026-45409 \(effective version disputed: 3\.19 vs 3\.9\.0\)\*\*/);
+    assert.doesNotMatch(logged, /`idna` 3\.9\.0 —/);
+    assert.match(logged, /Resolution conflict/);
     assert.match(logged, /OSV-Scanner \/ `PYSEC-2026-215`/);
     assert.match(logged, /OSV-Scanner \/ `GHSA-65pc-fj4g-8rjx`/);
 

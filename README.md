@@ -94,6 +94,7 @@ A conformance report that renders both as "skipped" tells a reviewer nothing.
 | --- | --- |
 | [`docs/onboarding.md`](docs/onboarding.md) | the full per-repo setup, AWS side included, and the rollout sequence |
 | [`docs/workflow-contracts.md`](docs/workflow-contracts.md) | every input, output, and portability rule |
+| [`docs/evidence-model.md`](docs/evidence-model.md) | the dependency evidence schema: relationship, version resolution, provenance, and how benchmarking reuses it |
 | [`docs/versioning.md`](docs/versioning.md) | what is pinned, what moves, and why they differ by layer |
 | [`docs/toolkit-resolution.md`](docs/toolkit-resolution.md) | how the toolkit reaches a consumer that has none of it |
 | [`docs/aws-setup.md`](docs/aws-setup.md) | OIDC, IAM, ECR — split by one-time vs per-repo |

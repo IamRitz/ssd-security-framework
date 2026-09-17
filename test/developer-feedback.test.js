@@ -704,9 +704,12 @@ describe('OSV-Scanner: derived severity and fix data are described as derived', 
     const { all } = render(gate);
     assert.match(all, /carries no CVSS v3 score\. The framework classifies it as high \(fail-closed\); this is not a severity OSV assigned/);
     assert.match(all, /aliases: CVE-2099-1/);
-    // Ecosystem-appropriate guidance: a PyPI package never gets an npm command.
-    assert.match(all, /pip install 'flask'/);
+    // A PyPI package never gets an npm command. Nothing proves how flask is
+    // declared (no manifest was analyzed), so no pip pin is offered either.
     assert.doesNotMatch(all, /npm install/);
+    assert.doesNotMatch(all, /pip install/);
+    assert.match(all, /Dependency relationship: unknown/);
+    assert.match(all, /no direct pin is suggested/);
   });
 
   it('no fixed event means no claimed fix', async () => {

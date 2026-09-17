@@ -4,6 +4,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { correlationRecord } from './correlate-findings.mjs';
+import { collectDependencyEvidenceSafely } from './dependency-evidence.mjs';
 import { detectEcosystems } from './detect-ecosystems.mjs';
 
 const VALID_ACTIONS = new Set(['BLOCK', 'BLOCK_DEPLOY', 'EXCEPTION', 'LOG']);
@@ -955,6 +956,15 @@ export async function runSecurityGate(options = {}) {
         : summary.exception > 0
           ? 'PASS-WITH-EXCEPTIONS'
           : 'PASS';
+    // Presentation evidence, gathered only AFTER the verdict is fixed and from
+    // the same parsed reports. It cannot throw (failures become `unavailable`),
+    // so it can never turn a result into a report-integrity BLOCK.
+    const dependencyEvidence = await collectDependencyEvidenceSafely({
+      repoDir: paths.repoDir,
+      pipAudit,
+      pipAuditSource: pipAudit !== null ? ecosystems.requirementsTxt : null,
+      osv
+    });
     result = {
       verdict,
       summary,
@@ -963,7 +973,11 @@ export async function runSecurityGate(options = {}) {
       findings,
       // Developer-facing grouping of `findings` (additive). `summary` above stays
       // the raw per-record count; `correlation.summary` counts unique issues.
-      correlation: correlationRecord(findings),
+      correlation: correlationRecord(findings, dependencyEvidence),
+      // Run-level dependency evidence (additive): every package version each
+      // scanner observed, and the manifests those scanners analyzed. See
+      // docs/evidence-model.md. Never read by a policy decision.
+      dependencyEvidence,
       breakGlass: breakGlassSummary(verdict, findings)
     };
   } catch (error) {

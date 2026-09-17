@@ -630,7 +630,7 @@ function correlatedCard(issue, members, memberCards, context, gate) {
       times: 1,
       text:
         `${scannerLabel(finding.source)} / \`${finding.id}\`` +
-        `${finding.installedVersion && versions.length > 1 ? ` (installed ${finding.installedVersion})` : ''}` +
+        `${finding.installedVersion && versions.length > 1 ? ` (reported at ${finding.installedVersion})` : ''}` +
         ` → **${finding.action}** (\`${finding.policyRule}\`) — ${severityDerivation(finding)}` +
         `; ${fixes.length > 0 ? `fixed in ${fixes.join(', ')}` : 'no fixed version listed'}`
     });
@@ -717,12 +717,209 @@ function correlatedCard(issue, members, memberCards, context, gate) {
   };
 }
 
+// ---- dependency evidence -----------------------------------------------------
+//
+// Every package-scoped issue carries `evidence` (dependency-evidence.mjs,
+// docs/evidence-model.md). Its facts are rendered with their provenance and the
+// remediation follows from them:
+//
+//   proven fact           stated plainly (a declaration in requirements.txt)
+//   supported inference   stated with who said it and how they derived it
+//   conflicting           every side shown; no version is presented as THE one
+//   unknown               said to be unknown
+//
+// A pin command is offered only for a proven DIRECT dependency whose version
+// evidence agrees and whose records name exactly one fixed version.
+
+const PROVENANCE_VERBS = {
+  'lockfile-resolved': 'read',
+  'environment-observed': 'observed installed',
+  'scanner-resolved': 'resolved',
+  'scanner-inferred': 'reported',
+  unknown: 'reported'
+};
+
+function observationLine(pkg, observation) {
+  if (observation.provenance === 'manifest-declared') {
+    return `\`${observation.source}\` declares \`${pkg}\` ${observation.version} (manifest-declared)`;
+  }
+  const from = observation.source ? ` from \`${observation.source}\`` : '';
+  const verb = PROVENANCE_VERBS[observation.provenance] ?? 'reported';
+  const version = observation.version ?? '(no version)';
+  const advisory =
+    observation.advisoryReported === true
+      ? 'reported this advisory'
+      : observation.advisoryReported === false
+        ? 'reported no advisory for this issue'
+        : null;
+  return `${scannerLabel(observation.scanner)} ${verb} \`${pkg}\` ${version}${from} (${observation.provenance}${advisory ? `; ${advisory}` : ''})`;
+}
+
+function relationshipNote(pkg, evidence) {
+  const { relationship, resolution } = evidence;
+  if (relationship.value === 'direct') {
+    const where = relationship.declarations
+      .map((declaration) => `\`${declaration.manifest}\` (\`${declaration.requirement}\`)`)
+      .join('; ');
+    return `Dependency relationship: direct — declared in ${where}.`;
+  }
+  if (relationship.value === 'transitive') {
+    const paths = relationship.dependencyPaths
+      .map((entry) => `\`${entry.path.join(' -> ')}\` (from ${scannerLabel(entry.scanner)})`)
+      .join('; ');
+    return `Dependency relationship: transitive — dependency path: ${paths}.`;
+  }
+  const scanners = [...new Set(resolution.observations.filter((o) => o.scanner).map((o) => scannerLabel(o.scanner)))];
+  const sources = [...new Set(resolution.observations.filter((o) => o.scanner && o.source).map((o) => `\`${o.source}\``))];
+  const who = scanners.length === 1 ? scanners[0] : 'the scanners';
+  const checked =
+    relationship.manifestsChecked.length > 0
+      ? ` \`${pkg}\` is not declared in ${relationship.manifestsChecked.map((path) => `\`${path}\``).join(', ')}; that alone does not prove it is transitive.`
+      : '';
+  return sources.length > 0
+    ? `Dependency relationship: unknown — ${who} identified \`${pkg}\` while analyzing ${sources.join(', ')}, but the available reports do not prove which direct dependency introduced it.${checked}`
+    : `Dependency relationship: unknown — the available reports do not record where \`${pkg}\` is declared or which dependency introduced it.`;
+}
+
+function resolutionNote(pkg, evidence) {
+  const { resolution } = evidence;
+  const lines = resolution.observations.map((observation) => observationLine(pkg, observation));
+  if (resolution.status === 'conflicting') {
+    const declared = resolution.observations.some((o) => o.provenance === 'manifest-declared');
+    return {
+      conflict: true,
+      text:
+        `Resolution conflict — the evidence disagrees on the effective version of \`${pkg}\`:` +
+        lines.map((line) => `\n  - ${line}`).join('') +
+        `\n  ${declared ? 'The manifest declaration and the scanner results disagree' : 'The scanners disagree'} on the effective package version. ` +
+        'Treat this finding as a dependency-resolution discrepancy until a lockfile, build artifact, or environment ' +
+        'observation establishes the version actually used.'
+    };
+  }
+  if (resolution.status === 'unknown') {
+    return { conflict: false, text: `Version: unknown — no record states which version of \`${pkg}\` is in use.` };
+  }
+  const head = `Version: \`${pkg}\` ${resolution.version} — consistent across the evidence (confidence: ${resolution.confidence})`;
+  return {
+    conflict: false,
+    text: lines.length === 1 ? `${head}: ${lines[0]}.` : `${head}:${lines.map((line) => `\n  - ${line}`).join('')}`
+  };
+}
+
+function fixProvenanceOf(members) {
+  const provenance = new Map();
+  for (const finding of members) {
+    for (const version of recordFixVersions(finding)) {
+      if (!provenance.has(version)) provenance.set(version, new Set());
+      provenance.get(version).add(scannerLabel(finding.source));
+    }
+  }
+  return provenance;
+}
+
+// What the records say about a fix, in the words each card used before.
+function fixStatement(pkg, members, fixes) {
+  if (members.length === 1) {
+    const [finding] = members;
+    const versions = [...fixes.keys()].join(', ');
+    if (finding.source === 'pip-audit') {
+      return fixes.size > 0 ? `pip-audit lists fixed version(s): ${versions}.` : 'pip-audit lists no fixed version.';
+    }
+    if (fixes.size > 0) {
+      return `OSV records a fix in version(s): ${versions}.`;
+    }
+    return finding.fixAvailable === false ? `OSV records no fixed version for \`${pkg}\`.` : `No scanner record lists a fixed version for \`${pkg}\`.`;
+  }
+  return fixes.size > 0
+    ? `The records list fixed version(s): ${[...fixes.entries()].map(([version, sources]) => `${version} (${[...sources].join(', ')})`).join('; ')}.`
+    : `No scanner record lists a fixed version for \`${pkg}\`.`;
+}
+
+export function evidenceHowToFix(issue, members) {
+  const { evidence } = issue;
+  const pkg = issue.package;
+  const fixes = fixProvenanceOf(members);
+  const parts = [fixStatement(pkg, members, fixes)];
+  const { relationship, resolution } = evidence;
+
+  if (resolution.status === 'conflicting') {
+    const owner =
+      relationship.value === 'direct'
+        ? `its declaration in ${[...new Set(relationship.declarations.map((d) => `\`${d.manifest}\``))].join(', ')}`
+        : 'the dependency or constraint that brings it in';
+    parts.push(
+      `Do not pin \`${pkg}\` from this report: the evidence disagrees on which version is in use. First establish the ` +
+        "version actually resolved — from a lockfile, the built artifact, or the installed environment, using the project's " +
+        `normal dependency management — then, if that version is affected, remediate through ${owner}.`
+    );
+  } else if (fixes.size === 0) {
+    // Nothing to upgrade to; the fix statement is the whole answer.
+  } else if (relationship.value === 'direct') {
+    const where = relationship.declarations.map((d) => `\`${d.manifest}\` (\`${d.requirement}\`)`).join('; ');
+    const example = fixes.size === 1 ? upgradeExample(issue.ecosystem, pkg, [...fixes.keys()][0]) : null;
+    parts.push(
+      `Upgrade the direct declaration in ${where} to a fixed version${example ? ` — e.g. ${example}` : ' on a release line that includes the fix'}.`
+    );
+  } else if (relationship.value === 'transitive') {
+    const parents = [...new Set(relationship.dependencyPaths.map((entry) => entry.path[0]))].map((name) => `\`${name}\``);
+    parts.push(
+      `\`${pkg}\` is a transitive dependency. Prefer updating the parent dependency ${parents.join(' or ')}, or your ` +
+        `resolution constraints, so the resolver selects a fixed \`${pkg}\`. A direct pin on a transitive package is not the default remedy.`
+    );
+  } else {
+    parts.push(
+      `The reports do not prove how \`${pkg}\` enters the dependency tree, so no direct pin is suggested. Establish the ` +
+        "version actually resolved and the dependency or constraint that introduces it — through the project's normal " +
+        'dependency management (a lockfile or the resolver\'s output) — and remediate there so the resolver selects a fixed version.'
+    );
+  }
+  return parts.join(' ');
+}
+
+function withDependencyEvidence(card, issue, members) {
+  const { evidence } = issue;
+  const pkg = issue.package;
+  const resolution = resolutionNote(pkg, evidence);
+  const malicious = members.some((finding) => finding.policyRule === 'dependencies.malicious_package');
+  const next = {
+    ...card,
+    dependencyEvidence: evidence,
+    relationshipNote: relationshipNote(pkg, evidence),
+    resolutionNote: resolution.text,
+    resolutionConflict: resolution.conflict
+  };
+  if (!malicious && issue.action !== 'EXCEPTION') {
+    next.howToFix = evidenceHowToFix(issue, members);
+  }
+  if (resolution.conflict) {
+    // No scanner-reported version is shown as THE version: each one moves out
+    // of the headline and is attributed in the conflict note.
+    const disputed = ` (effective version disputed: ${evidence.resolution.versions.join(' vs ')})`;
+    let { title, whatItMeans } = next;
+    if (card.correlated) {
+      title = `${malicious ? 'Known-malicious package ' : ''}\`${pkg}\` — ${issue.primaryId}`;
+    } else {
+      for (const version of issue.installedVersions ?? []) {
+        title = title.replaceAll(`\`${pkg}\` ${version}`, `\`${pkg}\``);
+        whatItMeans = String(whatItMeans ?? '').replaceAll(`\`${pkg}\` ${version}`, `\`${pkg}\` (reported at ${version}; disputed)`);
+      }
+    }
+    next.title = `${title}${disputed}`;
+    next.whatItMeans = whatItMeans;
+    next.fixedVersion = null;
+  }
+  return next;
+}
+
 // Issues over the raw cards. `cards[i]` is the card for `findings[i]`.
 export function buildIssues(findings, cards, context = {}, gate = null) {
-  return correlateFindings(findings).map((issue) => {
+  return correlateFindings(findings, gate?.dependencyEvidence ?? null).map((issue) => {
     const members = issue.findings.map((index) => findings[index]);
     const memberCards = issue.findings.map((index) => cards[index]);
-    const card = memberCards.length === 1 ? memberCards[0] : correlatedCard(issue, members, memberCards, context, gate);
+    let card = memberCards.length === 1 ? memberCards[0] : correlatedCard(issue, members, memberCards, context, gate);
+    if (issue.evidence) {
+      card = withDependencyEvidence(card, issue, members);
+    }
     return { ...issue, card, cards: memberCards };
   });
 }
@@ -979,6 +1176,12 @@ function renderCardMarkdown(card) {
   }
   if (Array.isArray(card.advisoryIds) && card.advisoryIds.length > 0) {
     facts.push(`🏷️ Advisory IDs: ${list(card.advisoryIds)}`);
+  }
+  if (card.relationshipNote) {
+    facts.push(`🧬 ${card.relationshipNote}`);
+  }
+  if (card.resolutionNote) {
+    facts.push(`${card.resolutionConflict ? '⚖️' : '📌'} ${card.resolutionNote}`);
   }
   if (Array.isArray(card.observedBy) && card.observedBy.length > 0) {
     facts.push(`🔎 Observed by:${card.observedBy.map((line) => `\n  - ${line}`).join('')}`);
