@@ -269,6 +269,52 @@ Interchange formats such as SARIF 2.1.0 (static analysis) or CycloneDX
 vulnerability/VEX (component vulnerabilities) could be exported from these objects
 later. They are not implemented, and the internal model is not shaped to match them.
 
+### Image gates: remediation-first, bounded
+
+Image gate results (`image-gate.json`, `image-gate-prepush.json`; verdicts
+`DEPLOY`, `DEPLOY-WITH-EXCEPTIONS`, `BLOCK_DEPLOY`) use their own presentation,
+because one base image routinely yields hundreds of records that repeat a few
+package upgrades. The layers, each complete for its audience:
+
+| Layer | Content | Bounded? |
+| --- | --- | --- |
+| raw scanner report (`trivy-image.json`, the registry response) | what the scanner said | no |
+| `image-gate*.json` | every normalized finding, `summary`, `verdict`, `integrity` | no; **format unchanged** |
+| `image-gate*-evidence.md` | every remediation group with every advisory id, then every finding's full card (LOG included) | no |
+| job summary / PR comment / Slack / console | what blocks, and what to change first | **yes, on purpose** |
+
+**Remediation groups** (`groupImageFindings` in `format-findings.mjs`) are
+presentation only. Findings share a group only when their recorded evidence is
+identical: scanner, policy action, package, installed version, fixed version
+and target (Trivy), or the single affected package of an Amazon Inspector
+finding. A finding with less evidence than package + installed version, a
+fix-available finding with no fixed version, or an Inspector finding covering
+several packages is its own group. The fixed version shown is the one the
+scanner lists; no install command or base-image claim is generated. Groups
+never feed the verdict, counts, routing or the gate JSON.
+
+What each verdict shows by default:
+
+| Verdict | Shown in full | Summarized as counts |
+| --- | --- | --- |
+| any, with an integrity failure | the integrity failure card(s) | — |
+| `BLOCK_DEPLOY` | image secrets (up to 20), then up to 10 blocking remediation groups, Critical first, each listing up to 6 advisory ids | exceptions (findings, distinct advisories, packages, severities); logged findings |
+| `DEPLOY-WITH-EXCEPTIONS` | up to 10 exception groups | logged findings |
+| `DEPLOY` | — | logged findings |
+
+Ordering is deterministic: groups by highest severity, then number of
+findings, then package / installed / fixed / target, then first appearance;
+advisories within a group by severity, then id. Image secrets are shown before,
+and never counted against, the blocking-group limit. Every omission states its
+exact group and finding count, with a per-severity breakdown, and points to the
+evidence document. Limits are `IMAGE_SUMMARY_LIMITS`.
+
+The gate's console output (`image-gate.mjs`) follows the same rule: verdict,
+the recorded `summary` counts, every integrity failure and every image secret,
+at most 5 other blocking findings (Critical first) with the exact number not
+shown, and the path of the JSON result. EXCEPTION and LOG findings are never
+printed one by one.
+
 ## Scanner execution evidence
 
 A scanner has three separate states, and they are never merged:

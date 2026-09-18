@@ -387,6 +387,9 @@ async function main() {
   const context = {
     evidenceFile: basename(options.gate),
     evidenceMarkdownFile: basename(evidencePath),
+    // The raw scanner report behind this gate result, when the workflow names
+    // one (image gates). Only its file name is shown.
+    rawReportFile: env.SECURITY_RAW_REPORT ? basename(env.SECURITY_RAW_REPORT) : null,
     // Each scanner job's own result (source workflow only), for scan health.
     jobResults: {
       'secret-scan': env.SECRET_SCAN_JOB_RESULT,

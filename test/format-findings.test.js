@@ -288,7 +288,8 @@ describe('format-findings: every verdict renders distinctly', () => {
       const report = buildReport({ gate, context: CONTEXT });
       assert.equal(report.verdictLabel, expectedLabel);
       const md = renderMarkdown(report);
-      assert.match(md, new RegExp(`Security gate: ${expectedLabel.replace(/[-]/g, '\\-')}`));
+      // Image verdicts are headed "Image gate", source verdicts "Security gate".
+      assert.match(md, new RegExp(`(Security|Image) gate: ${expectedLabel.replace(/[-]/g, '\\-')}`));
       labels.add(report.verdictLabel);
     });
   }
@@ -610,7 +611,7 @@ describe('dispatch: a clean DEPLOY posts no new PR comment but still writes the 
     assert.equal(performed.summary, true); // summary still written
     assert.equal(performed.slack, false); // clean -> no ping
     assert.ok(!calls.some((c) => c.method === 'POST'));
-    assert.match(appended[0], /Security gate: DEPLOY/);
+    assert.match(appended[0], /Image gate: DEPLOY/);
   });
 });
 
@@ -626,6 +627,7 @@ describe('format-findings: repo-scale finding count renders readably', () => {
         source: 'trivy',
         id: `CVE-2099-1${String(i).padStart(3, '0')}`,
         package: `pkg-block-${i}`,
+        installedVersion: '1.2.2',
         severity: i % 2 ? 'critical' : 'high',
         fixAvailable: true,
         fixedVersion: '1.2.3',
@@ -649,18 +651,18 @@ describe('format-findings: repo-scale finding count renders readably', () => {
     return { verdict: 'BLOCK_DEPLOY', findings };
   }
 
-  it('keeps every blocking finding visible and bounds the logged ones, stating the omission', () => {
+  it('bounds the blocking remediation, collapses the logged ones to a count, stating every omission', () => {
     const report = buildReport({ gate: scaleGate(), context: CONTEXT });
     assert.deepEqual(report.counts, { block: 12, exception: 0, log: 26, integrity: 0 });
     const md = renderMarkdown(report);
-    // All 12 blocking issues have a table row AND collapsible full evidence.
-    assert.equal((md.match(/^\| ⛔ BLOCK \|/gm) ?? []).length, 12);
-    assert.equal((md.match(/<details><summary>⛔ BLOCK/g) ?? []).length, 12);
-    // The 26 logged findings are INFO rows, capped at 20, with the exact
-    // omission stated — never a full card each.
-    assert.equal((md.match(/^\| ℹ️ INFO \|/gm) ?? []).length, 20);
-    assert.match(md, /Showing 32 of 38 issues; 6 table rows not shown \(6 INFO\)/);
-    assert.doesNotMatch(md, /<summary>ℹ️ INFO/);
+    // 12 distinct packages -> 12 remediation groups, 10 shown, the rest counted exactly.
+    assert.match(md, /### ⛔ Blocking — fix these first \(12 remediation groups · 12 findings\)/);
+    assert.equal((md.match(/^- \*\*(Critical|High)\*\* · image package/gm) ?? []).length, 10);
+    assert.match(md, /_2 more blocking remediation groups not shown here \(2 findings: 2 high\)/);
+    // The 26 logged findings are a count, never rows or cards.
+    assert.match(md, /ℹ️ \*\*26\*\* logged findings \(26 distinct advisories; 26 medium\) are informational/);
+    assert.doesNotMatch(md, /CVE-2099-2\d{3}/);
+    assert.doesNotMatch(md, /<details/);
     // Slack stays concise: at most 5 highlighted blocking findings + a "more" note.
     const slack = renderSlack(report);
     assert.match(slackText(slack), /and 7 more/);

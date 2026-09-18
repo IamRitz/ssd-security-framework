@@ -218,6 +218,8 @@ jobs:
           # The tarball Trivy scanned, for an accurate reproduce command. Image
           # gates have no break-glass, so no BREAK_GLASS_* state is passed.
           SSD_IMAGE_TARBALL: ${{ inputs.image_tarball }}
+          # Named in the bounded summary as the raw scanner evidence (uploaded below).
+          SECURITY_RAW_REPORT: reports/trivy-image.json
         run: node "$SSD_TOOLKIT/scripts/notify.mjs" --gate reports/image-gate-prepush.json
 
       - name: Flag an untrusted image scan (blocks baseline generation)

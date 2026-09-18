@@ -483,6 +483,15 @@ policy. `security-gate.json` stays complete, and `security-gate-evidence.md`
 the image gates) holds every issue's full card. Details:
 [evidence-model.md § Presentation](evidence-model.md#presentation-a-triage-view-over-this-model).
 
+Image gates present by remediation instead: integrity failures and image
+secrets first, then blocking package upgrades grouped only on identical
+scanner evidence, with exceptions and logged findings as counts during a
+`BLOCK_DEPLOY`. The console, summary, PR comment and Slack are bounded by
+design; the image gate JSON (unchanged), the evidence document and the raw
+scanner report stay complete. The pre-push notifier names the raw report via
+`SECURITY_RAW_REPORT` (a step environment variable, not a workflow input).
+Details: [evidence-model.md § Image gates](evidence-model.md#image-gates-remediation-first-bounded).
+
 ### Reproduce commands match what the run scanned with
 
 With no `reproduce_commands` override, the command is built from this run's own

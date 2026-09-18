@@ -1432,6 +1432,10 @@ export function buildReport({ gate, context = {}, mode = 'enforce', breakGlass }
   const scanHealth = deriveScanHealth(gate, context.jobResults ?? null);
   const gateStatus = assessGate({ verdict, verdictLabel: meta.label, counts, scanHealth });
 
+  // Image gates (the only producers of DEPLOY / DEPLOY-WITH-EXCEPTIONS /
+  // BLOCK_DEPLOY) get a remediation-grouped view; source gates are unchanged.
+  const image = IMAGE_VERDICTS.has(verdict) ? buildImagePresentation(gate, findings, cards) : null;
+
   let blurb = meta.blurb;
   if (gateStatus.kind === 'scan') {
     blurb =
@@ -1460,6 +1464,7 @@ export function buildReport({ gate, context = {}, mode = 'enforce', breakGlass }
     orderedIssues: ordered,
     dispositionCounts,
     scanHealth,
+    image,
     isBreakGlassEligible,
     breakGlass: breakGlassState,
     breakGlassNotice: breakGlassNotice(breakGlassState),
@@ -1828,6 +1833,9 @@ function renderFooter(report) {
 }
 
 export function renderMarkdown(report, { includeMarker = false } = {}) {
+  if (report.image) {
+    return renderImageMarkdown(report, { includeMarker });
+  }
   const head = [];
   if (includeMarker) {
     head.push(PR_COMMENT_MARKER);
@@ -1884,10 +1892,14 @@ export function renderMarkdown(report, { includeMarker = false } = {}) {
 // the triage summary can stay small without any per-issue explanation becoming
 // unavailable. It renders the SAME cards the summary's details use.
 export function renderEvidenceMarkdown(report) {
-  const blocks = [`# Security gate evidence: ${report.headline ?? report.verdictLabel}`, `_${report.blurb}_`];
+  const gateName = report.image ? 'Image gate' : 'Security gate';
+  const blocks = [`# ${gateName} evidence: ${report.headline ?? report.verdictLabel}`, `_${report.blurb}_`];
   const ctx = contextLine(report.context);
   if (ctx) blocks.push(ctx);
-  blocks.push(...renderScanHealth(report), ...renderScanProblem(report), countsLine(report));
+  blocks.push(...renderScanHealth(report), ...renderScanProblem(report), report.image ? imageCountsLine(report) : countsLine(report));
+  if (report.image) {
+    blocks.push(...imageScanLine(report), ...renderImageGroupIndex(report));
+  }
   const integrity = (report.issues ?? []).map((issue) => issue.card).filter((card) => card.isIntegrity);
   for (const card of integrity) {
     blocks.push(`## 🚨 Scan integrity failure\n\n${renderCardMarkdown(withExecutionNote(card, report))}`);
@@ -1906,6 +1918,406 @@ export function renderEvidenceMarkdown(report) {
   return `${blocks.join('\n\n')}\n`;
 }
 
+// ---- image gate presentation ---------------------------------------------------
+//
+// An image scan reports hundreds of records for one base image, most repeating
+// the same few package upgrades. The developer surface for an image gate is
+// therefore organized by REMEDIATION, not by record:
+//
+//   raw scanner report  ->  image-gate*.json (complete normalized findings)
+//                       ->  image-gate*-evidence.md (every card, every group)
+//                       ->  bounded summary / PR comment / Slack (this section)
+//
+// PRESENTATION ONLY. Grouping reads the normalized findings and writes nothing
+// back: the verdict, `summary`, `findings` and every policy action are the
+// gate's. A group holds findings whose recorded remediation evidence is
+// IDENTICAL — scanner, policy action, package, installed version, fixed version
+// and target. A finding that records less than package + installed version (or
+// a fix-available finding with no fixed version) is never merged: it stands
+// alone and is shown with its own card title. No upgrade command is invented;
+// the fixed version shown is the one the scanner lists.
+//
+// Disclosure by verdict:
+//   BLOCK_DEPLOY            integrity failures and image secrets in full, then
+//                           blocking remediation groups (bounded, Critical
+//                           first); exceptions and logged findings as counts
+//   DEPLOY-WITH-EXCEPTIONS  exception groups (bounded); logged as counts
+//   DEPLOY                  logged as counts
+// Every omission states its exact group and finding count.
+
+const IMAGE_VERDICTS = new Set(['DEPLOY', 'DEPLOY-WITH-EXCEPTIONS', 'BLOCK_DEPLOY']);
+
+// EXCEPTION_FIX, stated once for a list of groups.
+const IMAGE_EXCEPTIONS_FIX =
+  'No fix is available according to the scanner data, so policy records these Critical/High findings as tracked ' +
+  'EXCEPTIONs instead of blocks. They are reported on every run, and each will block once a fix becomes available.';
+
+export const IMAGE_SUMMARY_LIMITS = {
+  secrets: 20,
+  blockingGroups: 10,
+  exceptionGroups: 10,
+  advisoriesPerGroup: 6,
+  textCharacters: 120
+};
+
+const IMAGE_SCANNER_LABELS = { trivy: 'Trivy', 'ecr-enhanced-scan': 'Amazon Inspector', 'ecr-image-scan': 'ECR basic scanning' };
+
+const nonEmpty = (value) => typeof value === 'string' && value !== '';
+const severityRank = (severity) => SEVERITY_RANK[String(severity ?? 'unknown').toLowerCase()] ?? 9;
+const compareText = (a, b) => String(a ?? '').localeCompare(String(b ?? ''));
+
+// The remediation facts one image finding records, or null when it records too
+// few for it to be grouped safely with anything else.
+export function imageRemediationEvidence(finding) {
+  let evidence = null;
+  if (finding?.source === 'trivy' && finding.policyRule !== 'image.secret') {
+    if (nonEmpty(finding.package) && nonEmpty(finding.installedVersion)) {
+      evidence = {
+        package: finding.package,
+        installedVersion: finding.installedVersion,
+        fixedVersion: nonEmpty(finding.fixedVersion) ? finding.fixedVersion : null,
+        target: nonEmpty(finding.target) ? finding.target : null
+      };
+    }
+  } else if (finding?.source === 'ecr-enhanced-scan') {
+    // Only a single-package finding: with several packages there is no one
+    // upgrade to share.
+    const packages = Array.isArray(finding.packages) ? finding.packages : [];
+    if (packages.length === 1 && nonEmpty(packages[0]?.name) && nonEmpty(packages[0]?.version)) {
+      evidence = {
+        package: packages[0].name,
+        installedVersion: packages[0].version,
+        fixedVersion: nonEmpty(packages[0].fixedInVersion) ? packages[0].fixedInVersion : null,
+        target: null
+      };
+    }
+  }
+  if (evidence && finding.fixAvailable === true && evidence.fixedVersion === null) {
+    return null;
+  }
+  return evidence;
+}
+
+function severityBreakdown(findings) {
+  const counts = new Map();
+  for (const finding of findings) {
+    const severity = String(finding.severity ?? 'unknown').toLowerCase();
+    counts.set(severity, (counts.get(severity) ?? 0) + 1);
+  }
+  return [...counts.entries()]
+    .sort((a, b) => severityRank(a[0]) - severityRank(b[0]))
+    .map(([severity, count]) => `${count} ${severity}`)
+    .join(', ');
+}
+
+// Groups `indexes` (into `findings`) by identical remediation evidence.
+// Deterministic: groups by highest severity, then size, then package /
+// installed / fixed / target, then first appearance; advisories inside a group
+// by severity, then id.
+export function groupImageFindings(findings, indexes) {
+  const groups = new Map();
+  for (const index of indexes) {
+    const finding = findings[index];
+    const evidence = imageRemediationEvidence(finding);
+    const key = evidence
+      ? JSON.stringify([finding.source, finding.action, evidence.package, evidence.installedVersion, evidence.fixedVersion, evidence.target])
+      : `finding:${index}`;
+    if (!groups.has(key)) {
+      groups.set(key, { key, source: finding.source, action: finding.action, evidence, findings: [] });
+    }
+    groups.get(key).findings.push(index);
+  }
+  return [...groups.values()]
+    .map((group) => {
+      const ordered = [...group.findings].sort(
+        (a, b) => severityRank(findings[a].severity) - severityRank(findings[b].severity) || compareText(findings[a].id, findings[b].id) || a - b
+      );
+      const members = ordered.map((index) => findings[index]);
+      return {
+        ...group,
+        findings: ordered,
+        firstIndex: Math.min(...group.findings),
+        severity: String(members[0].severity ?? 'unknown').toLowerCase(),
+        severityBreakdown: severityBreakdown(members),
+        mixedSeverity: new Set(members.map((finding) => finding.severity)).size > 1,
+        advisories: uniqueStrings(members.map((finding) => finding.id)),
+        scanner: IMAGE_SCANNER_LABELS[group.source] ?? group.source
+      };
+    })
+    .sort(
+      (a, b) =>
+        severityRank(a.severity) - severityRank(b.severity) ||
+        b.findings.length - a.findings.length ||
+        compareText(a.evidence?.package, b.evidence?.package) ||
+        compareText(a.evidence?.installedVersion, b.evidence?.installedVersion) ||
+        compareText(a.evidence?.fixedVersion, b.evidence?.fixedVersion) ||
+        compareText(a.evidence?.target, b.evidence?.target) ||
+        a.firstIndex - b.firstIndex
+    );
+}
+
+function imageStats(findings, groups) {
+  const indexes = groups.flatMap((group) => group.findings);
+  const members = indexes.map((index) => findings[index]);
+  return {
+    findings: indexes.length,
+    groups: groups.length,
+    advisories: uniqueStrings(members.map((finding) => finding.id)).length,
+    packages: uniqueStrings(members.map((finding) => imageRemediationEvidence(finding)?.package ?? finding.package)).length,
+    severities: severityBreakdown(members)
+  };
+}
+
+function buildImagePresentation(gate, findings, cards) {
+  const where = (predicate) => findings.map((_, index) => index).filter((index) => predicate(findings[index], cards[index]));
+  const isBlocking = (finding) => finding.action === 'BLOCK_DEPLOY' || finding.action === 'BLOCK';
+  const secrets = where((finding, card) => finding.policyRule === 'image.secret' && !card.isIntegrity);
+  const blocking = groupImageFindings(
+    findings,
+    where((finding, card) => isBlocking(finding) && !card.isIntegrity && finding.policyRule !== 'image.secret')
+  );
+  const exceptions = groupImageFindings(findings, where((finding) => finding.action === 'EXCEPTION'));
+  const logged = groupImageFindings(findings, where((finding) => finding.action === 'LOG'));
+  const sources = uniqueStrings(findings.map((finding) => finding.source)).filter((source) => IMAGE_SCANNER_LABELS[source]);
+  return {
+    findings,
+    scanner: sources.length > 0 ? sources.map((source) => IMAGE_SCANNER_LABELS[source]).join(' + ') : gate?.image?.imageId ? 'Trivy' : null,
+    trusted: typeof gate?.integrity?.trusted === 'boolean' ? gate.integrity.trusted : null,
+    identity: gate?.image ?? null,
+    secrets,
+    blocking,
+    exceptions,
+    logged,
+    stats: {
+      blocking: imageStats(findings, blocking),
+      exception: imageStats(findings, exceptions),
+      logged: imageStats(findings, logged)
+    }
+  };
+}
+
+function clip(text, limit = IMAGE_SUMMARY_LIMITS.textCharacters) {
+  const value = String(text ?? '').replace(/\s+/g, ' ').trim();
+  return value.length > limit ? `${value.slice(0, limit - 1)}…` : value;
+}
+
+const codeSpan = (text, limit) => `\`${clip(text, limit).replace(/`/g, "'")}\``;
+const plural = (count, noun, nouns = `${noun}s`) => `${count} ${count === 1 ? noun : nouns}`;
+
+function advisoryList(group, limit) {
+  const shown = group.advisories.slice(0, limit);
+  const more = group.advisories.length - shown.length;
+  return `${shown.map((id) => codeSpan(id)).join(', ')}${more > 0 ? ` and ${more} more` : ''}`;
+}
+
+// One line per group. `limit` bounds the advisory ids listed (Infinity in the
+// evidence document).
+function imageGroupLine(group, report, { limit = IMAGE_SUMMARY_LIMITS.advisoriesPerGroup } = {}) {
+  const { findings } = report.image;
+  const severity = `**${titleCase(group.severity)}**`;
+  const ev = group.evidence;
+  if (!ev) {
+    return `- ${severity} · ${clip(report.cards[group.findings[0]].title, 300)}`;
+  }
+  const count = group.advisories.length;
+  const breakdown = group.mixedSeverity ? ` (${group.severityBreakdown})` : '';
+  const only = group.findings.length === 1 ? findings[group.findings[0]] : null;
+  const title = only && nonEmpty(only.title) ? ` — ${clip(only.title, 100)}` : '';
+  const target = ev.target ? ` · in ${codeSpan(ev.target)}` : '';
+  const pkg = `image package ${codeSpan(ev.package)} ${codeSpan(ev.installedVersion)}`;
+  const ids = `${advisoryList(group, limit)}${title}`;
+  return ev.fixedVersion
+    ? `- ${severity} · ${pkg} → **${codeSpan(ev.fixedVersion)}** — ${group.scanner} lists this fixed version for ${plural(count, 'advisory', 'advisories')}${breakdown}: ${ids}${target}`
+    : `- ${severity} · ${pkg} — no fixed version reported by ${group.scanner} · ${plural(count, 'advisory', 'advisories')}${breakdown}: ${ids}${target}`;
+}
+
+function evidencePointer(report) {
+  const markdown = report.context?.evidenceMarkdownFile;
+  return markdown ? `\`${markdown}\`` : `\`${evidenceFile(report)}\``;
+}
+
+function omittedGroupsNote(report, groups, shownCount, noun) {
+  const omitted = groups.slice(shownCount);
+  if (omitted.length === 0) return null;
+  const members = omitted.flatMap((group) => group.findings).map((index) => report.image.findings[index]);
+  return (
+    `_${plural(omitted.length, `more ${noun} group`)} not shown here (${plural(members.length, 'finding')}: ` +
+    `${severityBreakdown(members)}). Every group and finding is in ${evidencePointer(report)}._`
+  );
+}
+
+function renderImageSecrets(report) {
+  const { secrets } = report.image;
+  if (secrets.length === 0) return [];
+  const cards = secrets.map((index) => report.cards[index]);
+  const shown = cards.slice(0, IMAGE_SUMMARY_LIMITS.secrets);
+  const lines = [
+    `### 🔑 Secrets in image layers (${cards.length}) — blocking, no break-glass`,
+    '',
+    ...shown.map((card) => `- **${clip(card.title, 300)}**${card.target ? ` · in ${codeSpan(card.target)}` : ''}`)
+  ];
+  if (cards.length > shown.length) {
+    lines.push('', `_${plural(cards.length - shown.length, 'more secret finding')} not shown here; every one is in ${evidencePointer(report)}._`);
+  }
+  lines.push('', `🔎 ${cards[0].evidenceNote}`, `🔧 ${cards[0].howToFix}`);
+  return [lines.join('\n')];
+}
+
+function reproduceLine(report, groups) {
+  const commands = uniqueStrings(groups.flatMap((group) => group.findings.map((index) => report.cards[index].reproduce)));
+  return commands.length > 0 ? `🔁 Reproduce locally: ${commands.slice(0, 2).map((command) => `\`${command}\``).join(' · ')}` : null;
+}
+
+function renderImageBlocking(report) {
+  const { blocking, stats } = report.image;
+  if (blocking.length === 0) return [];
+  const shown = blocking.slice(0, IMAGE_SUMMARY_LIMITS.blockingGroups);
+  const lines = [
+    `### ⛔ Blocking — fix these first (${plural(stats.blocking.groups, 'remediation group')} · ${plural(stats.blocking.findings, 'finding')})`,
+    '',
+    '_Findings are grouped only when the scanner records the same package, installed version, fixed version and target; a finding without that evidence is its own group._',
+    '',
+    ...shown.map((group) => imageGroupLine(group, report))
+  ];
+  const omitted = omittedGroupsNote(report, blocking, shown.length, 'blocking remediation');
+  if (omitted) lines.push('', omitted);
+  const hints = [];
+  if (shown.some((group) => group.evidence?.fixedVersion)) {
+    hints.push('Upgrade each package to the fixed version shown, or move to a base image that ships it, then rebuild the image.');
+  }
+  // A standalone finding's own remediation, each distinct text once.
+  hints.push(...uniqueStrings(shown.filter((group) => !group.evidence).map((group) => report.cards[group.findings[0]].howToFix)).map((text) => clip(text, 400)));
+  lines.push('', ...hints.map((hint) => `🔧 ${hint}`));
+  const reproduce = reproduceLine(report, shown);
+  if (reproduce) lines.push(reproduce);
+  return [lines.join('\n')];
+}
+
+function renderImageExceptions(report) {
+  const { exceptions, stats } = report.image;
+  if (exceptions.length === 0) return [];
+  const shown = exceptions.slice(0, IMAGE_SUMMARY_LIMITS.exceptionGroups);
+  const lines = [
+    `### ⚠️ Tracked exceptions — no fix available (${plural(stats.exception.groups, 'group')} · ${plural(stats.exception.findings, 'finding')})`,
+    '',
+    ...shown.map((group) => imageGroupLine(group, report))
+  ];
+  const omitted = omittedGroupsNote(report, exceptions, shown.length, 'exception');
+  if (omitted) lines.push('', omitted);
+  lines.push('', `ℹ️ ${IMAGE_EXCEPTIONS_FIX}`);
+  return [lines.join('\n')];
+}
+
+function exceptionCountLine(report) {
+  const { exception } = report.image.stats;
+  if (exception.findings === 0) return null;
+  return (
+    `⚠️ **${exception.findings}** exception ${exception.findings === 1 ? 'finding' : 'findings'} ` +
+    `(${plural(exception.advisories, 'distinct advisory', 'distinct advisories')} in ${plural(exception.packages, 'package')}; ${exception.severities}) ` +
+    'have no fix available according to the scanner, so policy tracks them as EXCEPTIONs; they do not block deploy. ' +
+    `Listed in ${evidencePointer(report)}.`
+  );
+}
+
+function loggedCountLine(report) {
+  const { logged } = report.image.stats;
+  if (logged.findings === 0) return null;
+  return (
+    `ℹ️ **${logged.findings}** logged ${logged.findings === 1 ? 'finding' : 'findings'} ` +
+    `(${plural(logged.advisories, 'distinct advisory', 'distinct advisories')}; ${logged.severities}) ` +
+    `are informational (LOG) and do not block deploy. Listed in ${evidencePointer(report)}.`
+  );
+}
+
+// The gate's raw per-record counts (image findings are never correlated), with
+// integrity failures counted on their own.
+function imageCountsLine(report) {
+  const { block, exception, log, integrity } = report.counts;
+  const bits = [`**${block}** blocking`, `**${exception}** exception`, `**${log}** logged ${block + exception + log === 1 ? 'finding' : 'findings'}`];
+  if (integrity > 0) bits.push(`**${integrity}** integrity failure${integrity === 1 ? '' : 's'}`);
+  return bits.join(' · ');
+}
+
+function imageScanLine(report) {
+  const { scanner, trusted, identity } = report.image;
+  const bits = [];
+  if (trusted === true) {
+    bits.push(`Scan integrity: trusted — the gate interpreted the ${scanner ?? 'image scan'} report.`);
+  }
+  if (identity?.imageId) {
+    const os = [identity.os?.family, identity.os?.name].filter(nonEmpty).join(' ');
+    bits.push(`Scanned image \`${identity.imageId}\`${os ? ` (${os})` : ''}.`);
+  } else if (identity?.imageDigest) {
+    bits.push(`Scanned image \`${identity.repository ?? '?'}@${identity.imageDigest}\`.`);
+  }
+  return bits.length > 0 ? [bits.join(' ')] : [];
+}
+
+function renderImageFooter(report) {
+  const raw = report.context?.rawReportFile;
+  const markdown = report.context?.evidenceMarkdownFile;
+  const notes = [
+    'This summary is bounded on purpose: what blocks, and what to change first. Grouping is presentation only and never changes the verdict, the counts, or any finding.',
+    `Full evidence: ${markdown ? `\`${markdown}\` (every finding's explanation and every remediation group) and ` : ''}` +
+      `\`${evidenceFile(report)}\` (complete normalized findings)${raw ? `; raw scanner report: \`${raw}\`` : ''} — in this run's artifacts` +
+      `${report.context?.runUrl ? ` ([run](${report.context.runUrl}))` : ''}.`
+  ];
+  return [`---\n${notes.map((note) => `<sub>${note}</sub>`).join('<br>\n')}`];
+}
+
+function renderImageMarkdown(report, { includeMarker = false } = {}) {
+  const blocks = [];
+  if (includeMarker) {
+    blocks.push(PR_COMMENT_MARKER);
+  }
+  blocks.push(`## ${report.emoji} Image gate: ${report.headline ?? report.verdictLabel}`, `_${report.blurb}_`);
+  const ctx = contextLine(report.context);
+  if (ctx) blocks.push(ctx);
+  blocks.push(...imageScanLine(report), ...renderScanProblem(report), imageCountsLine(report));
+  if (report.mode === 'log-only') {
+    blocks.push(
+      isBlockingVerdict(report.verdict)
+        ? '> ℹ️ This repository runs in **log-only** mode: the blocking verdict above is reported but NOT enforced, and no Slack alert is sent.'
+        : `> ℹ️ This repository runs in **log-only** mode. The verdict is ${report.verdictLabel}, so there is no blocking verdict to suppress.`
+    );
+  }
+  blocks.push(...renderIntegrity(report), ...renderImageSecrets(report), ...renderImageBlocking(report));
+  if (report.verdict === 'BLOCK_DEPLOY') {
+    // Exceptions do not compete with blockers: a count and a pointer.
+    blocks.push(exceptionCountLine(report));
+  } else {
+    blocks.push(...renderImageExceptions(report));
+  }
+  blocks.push(loggedCountLine(report));
+  if (report.cards.length === 0) {
+    blocks.push('No findings. 🎉');
+  }
+  blocks.push(...renderImageFooter(report));
+  return `${blocks.filter(Boolean).join('\n\n')}\n`;
+}
+
+// The evidence document's unbounded index: every group with every advisory.
+function renderImageGroupIndex(report) {
+  const blocks = [];
+  const { secrets, blocking, exceptions, logged } = report.image;
+  const section = (heading, groups) => {
+    if (groups.length === 0) return;
+    blocks.push(`## ${heading} (${plural(groups.length, 'group')})\n\n${groups.map((group) => imageGroupLine(group, report, { limit: Infinity })).join('\n')}`);
+  };
+  if (secrets.length > 0) {
+    blocks.push(
+      `## 🔑 Secrets in image layers (${secrets.length})\n\n${secrets.map((index) => `- ${report.cards[index].title}${report.cards[index].target ? ` · in \`${report.cards[index].target}\`` : ''}`).join('\n')}`
+    );
+  }
+  section('⛔ Blocking remediation groups', blocking);
+  section('⚠️ Exception groups — no fix available', exceptions);
+  section('ℹ️ Logged groups', logged);
+  if (blocks.length > 0) {
+    blocks.push('Every finding\'s full explanation follows, in priority order.');
+  }
+  return blocks;
+}
+
 // ---- Slack Block Kit renderer (concise: what/where/how many + link) ---------
 
 // Slack mrkdwn has no **bold** and renders `code` the same way markdown does.
@@ -1918,9 +2330,18 @@ function slackCardLine(card) {
   return `• *${card.title}*${loc ? `\n   ${loc}` : ''}`;
 }
 
+function slackGroupLine(group, report) {
+  if (!group.evidence) {
+    return slackCardLine(report.cards[group.findings[0]]);
+  }
+  const { package: pkg, installedVersion, fixedVersion } = group.evidence;
+  const fix = fixedVersion ? ` → ${clip(fixedVersion)}` : '';
+  return `• *${titleCase(group.severity)}* · \`${clip(pkg)}\` ${clip(installedVersion)}${fix} · ${plural(group.advisories.length, 'advisory', 'advisories')}`;
+}
+
 export function renderSlack(report, { detailUrl } = {}) {
   const counts = report.issueCounts ?? report.counts;
-  const headline = `${report.emoji} Security gate: ${report.headline ?? report.verdictLabel}`;
+  const headline = `${report.emoji} ${report.image ? 'Image' : 'Security'} gate: ${report.headline ?? report.verdictLabel}`;
   const fields = [
     { type: 'mrkdwn', text: `*Blocking*\n${counts.block}` },
     { type: 'mrkdwn', text: `*Exceptions*\n${counts.exception}` },
@@ -1963,15 +2384,22 @@ export function renderSlack(report, { detailUrl } = {}) {
   // Concise: integrity failures and BLOCK issues only, in the same priority
   // order as every other surface; full detail lives in the PR comment / job
   // summary, which is linked below.
-  const actionable = Array.isArray(report.orderedIssues)
+  // An image gate highlights secrets, then remediation groups, never per-CVE records.
+  const actionable = report.image
+    ? [
+        ...report.issues.map((issue) => issue.card).filter((card) => card.isIntegrity).map(slackCardLine),
+        ...report.image.secrets.map((index) => slackCardLine(report.cards[index])),
+        ...report.image.blocking.map((group) => slackGroupLine(group, report))
+      ]
+    : Array.isArray(report.orderedIssues)
     ? [
         ...report.issues.map((issue) => issue.card).filter((card) => card.isIntegrity),
         ...report.orderedIssues.filter((issue) => issue.presentation.disposition === 'BLOCK').map((issue) => issue.card)
-      ]
-    : sortCards(report.cards.filter((c) => c.action === 'BLOCK' || c.action === 'BLOCK_DEPLOY' || c.isIntegrity));
+      ].map(slackCardLine)
+    : sortCards(report.cards.filter((c) => c.action === 'BLOCK' || c.action === 'BLOCK_DEPLOY' || c.isIntegrity)).map(slackCardLine);
   const highlights = actionable.slice(0, 5);
   if (highlights.length > 0) {
-    const shown = highlights.map(slackCardLine).join('\n');
+    const shown = highlights.join('\n');
     const remaining = actionable.length - highlights.length;
     const more = remaining > 0 ? `\n_…and ${remaining} more — see full detail._` : '';
     blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `${shown}${more}` } });
