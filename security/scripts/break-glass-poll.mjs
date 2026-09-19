@@ -74,29 +74,69 @@ export async function pollBreakGlass({
   };
 }
 
-async function main() {
-  const requestPath = process.argv[2] || 'reports/break-glass-request.json';
-  const outputPath = process.argv[3] || 'reports/break-glass-decision.json';
+// The one human-readable line the poll step logs, per outcome. Terminal states
+// and failures stay distinct: only `denied` is a denial. A timeout, an expiry,
+// or an exception (transport, broker rejection, malformed or mismatched
+// response, unreadable request) is NOT a decision by anyone. The machine-readable
+// status is break-glass-result.mjs's, derived from the decision file; this line
+// is for the person reading the log.
+export function describePollOutcome({ result = null, error = null } = {}) {
+  if (error) {
+    return { approved: false, line: `BREAK-GLASS: ERROR (${error.message ?? String(error)}) — no verified decision was obtained; the BLOCK stands` };
+  }
+  const requestId = result?.requestId ?? 'unknown';
+  switch (result?.status) {
+    case 'approved':
+      return { approved: true, line: `BREAK-GLASS: APPROVED by verified approver ${result.approver?.username}` };
+    case 'denied':
+      return { approved: false, line: `BREAK-GLASS: DENIED (request ${requestId} was denied by an approver) — the BLOCK stands` };
+    case 'expired':
+      return { approved: false, line: `BREAK-GLASS: EXPIRED (request ${requestId} expired at the broker without a decision) — the BLOCK stands` };
+    case 'timeout':
+      return { approved: false, line: `BREAK-GLASS: TIMEOUT (no authorized decision for request ${requestId} before the CI timeout) — the BLOCK stands` };
+    default:
+      return { approved: false, line: `BREAK-GLASS: ERROR (request ${requestId} ended with unrecognized status '${result?.status}') — the BLOCK stands` };
+  }
+}
+
+// The poll step, with its I/O injectable. Exit code 0 only for `approved`.
+export async function runPoll({
+  requestPath,
+  outputPath,
+  env = process.env,
+  poll = pollBreakGlass,
+  log = console
+}) {
+  let outcome;
   try {
     const request = JSON.parse(await readFile(requestPath, 'utf8'));
-    const result = await pollBreakGlass({
+    const result = await poll({
       request,
-      endpoint: process.env.BREAK_GLASS_STATUS_URL,
-      sharedSecret: process.env.BREAK_GLASS_SHARED_SECRET,
-      timeoutSeconds: Number(process.env.BREAK_GLASS_TIMEOUT_SECONDS || 900),
-      intervalMilliseconds: Number(process.env.BREAK_GLASS_POLL_INTERVAL_MS || 10_000),
-      invoke: lambdaInvokerFromEnv(process.env)
+      endpoint: env.BREAK_GLASS_STATUS_URL,
+      sharedSecret: env.BREAK_GLASS_SHARED_SECRET,
+      timeoutSeconds: Number(env.BREAK_GLASS_TIMEOUT_SECONDS || 900),
+      intervalMilliseconds: Number(env.BREAK_GLASS_POLL_INTERVAL_MS || 10_000),
+      invoke: lambdaInvokerFromEnv(env)
     });
     await mkdir(dirname(outputPath), { recursive: true });
     await writeFile(outputPath, `${JSON.stringify(result, null, 2)}\n`);
-    if (result.status !== 'approved') {
-      throw new Error(`request ${request.requestId} ended as ${result.status}`);
-    }
-    console.log(`BREAK-GLASS: APPROVED by verified approver ${result.approver?.username}`);
+    outcome = describePollOutcome({ result });
   } catch (error) {
-    console.error(`BREAK-GLASS: DENIED (${error.message})`);
-    process.exitCode = 1;
+    outcome = describePollOutcome({ error });
   }
+  if (outcome.approved) {
+    log.log(outcome.line);
+    return 0;
+  }
+  log.error(outcome.line);
+  return 1;
+}
+
+async function main() {
+  process.exitCode = await runPoll({
+    requestPath: process.argv[2] || 'reports/break-glass-request.json',
+    outputPath: process.argv[3] || 'reports/break-glass-decision.json'
+  });
 }
 
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1]);

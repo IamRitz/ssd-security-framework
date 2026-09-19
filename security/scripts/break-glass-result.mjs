@@ -111,6 +111,81 @@ export function deriveBreakGlassResult({
   }
 }
 
+// ---- human-readable job summary ------------------------------------------------
+//
+// The break-glass job's summary headlines the break-glass REVIEW, not the source
+// gate: the source policy verdict, the break-glass decision, and the effective
+// disposition are three different facts, shown side by side and never merged.
+//   - the source verdict is read from the gate evidence and shown as-is (an
+//     approved BLOCK is still "BLOCK");
+//   - the decision and delivery come from the SAME result record this step
+//     emits as outputs, so the summary cannot disagree with enforcement;
+//   - only `approved` is shown as an OVERRIDDEN BLOCK; everything else says no
+//     verified approval exists.
+// Presentation only: nothing here feeds an output, the exit code, or the final gate.
+
+const DECISION_LABELS = {
+  approved: 'APPROVED',
+  denied: 'DENIED',
+  expired: 'EXPIRED',
+  timeout: 'TIMEOUT',
+  refused: 'REFUSED',
+  error: 'ERROR'
+};
+
+// One line of plain text, safe inside a Markdown table cell.
+const cell = (value, max = 300) => {
+  const flat = String(value ?? '').replace(/[\r\n]+/g, ' ').replace(/[|`<>]/g, ' ').replace(/\s+/g, ' ').trim();
+  return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
+};
+
+export function renderBreakGlassSummary(result, { verdict = null } = {}) {
+  const status = DECISION_STATUSES.includes(result?.decisionStatus) ? result.decisionStatus : 'error';
+  const approved = status === 'approved';
+  const sourceVerdict = typeof verdict === 'string' && /^[A-Z][A-Z_-]{0,39}$/.test(verdict) ? verdict : null;
+
+  let decision = DECISION_LABELS[status];
+  if (approved && result.approver) decision += ` by \`${cell(result.approver, 64)}\``;
+  if (status === 'refused') decision += ' — this BLOCK is not eligible for break-glass';
+  if (status === 'error') decision += ' — no verified decision was obtained';
+
+  let disposition;
+  if (approved) {
+    disposition = '**OVERRIDDEN BLOCK** for this run only';
+  } else if (sourceVerdict === 'BLOCK' || sourceVerdict === null) {
+    disposition = `**BLOCK STANDS** — ${status === 'error' || status === 'refused' ? 'no verified approval exists' : 'no approval was given'}`;
+  } else {
+    disposition = `**NO OVERRIDE** — no verified approval exists; the source verdict ${sourceVerdict} is unchanged`;
+  }
+
+  const delivered = result?.requestDelivered === true
+    ? `yes${result.requestId ? ` (request \`${cell(result.requestId, 128)}\`)` : ''}`
+    : 'no — no approval request reached the broker';
+
+  const lines = [
+    `## ${approved ? '🔓' : '⛔'} Break-glass review: ${DECISION_LABELS[status]}`,
+    '',
+    '| | |',
+    '|---|---|',
+    `| Source policy verdict | ${sourceVerdict ? `**${sourceVerdict}**` : 'unavailable — the gate evidence could not be read'} |`,
+    `| Request delivered | ${delivered} |`,
+    `| Decision | ${decision} |`,
+    `| Effective disposition | ${disposition} |`,
+    `| Gate digest | ${HEX64.test(result?.gateDigest ?? '') ? `\`sha256:${result.gateDigest}\`` : 'none validated'} |`
+  ];
+  if (result?.synthetic === true) {
+    lines.push('| Route | synthetic fixture — isolated test broker |');
+  }
+  lines.push('');
+  if (result?.reason) lines.push(`_${cell(result.reason, 500)}_`, '');
+  lines.push(
+    approved
+      ? '> The source policy verdict remains **BLOCK**; this approval overrides it for this run only. The caller\'s aggregate `security-gate` check decides whether the run may continue.'
+      : '> No override is active. The caller\'s aggregate `security-gate` check decides whether the run may continue, and it stays red without a verified approval.'
+  );
+  return `${lines.join('\n')}\n\n`;
+}
+
 async function readOptionalJson(path) {
   if (!path) return null;
   try {
@@ -147,6 +222,15 @@ async function main() {
     );
   }
   console.log(`BREAK-GLASS RESULT: ${result.decisionStatus} (delivered=${result.requestDelivered}) — ${result.reason}`);
+  // After the outputs, and best effort: a summary failure never changes them.
+  if (env.GITHUB_STEP_SUMMARY) {
+    try {
+      const gate = await readOptionalJson(env.SSD_GATE_PATH);
+      await appendFile(env.GITHUB_STEP_SUMMARY, renderBreakGlassSummary(result, { verdict: gate?.verdict }));
+    } catch (error) {
+      console.error(`BREAK-GLASS RESULT: job summary not written (${error.message})`);
+    }
+  }
 }
 
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1]);

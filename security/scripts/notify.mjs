@@ -389,6 +389,9 @@ async function main() {
   const context = {
     evidenceFile: basename(options.gate),
     evidenceMarkdownFile: basename(evidencePath),
+    // `break-glass` only in the Lambda break-glass job: the job summary then
+    // presents the findings under that job's break-glass review.
+    summaryRole: env.SECURITY_SUMMARY_ROLE === 'break-glass' ? 'break-glass' : null,
     // The raw scanner report behind this gate result, when the workflow names
     // one (image gates). Only its file name is shown.
     rawReportFile: env.SECURITY_RAW_REPORT ? basename(env.SECURITY_RAW_REPORT) : null,

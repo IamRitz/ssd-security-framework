@@ -267,7 +267,9 @@ jobs:
       - name: Record the break-glass result
         # approved only when the poll succeeded AND the decision's requestId and
         # gateDigest match the delivered request, which matches the validated
-        # gate. Everything else is a bounded failure status.
+        # gate. Everything else is a bounded failure status. It also writes the
+        # "Break-glass review" job summary (source verdict, decision, effective
+        # disposition) — presentation only, after the outputs.
         id: result
         if: always()
         env:
@@ -292,6 +294,9 @@ jobs:
           BREAK_GLASS_CHECK_OUTCOME: ${{ steps.preflight.outcome }}
           BREAK_GLASS_REQUEST_OUTCOME: ${{ steps.request.outcome }}
           BREAK_GLASS_POLL_OUTCOME: ${{ steps.poll.outcome }}
+          # The "Record the break-glass result" step already headlined this
+          # summary with the break-glass review; the findings follow it.
+          SECURITY_SUMMARY_ROLE: break-glass
         run: |
           export BREAK_GLASS_REQUEST_PATH="$SSD_REQUEST_PATH" BREAK_GLASS_DECISION_PATH="$SSD_DECISION_PATH"
           if [ ! -f "$SSD_GATE_PATH" ]; then

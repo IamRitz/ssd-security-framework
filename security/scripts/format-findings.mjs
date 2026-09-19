@@ -1863,7 +1863,15 @@ export function renderMarkdown(report, { includeMarker = false } = {}) {
   if (includeMarker) {
     head.push(PR_COMMENT_MARKER);
   }
-  head.push(`## ${report.emoji} Security gate: ${report.headline ?? report.verdictLabel}`);
+  // In the Lambda break-glass job the primary outcome is the break-glass review
+  // (rendered above this by break-glass-result.mjs), so the findings are a
+  // secondary section. The raw verdict is still shown verbatim, never rewritten.
+  const breakGlassJob = report.context?.summaryRole === 'break-glass';
+  head.push(
+    breakGlassJob
+      ? `### ${report.emoji} Source findings behind this review — source policy verdict: ${report.headline ?? report.verdictLabel}`
+      : `## ${report.emoji} Security gate: ${report.headline ?? report.verdictLabel}`
+  );
   head.push(`_${report.blurb}_`);
 
   const ctx = contextLine(report.context);
@@ -1882,7 +1890,11 @@ export function renderMarkdown(report, { includeMarker = false } = {}) {
             'log-only is a rollout mode: a future BLOCK would be reported without blocking the merge, and no Slack alert is sent.'
     );
   }
-  if (report.breakGlassNotice) {
+  if (breakGlassJob) {
+    // Not the notice: the review above is derived from the job's own result
+    // record, and repeating a second derivation here could only disagree with it.
+    head.push('> The break-glass decision for these findings is in **Break-glass review** above.');
+  } else if (report.breakGlassNotice) {
     head.push(`> ${report.breakGlassNotice}`);
   }
 
