@@ -1,44 +1,20 @@
-# >>> scan-only
-# | # GENERATED FILE — DO NOT EDIT.
-# | # Rendered from _source-security.yml by tools/render-source-scan.mjs; the
-# | # framework tests fail if the two ever differ outside the marked regions.
-# | # Edit _source-security.yml and re-run: node tools/render-source-scan.mjs
-# | name: Source scan (reusable, OIDC-free)
-# |
-# | # Reusable source-security workflow for LEAST-PRIVILEGE callers: secret scan,
-# | # dependency scan, SAST, and the source security gate — with NO job that can
-# | # request a GitHub OIDC token. A caller needs no `id-token: write` to call it.
-# | #
-# | # CREDENTIAL BOUNDARY: no job receives cloud credentials. Lambda break-glass
-# | # is NOT performed here: with `break_glass_transport: lambda` an eligible,
-# | # enforced BLOCK is DELEGATED (output `break_glass_delegated=true`) to the
-# | # dedicated `_break-glass-lambda.yml`, the only job that may hold
-# | # `id-token: write`. The legacy `http` transport still runs in-job (it needs
-# | # no OIDC). Callers must never use `secrets: inherit`.
-# | #
-# <<< scan-only
-# >>> legacy-only
-name: Source security (reusable)
+# GENERATED FILE — DO NOT EDIT.
+# Rendered from _source-security.yml by tools/render-source-scan.mjs; the
+# framework tests fail if the two ever differ outside the marked regions.
+# Edit _source-security.yml and re-run: node tools/render-source-scan.mjs
+name: Source scan (reusable, OIDC-free)
 
-# Reusable source-security workflow: secret scan, dependency scan, SAST, and the
-# source security gate.
+# Reusable source-security workflow for LEAST-PRIVILEGE callers: secret scan,
+# dependency scan, SAST, and the source security gate — with NO job that can
+# request a GitHub OIDC token. A caller needs no `id-token: write` to call it.
 #
-# CREDENTIAL BOUNDARY: scanner jobs receive no cloud credentials.
-# The source-gate job may assume the narrowly scoped break-glass Lambda
-# invoker role through GitHub OIDC, and only after eligibility is confirmed.
-# Callers must never use `secrets: inherit`.
+# CREDENTIAL BOUNDARY: no job receives cloud credentials. Lambda break-glass
+# is NOT performed here: with `break_glass_transport: lambda` an eligible,
+# enforced BLOCK is DELEGATED (output `break_glass_delegated=true`) to the
+# dedicated `_break-glass-lambda.yml`, the only job that may hold
+# `id-token: write`. The legacy `http` transport still runs in-job (it needs
+# no OIDC). Callers must never use `secrets: inherit`.
 #
-# LEAST PRIVILEGE: because that job declares `id-token: write`, GitHub requires
-# EVERY caller of this file to grant it, even with break-glass disabled. New
-# callers should use `_source-scan.yml` (generated from this file, identical
-# except that it has no OIDC-capable job) plus `_break-glass-lambda.yml`.
-# This file is kept unchanged in behaviour for existing v1 callers.
-#
-# THIS FILE IS THE SOURCE OF `_source-scan.yml`. Regions between the
-# `legacy-only` markers are dropped from it; `scan-only` regions are commented
-# out here and emitted there. After editing, run: node tools/render-source-scan.mjs
-#
-# <<< legacy-only
 # Portability: every repo-specific value is an input. Node is installed as a TOOL
 # dependency (the gate scripts are .mjs) independent of the target repo's own
 # language; a pure-Python or Go consumer needs no Node of its own.
@@ -125,23 +101,16 @@ on:
         type: boolean
         default: false
       break_glass_transport:
-        # >>> legacy-only
-        description: Break-glass transport. `http` uses the legacy webhook path; `lambda` uses direct Lambda invocation via GitHub OIDC.
-        # <<< legacy-only
-        # >>> scan-only
-        # | description: >-
-        # |   Break-glass transport. `http` runs the legacy webhook path in-job. `lambda` DELEGATES an
-        # |   eligible, enforced BLOCK to `_break-glass-lambda.yml` (see output break_glass_delegated);
-        # |   nothing Lambda-related runs in this workflow.
-        # <<< scan-only
+        description: >-
+          Break-glass transport. `http` runs the legacy webhook path in-job. `lambda` DELEGATES an
+          eligible, enforced BLOCK to `_break-glass-lambda.yml` (see output break_glass_delegated);
+          nothing Lambda-related runs in this workflow.
         type: string
         default: http
       break_glass_lambda_role_arn:
-        # >>> scan-only
-        # | # Accepted for interface parity with _source-security.yml and IGNORED here:
-        # | # this workflow can hold no OIDC token. Pass Lambda configuration to
-        # | # _break-glass-lambda.yml instead.
-        # <<< scan-only
+        # Accepted for interface parity with _source-security.yml and IGNORED here:
+        # this workflow can hold no OIDC token. Pass Lambda configuration to
+        # _break-glass-lambda.yml instead.
         description: IAM role assumed through GitHub OIDC when break_glass_transport is lambda.
         type: string
         default: ''
@@ -271,12 +240,7 @@ env:
   # Which of the two rendered workflows this is. Read only by the break-glass
   # route step: `legacy` keeps every v1 break-glass behaviour in-job; `scan`
   # delegates the Lambda transport to _break-glass-lambda.yml.
-  # >>> legacy-only
-  SSD_WORKFLOW_VARIANT: legacy
-  # <<< legacy-only
-  # >>> scan-only
-  # | SSD_WORKFLOW_VARIANT: scan
-  # <<< scan-only
+  SSD_WORKFLOW_VARIANT: scan
 
 jobs:
   secret-scanning:
@@ -838,9 +802,6 @@ jobs:
       # comment (find-by-marker) with the full finding detail. No other job is
       # granted PR write.
       pull-requests: write
-      # >>> legacy-only
-      id-token: write
-      # <<< legacy-only
     outputs:
       verdict: ${{ steps.verdict.outputs.verdict }}
       gate_digest: ${{ steps.verdict.outputs.gate_digest }}
@@ -1264,17 +1225,6 @@ jobs:
             echo "SSD_BG_ROLE=$ROLE"
           } >> "$GITHUB_ENV"
 
-      # >>> legacy-only
-      - name: Assume the break-glass invoker role (OIDC)
-        if: ${{ steps.evaluate.outcome == 'failure' && steps.route.outputs.in_job == 'true' && inputs.break_glass_transport == 'lambda' }}
-        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
-        with:
-          # The EFFECTIVE role resolved above — the isolated test role on a
-          # synthetic run, the production role otherwise. Never the raw input.
-          role-to-assume: ${{ env.SSD_BG_ROLE }}
-          aws-region: ${{ env.SSD_BG_REGION }}
-          role-session-name: break-glass-gate
-      # <<< legacy-only
 
       - name: Request break-glass decision
         id: break-glass-request

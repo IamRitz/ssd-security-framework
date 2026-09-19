@@ -619,8 +619,15 @@ the interaction handler, not the DynamoDB table, not the secrets. Scope its
 trust policy the same way as §2.2, and confirm the negative case: assuming it
 and calling anything else must return AccessDenied.
 
-Pass it as `break_glass_lambda_role_arn` with `break_glass_transport: lambda`.
-This path needs **no repository secret at all**.
+Call `_source-scan.yml` with `break_glass_transport: lambda`, and pass the role
+to a separate `break-glass` job calling `_break-glass-lambda.yml`
+(`lambda_role_arn`) — the only job granted `id-token: write`. See
+`examples/container-ecr/security.yml` and
+[workflow-contracts.md](workflow-contracts.md#_break-glass-lambdayml). (Existing
+v1 callers of `_source-security.yml` keep passing `break_glass_lambda_role_arn`
+there.) Set `strict_break_glass_evidence: true` on `_conformance.yml` and feed
+it the structured `break-glass` record, as the example does. This path needs
+**no repository secret at all**.
 
 ### 3.3 The Slack app **[ORG]**
 

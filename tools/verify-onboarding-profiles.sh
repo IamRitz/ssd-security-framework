@@ -143,8 +143,8 @@ echo "=============================================================="
 echo " PROFILE 2 — library WITH break glass (no delivery AWS)"
 echo "=============================================================="
 node "$CONF" --artifact-type library --registry none --deploy-target none --phase pr \
-  --break-glass true \
-  --observed '{"secret-scan":{"status":"pass"},"dependency-scan":{"status":"pass"},"sast":{"status":"pass"},"source-gate":{"status":"pass"},"break-glass":{"status":"pass"}}' \
+  --break-glass true --strict-break-glass-evidence true \
+  --observed '{"secret-scan":{"status":"pass"},"dependency-scan":{"status":"pass"},"sast":{"status":"pass"},"source-gate":{"status":"pass"},"break-glass":{"status":"skipped","decision":"","request_delivered":"","gate_digest":"","delegated":"false"}}' \
   --output reports/conformance-bg.json >/dev/null
 node -e '
   const r = require(process.argv[1]);
@@ -183,11 +183,11 @@ echo
 echo "=============================================================="
 echo " PROFILE 4 — full framework-gated container (PR vs delivery)"
 echo "=============================================================="
-PR_OBSERVED='{"secret-scan":{"status":"pass"},"dependency-scan":{"status":"pass"},"sast":{"status":"pass"},"source-gate":{"status":"pass"},"image-scan-prepush":{"status":"pass"},"break-glass":{"status":"pass"}}'
+PR_OBSERVED='{"secret-scan":{"status":"pass"},"dependency-scan":{"status":"pass"},"sast":{"status":"pass"},"source-gate":{"status":"pass"},"image-scan-prepush":{"status":"pass"},"break-glass":{"status":"skipped","decision":"","request_delivered":"","gate_digest":"","delegated":"false"}}'
 
 echo "-- 4a. PR phase defers the delivery controls (never a fake pass)"
 node "$CONF" --artifact-type container --registry ecr --deploy-target framework-gated --phase pr \
-  --break-glass true --observed "$PR_OBSERVED" --output reports/conf-pr.json >/dev/null
+  --break-glass true --strict-break-glass-evidence true --observed "$PR_OBSERVED" --output reports/conf-pr.json >/dev/null
 node -e '
   const r = require(process.argv[1]);
   const get = (id) => r.controls.find((c) => c.id === id);
@@ -203,8 +203,8 @@ pass "delivery controls deferred: required by the repo, proven by the delivery r
 
 echo "-- 4b. a caller claiming a deploy passed on a PR is NOT honoured"
 node "$CONF" --artifact-type container --registry ecr --deploy-target framework-gated --phase pr \
-  --break-glass true \
-  --observed '{"secret-scan":{"status":"pass"},"dependency-scan":{"status":"pass"},"sast":{"status":"pass"},"source-gate":{"status":"pass"},"image-scan-prepush":{"status":"pass"},"break-glass":{"status":"pass"},"gated-deploy":{"status":"pass","evidence":"runs on push to main"}}' \
+  --break-glass true --strict-break-glass-evidence true \
+  --observed '{"secret-scan":{"status":"pass"},"dependency-scan":{"status":"pass"},"sast":{"status":"pass"},"source-gate":{"status":"pass"},"image-scan-prepush":{"status":"pass"},"break-glass":{"status":"skipped","decision":"","request_delivered":"","gate_digest":"","delegated":"false"},"gated-deploy":{"status":"pass","evidence":"runs on push to main"}}' \
   --output reports/conf-fake.json >/dev/null
 node -e '
   const r = require(process.argv[1]);
@@ -218,8 +218,8 @@ pass "a control that did not execute cannot have passed"
 
 echo "-- 4c. delivery phase proves them with real job results"
 node "$CONF" --artifact-type container --registry ecr --deploy-target framework-gated --phase delivery \
-  --break-glass true \
-  --observed '{"secret-scan":{"status":"success"},"dependency-scan":{"status":"success"},"sast":{"status":"success"},"source-gate":{"status":"success"},"image-scan-prepush":{"status":"success"},"break-glass":{"status":"pass"},"registry-scan-collect":{"status":"success","evidence":"ecr-collect"},"artifact-gate":{"status":"success","evidence":"artifact-gate"},"gated-deploy":{"status":"success","evidence":"digest-pinned SSM deploy"}}' \
+  --break-glass true --strict-break-glass-evidence true \
+  --observed '{"secret-scan":{"status":"success"},"dependency-scan":{"status":"success"},"sast":{"status":"success"},"source-gate":{"status":"success"},"image-scan-prepush":{"status":"success"},"break-glass":{"status":"skipped","decision":"","request_delivered":"","gate_digest":"","delegated":"false"},"registry-scan-collect":{"status":"success","evidence":"ecr-collect"},"artifact-gate":{"status":"success","evidence":"artifact-gate"},"gated-deploy":{"status":"success","evidence":"digest-pinned SSM deploy"}}' \
   --output reports/conf-del.json >/dev/null
 node -e '
   const r = require(process.argv[1]);
@@ -232,7 +232,7 @@ pass "every required control proven in the delivery run"
 
 echo "-- 4d. delivery phase FAILS when delivery evidence is missing"
 node "$CONF" --artifact-type container --registry ecr --deploy-target framework-gated --phase delivery \
-  --break-glass true --observed "$PR_OBSERVED" --output reports/conf-del-missing.json >/dev/null 2>&1 || true
+  --break-glass true --strict-break-glass-evidence true --observed "$PR_OBSERVED" --output reports/conf-del-missing.json >/dev/null 2>&1 || true
 node -e '
   const r = require(process.argv[1]);
   if (r.summary.failed !== 3) throw new Error(`failed=${r.summary.failed}, expected 3`);

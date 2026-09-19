@@ -36,7 +36,9 @@ and runs on every framework PR.
 
 | File | Purpose | Cloud credentials |
 | --- | --- | --- |
-| `_source-security.yml` | secret scan, dependency scan, SAST, source gate | **none** (break-glass invoker role only, after eligibility) |
+| `_source-scan.yml` | secret scan, dependency scan, SAST, source gate — **for new callers**; no job can request OIDC | **none** |
+| `_break-glass-lambda.yml` | Lambda break-glass for an eligible BLOCK; validates this run's gate evidence before assuming any role | break-glass invoker role, **after** validation |
+| `_source-security.yml` | the v1 source workflow (the twin above is generated from it); keeps in-job Lambda break-glass for existing callers, so callers must grant `id-token: write` | break-glass invoker role only, after eligibility |
 | `_image-scan-prepush.yml` | Trivy over a built image tarball + pre-push gate | **none** |
 | `_artifact-gate.yml` | policy over a normalized registry report; names no registry | **none** |
 | `_ecr-collect.yml` | the ECR adapter: push, poll by digest, normalize | ECR push+scan role |
@@ -50,8 +52,8 @@ normalized report. The gate and the policy do not change.
 ```yaml
 jobs:
   source-security:
-    uses: IamRitz/ssd-security-framework/.github/workflows/_source-security.yml@v1
-    permissions:
+    uses: IamRitz/ssd-security-framework/.github/workflows/_source-scan.yml@v1
+    permissions:               # no id-token: nothing in _source-scan.yml can request one
       contents: read
       pull-requests: write
     with:

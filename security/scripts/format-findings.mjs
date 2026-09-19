@@ -941,10 +941,17 @@ export function buildIssues(findings, cards, context = {}, gate = null) {
 //   requested           the "Request break-glass decision" step itself RAN
 //                       (outcome success, failure, or cancelled mid-run)
 //   delivered           that step succeeded: the broker accepted a pending request
+//   delegated           the source workflow handed this eligible BLOCK to the
+//                       separate Lambda break-glass workflow. Only ever set from
+//                       the workflow's explicit delegation output. It is NOT
+//                       delivery: this job cannot observe whether that other
+//                       workflow runs or delivers, so delegation never
+//                       suppresses the plain BLOCK alert (fail-safe: a duplicate
+//                       alert is preferred over a silently lost one).
 //   decision            approved | denied | expired | timeout |
 //                       decision-unavailable | request-failed |
 //                       request-not-attempted | not-requested | not-eligible |
-//                       unknown | not-applicable
+//                       delegated | unknown | not-applicable
 //
 // Inputs are GitHub step outcomes ('success' | 'failure' | 'cancelled' |
 // 'skipped' | '' when the step does not exist) and the decision artifact.
@@ -959,7 +966,8 @@ export function deriveBreakGlassState({
   requestOutcome = '',
   pollOutcome = '',
   request = null,
-  decision = null
+  decision = null,
+  delegated = false
 } = {}) {
   const state = {
     eligible: eligible === true,
@@ -988,6 +996,14 @@ export function deriveBreakGlassState({
   }
   if (!state.eligible) {
     state.decision = 'not-eligible';
+    return state;
+  }
+  if (delegated === true) {
+    // Not a request outcome: this job made no request, and cannot see
+    // whether the break-glass workflow will. Informational only — routing
+    // still sends the plain BLOCK alert.
+    state.delegated = true;
+    state.decision = 'delegated';
     return state;
   }
 
@@ -1039,6 +1055,8 @@ export function breakGlassNotice(state) {
       return state.eligible
         ? '🔑 This BLOCK is eligible for break-glass by policy. This notifier was not given the run\'s break-glass state, so it makes no claim about whether an approval request was made.'
         : null;
+    case 'delegated':
+      return '🔑 This BLOCK is eligible for break-glass and was handed to the Lambda break-glass workflow in this run, which sends any approval request and reports the decision. This alert is sent regardless, because a hand-off is not a delivered request. Until a verified approval exists, the BLOCK stands.';
     case 'not-eligible':
       return '🔒 Break-glass is enabled, but this BLOCK is not eligible: it includes at least one finding policy never allows to be overridden. No approval request was made.';
     case 'request-not-attempted':
@@ -1082,6 +1100,11 @@ export function route({ verdict, mode = 'enforce', breakGlass = null }) {
     slack = false;
     slackReason = 'break-glass-request-delivered';
   }
+  // Deliberately NO suppression for a delegated BLOCK (breakGlass.decision ===
+  // 'delegated'). Delegation is a hand-off to another workflow this job cannot
+  // observe; if the caller skips or misconfigures it, suppressing here would
+  // lose the only alert. A duplicate (this alert + the interactive request) is
+  // the accepted, fail-safe cost until an orchestrator can observe delivery.
   return { slack, slackReason, prComment: true, summary: true };
 }
 

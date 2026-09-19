@@ -266,6 +266,12 @@ jobs:
       - artifact-gate
       - deploy
     if: ${{ always() && github.ref == 'refs/heads/main' }}
+    # TODO RELEASE BLOCKER RB-1 (docs/release-blockers.md): the "break-glass"
+    # entry below is a hard-coded pass, NOT observed evidence. This file stays on
+    # the v1 COMPATIBILITY path (no strict_break_glass_evidence, so the legacy
+    # default applies and conformance emits a deprecation warning). Migrate it to
+    # _source-scan.yml + _break-glass-lambda.yml with strict evidence before
+    # moving v1 or handing off to DevOps. Do not copy this entry.
     uses: IamRitz/ssd-security-framework/.github/workflows/_conformance.yml@v1
     with:
       toolkit_ref: v1

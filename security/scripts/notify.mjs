@@ -373,7 +373,9 @@ export async function breakGlassStateFromEnv(env, { gate, mode }) {
     requestOutcome: env.BREAK_GLASS_REQUEST_OUTCOME || '',
     pollOutcome: env.BREAK_GLASS_POLL_OUTCOME || '',
     request: await readOptionalJson(env.BREAK_GLASS_REQUEST_PATH || 'reports/break-glass-request.json'),
-    decision: await readOptionalJson(env.BREAK_GLASS_DECISION_PATH || 'reports/break-glass-decision.json')
+    decision: await readOptionalJson(env.BREAK_GLASS_DECISION_PATH || 'reports/break-glass-decision.json'),
+    // Explicit workflow output, never inferred from eligibility or `enabled`.
+    delegated: env.BREAK_GLASS_DELEGATED === 'true'
   });
 }
 

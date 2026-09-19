@@ -18,11 +18,29 @@ see [toolkit-resolution.md](toolkit-resolution.md).
 | `gate_mode` | string | `enforce` | `enforce`: a blocking verdict fails the job. `log-only`: reported, nothing fails, no Slack. |
 | `policy_path` | string | `''` | Consumer-owned `policy.yaml`. Empty uses the framework's default, which travels with the toolkit and is therefore centrally fixable. (`_ecr-collect.yml` makes no policy decision and does not accept this.) |
 
-## `_source-security.yml`
+## `_source-security.yml` and `_source-scan.yml`
 
-Secret scan, dependency scan, SAST, and the source gate. Assumes no cloud role
-except the narrowly scoped break-glass invoker, and only after eligibility is
-confirmed.
+Secret scan, dependency scan, SAST, and the source gate. Two files, one
+implementation:
+
+| | `_source-scan.yml` (**new callers**) | `_source-security.yml` (**v1, unchanged behaviour**) |
+| --- | --- | --- |
+| Caller must grant | `contents: read`, `pull-requests: write` | the same **plus `id-token: write`** — always, even with break-glass disabled, because GitHub validates a called job's permissions before any `if:` |
+| Can request an OIDC token | **no job can** | the `source-gate` job |
+| `break_glass_transport: http` | in-job (needs no OIDC) | in-job |
+| `break_glass_transport: lambda` | **delegated**: an eligible, trusted, enforced BLOCK sets `break_glass_delegated=true`; the caller runs [`_break-glass-lambda.yml`](#_break-glass-lambdayml) | in-job, after the eligibility check (v1 contract) |
+
+`_source-scan.yml` is **generated** from `_source-security.yml` by
+`tools/render-source-scan.mjs`, which only drops `# >>> legacy-only` regions and
+emits `# >>> scan-only` regions. The framework tests fail if the committed twin
+differs from the render, so the scanner logic cannot diverge. Edit
+`_source-security.yml`, then run `node tools/render-source-scan.mjs`. See
+[versioning.md](versioning.md#the-generated-oidc-free-twin).
+
+Both accept every input below and publish every output below. In
+`_source-scan.yml` the `break_glass_lambda_*` / `synthetic_break_glass_*` inputs
+are accepted for interface parity and ignored — Lambda configuration goes to
+`_break-glass-lambda.yml`.
 
 | Input | Type | Default | Meaning |
 | --- | --- | --- | --- |
@@ -69,6 +87,12 @@ one. **Callers must never use `secrets: inherit`.**
 | `dependency_scan_result` | Dependency scanning control — same vocabulary (since v1.1.x) |
 | `sast_result` | SAST control — same vocabulary (since v1.1.x) |
 | `source_gate_result` | Source security gate control — the `source-gate` job's own status: `success` \| `failure` \| `cancelled` (since v1.1.x) |
+| `gate_digest` | SHA-256 of the `security-gate.json` this run evaluated — the digest a break-glass approval binds to. Empty if unreadable. (additive) |
+| `break_glass_delegated` | `true` only when an eligible, trusted, **enforced** BLOCK was handed to `_break-glass-lambda.yml` (`_source-scan.yml` + `lambda`). Always `false` in `_source-security.yml`. Use it as the break-glass job's `if:`. (additive) |
+
+A BLOCK still fails the `source-gate` job — including a delegated one. The
+source workflow is never turned green so that break-glass can run; the caller
+reads these outputs under `if: always()`.
 
 `gate_mode` is echoed back deliberately: a caller that reports the mode it
 *believes* it passed can display "enforce" while the gate ran in log-only.
@@ -167,6 +191,90 @@ The Secret scanning job likewise validates both reports before upload, so all th
 scanning jobs' `success` means the same thing. Both are deliberate tightenings in the
 fail-closed direction: a malformed secret report, or an exit-1-with-no-findings, used
 to surface only as a gate integrity BLOCK and now also fails the scanner job itself.
+
+## `_break-glass-lambda.yml`
+
+The **only** framework job that requests `id-token: write` for break-glass. Called
+as its own caller job, after `_source-scan.yml`, in the same workflow run:
+
+```yaml
+break-glass:
+  needs: source-security
+  if: ${{ always() && needs.source-security.outputs.break_glass_delegated == 'true' }}
+  uses: IamRitz/ssd-security-framework/.github/workflows/_break-glass-lambda.yml@v1
+  permissions:
+    contents: read
+    id-token: write
+  with:
+    toolkit_ref: v1
+    gate_mode: ${{ needs.source-security.outputs.gate_mode }}
+    expected_gate_digest: ${{ needs.source-security.outputs.gate_digest }}
+    lambda_function: ${{ vars.BREAK_GLASS_LAMBDA_FUNCTION }}
+    lambda_role_arn: ${{ vars.BREAK_GLASS_LAMBDA_ROLE_ARN }}
+    aws_region: ${{ vars.AWS_REGION }}
+    slack_notify_url: ${{ vars.SECURITY_NOTIFY_SLACK_URL }}
+```
+
+| Input | Default | Meaning |
+| --- | --- | --- |
+| `toolkit_ref` | `v1` | Framework ref. The **repository is fixed** (no `toolkit_repository`, no `toolkit_path`): this job holds credentials, so its validation code cannot be repointed or vendored. |
+| `gate_mode` | required | The source `gate_mode` output. Anything but `enforce` is refused. |
+| `expected_gate_digest` | required | The source `gate_digest` output. The downloaded evidence must hash to exactly this. |
+| `lambda_function` / `lambda_role_arn` / `aws_region` | `''` | Production broker and invoker role. |
+| `synthetic_lambda_function` / `synthetic_lambda_role_arn` / `synthetic_aws_region` | `''` | Isolated test broker, used **only** when the gate evidence records a synthetic fixture. There is no input that turns synthetic routing on or off. |
+| `timeout_seconds` | `900` | How long to wait for a verified decision. |
+| `slack_notify_url` | `''` | An additional alert when the request is **not** delivered. The source workflow always sends its own BLOCK alert. |
+| `pr_number` | `''` | Recorded in the request. |
+
+It declares **no secrets**.
+
+Step order — asserted by `test/break-glass-oidc-boundary.test.js`, including
+mutation cases that reorder it:
+
+1. check out **this framework** (never the consumer), set up Node;
+2. download `security-gate-results` from **this run** (no `run-id` override);
+3. `break-glass-evidence.mjs` (framework code) re-derives, from the evidence:
+   run binding (`provenance.repository` / `commitSha` / `runId` must equal this
+   run's), the exact gate digest, eligibility from the **raw findings** (refuses
+   PASS, PASS-WITH-EXCEPTIONS, integrity, verified secret, malicious package,
+   mixed, bootstrap, and a summary that differs from the raw BLOCKs), and the
+   production-vs-synthetic route from `synthetic`;
+4. **only then** `aws-actions/configure-aws-credentials`, with the role the
+   preflight resolved;
+5. request, poll (requestId + gateDigest verified exactly, as before);
+6. always: record `break-glass-result.json`, notify, upload `break-glass-results`, enforce.
+
+| Output | Values |
+| --- | --- |
+| `decision_status` | `approved` \| `denied` \| `expired` \| `timeout` \| `refused` (preflight: not an overridable BLOCK) \| `error` (config, evidence, delivery, malformed or unreachable). Empty if the job did not run. |
+| `request_delivered` | `true` \| `false` |
+| `gate_digest` | the SHA-256 the request and decision are bound to |
+| `control_result` | `success` only for `approved` |
+| `synthetic` | `true` \| `false`, from the evidence |
+| `request_id` | broker request id, when delivered |
+
+The job fails for every status except `approved`.
+
+### The final `security-gate` with separate break-glass
+
+`security/scripts/final-gate.mjs` decides the source leg. A caller checks the
+toolkit out in its `security-gate` job and runs it (see
+`examples/container-ecr/security.yml`); it is not re-implemented in shell.
+
+| Source | Break-glass | Source outcome |
+| --- | --- | --- |
+| `success`, PASS / PASS-WITH-EXCEPTIONS | not applicable | **pass** |
+| `success`, BLOCK, `log-only` | not applicable | **pass** (reported, not enforced) |
+| `success`, BLOCK, `enforce` | in-job (legacy / HTTP) | **overridden-block** (`override=in-job`) |
+| `failure`, eligible trusted delegated BLOCK, all scanners `success` | `success` + `approved` + delivered + same digest | **overridden-block** (`override=approved`) |
+| `failure`, anything else | anything | **block** |
+| `cancelled` / `skipped` / empty | anything | **block** |
+
+Every fact of the override row is compared exactly; a missing, empty, or
+unrecognized value blocks. The policy verdict is never rewritten: an
+overridden BLOCK is reported as such. The image gate is **not** an input —
+break-glass never touches image policy, and a `BLOCK_DEPLOY` keeps the
+aggregate red.
 
 ## `_image-scan-prepush.yml`
 
@@ -284,6 +392,7 @@ Which controls apply to this repository, and what happened to each.
 | `deploy_target` | string | `none` — `framework-gated` \| `self-managed` \| `none` |
 | `phase` | string | `pr` — `pr` \| `delivery`. Which part of the lifecycle THIS run is. |
 | `break_glass_enabled` | boolean | `false` |
+| `strict_break_glass_evidence` | boolean | `false` — **set `true` in every new caller.** Judge the `break-glass` control only from structured observed evidence and honour a source-gate `override` only when that evidence proves it. `false` is the v1 compatibility mode (status-only accepted with a deprecation warning; `override` ignored). Removed in v2, where strict is unconditional. See below. |
 | `observed` | string (JSON) | **required** — control id → `{status, evidence}`, optionally with gate evidence `verdict`, `gate_mode`, `integrity_trusted` |
 | `exemptions_path` | string | `security/exemptions.json` |
 
@@ -348,7 +457,7 @@ just "observed result 'failure'":
 | `scan` | `secret-scan`, `dependency-scan`, `sast` | no trustworthy report exists (`failure`, `cancelled`, `skipped`, `untrusted`). **Findings never fail a scanning control.** |
 | `gate` | `source-gate`, `image-scan-prepush`, `artifact-gate` | the evidence did not satisfy policy, or the gate itself failed |
 | `delivery` | `registry-scan-collect`, `gated-deploy` | the delivery step did not complete |
-| `approval` | `break-glass` | the approval channel is not in place |
+| `approval` | `break-glass` | no verified approval was observed (see below) |
 
 Optional gate evidence in an `observed` entry, used only to explain:
 
@@ -357,6 +466,58 @@ Optional gate evidence in an `observed` entry, used only to explain:
 | `verdict` | `failure` + `BLOCK`/`BLOCK_DEPLOY` → "*the source security policy gate returned a blocking result (verdict BLOCK)*". `failure` with a non-blocking verdict → the gate job errored. `success` + `BLOCK` → applied, noting the BLOCK was not enforced (log-only) or was overridden. |
 | `gate_mode` | distinguishes "not enforced (log-only)" from a break-glass override |
 | `integrity_trusted` | `false` + BLOCK → "*failed closed: a scan report could not be trusted*" rather than a policy BLOCK |
+
+### Break-glass evidence, and proving an override
+
+The rules depend on `strict_break_glass_evidence`, which the caller sets
+**explicitly**. The mode is never inferred from which fields an entry carries, so
+a producer cannot opt out of strict checking by leaving fields out. The report
+records the mode it applied as `breakGlassEvidence: strict | legacy` (an
+additive field).
+
+| | `strict_break_glass_evidence: false` (v1 default, **deprecated**) | `strict_break_glass_evidence: true` (**all new callers**) |
+| --- | --- | --- |
+| `break-glass` entry | judged by `status` alone, exactly as in v1.0/v1.1 | structured evidence required (below) |
+| `{"status":"pass"}` | applied, **plus a loud deprecation warning**: it proves no request delivery, decision, delegation or digest binding, and is never described as verified | **failed** |
+| source-gate `override` | **ignored** (with a warning) — v1 never interpreted it, so legacy mode gains no override semantics | honoured only when the `break-glass` entry proves it |
+| v2 | removed | unconditional |
+
+The rest of this section describes **strict** mode. With `break_glass_enabled:
+true` the `break-glass` control accepts **only structured observed evidence**. Every one of these fields must be present on the
+`break-glass` entry (empty strings are allowed where noted), and a `source-gate`
+entry with a non-empty `status` must be observed:
+
+| Field | Source |
+| --- | --- |
+| `status` | `needs.break-glass.result` |
+| `decision` | `needs.break-glass.outputs.decision_status` (`''` when the job did not run) |
+| `request_delivered` | `needs.break-glass.outputs.request_delivered` |
+| `gate_digest` | `needs.break-glass.outputs.gate_digest` |
+| `delegated` | `needs.source-security.outputs.break_glass_delegated` |
+
+A bare `{"status": "pass"}` — or any entry missing a field — **fails**. It is the
+fabricated shape this schema removes. (Other controls keep their v1 status-based
+handling.) Exactly two shapes are applied:
+
+| Shape | Required, each compared exactly | `break-glass` control |
+| --- | --- | --- |
+| **not exercised** | `delegated=false`, `status=skipped`, `decision` `''`/`not-applicable`, `request_delivered` `''`/`false`, `gate_digest` `''`; the source gate claims no `override` and did not report an eligible, trusted, enforced BLOCK | **applied**, `exercised: false` — no approval attempt was needed |
+| **approved** | `delegated=true`, `status=success`, `request_delivered=true`, `decision=approved`, a SHA-256 `gate_digest` equal to the source-gate `gate_digest`; source `verdict=BLOCK`, `integrity_trusted=true`, `break_glass_eligible=true`, `gate_mode=enforce` | **applied**, `exercised: true` |
+
+Everything else fails: `denied` / `expired` / `timeout` (the channel worked,
+nothing was approved), `refused`, `error`, `cancelled`, delegated but skipped,
+and any inconsistent value. Tests remove each required field in turn.
+
+The `source-gate` entry may add `break_glass_eligible`, `gate_digest` and
+`override` (the caller's `security-gate` output `source_override`). With
+`override: approved`, a **failed** source gate reads **applied** — *"policy
+verdict BLOCK; override: verified approved break-glass for gate sha256 …"*, with
+`observedStatus: failure` and `override: approved` kept on the record — **only
+if** the `break-glass` entry proves it: break-glass enabled, job `success`,
+decision `approved`, request delivered, identical gate digest, and a source
+verdict BLOCK that was trusted, eligible and enforced. Otherwise the source
+gate is failed with the reason the claim was rejected. A fabricated
+`override: approved` cannot pass.
 
 An empty or unrecognized `status` is `failed` with that stated as the reason.
 Applied controls carry a `detail` (e.g. *policy verdict PASS*), and the summary
@@ -441,8 +602,8 @@ Five facts are kept distinct, and no later one is inferred from an earlier one:
 | **delivered** | the request step succeeded: the broker accepted a pending request |
 | **decision** | the poll step's outcome (the same signal the enforce step uses) plus `break-glass-decision.json`: `approved`, `denied`, `expired`/`timeout`, or `decision-unavailable` |
 
-The workflow hands the notifier `BREAK_GLASS_ENABLED` and each break-glass
-step's `outcome`. A step whose condition was false reports `skipped`, so a
+The workflow hands the notifier `BREAK_GLASS_ENABLED`, `BREAK_GLASS_DELEGATED`
+and each break-glass step's `outcome`. A step whose condition was false reports `skipped`, so a
 disabled, failed, or never-entered request is never described as sent. A
 notifier given no state at all claims nothing.
 
@@ -453,9 +614,20 @@ notifier given no state at all claims nothing.
 | eligible, path stopped before the request step | no request was attempted; **no override is active** | sent |
 | eligible, request step ran and failed | request attempted but not confirmed delivered; **no override is active** | sent |
 | request delivered, then approved / denied / timed out | entered review, request sent; then the decision | suppressed — the interactive request already reached approvers |
+| `_source-scan.yml` delegated the BLOCK (`break_glass_delegated=true`) | handed to the Lambda break-glass workflow; BLOCK stands until a verified approval | **sent** — delegation is not delivery (see below) |
 | `gate_mode: log-only` | eligible by policy, but log-only enforces nothing; no request made | suppressed (log-only) |
 
 Routing chooses surfaces only; it never changes the verdict.
+
+**Delegation never suppresses the alert (intentional fail-safe).** The source
+workflow cannot observe whether the caller's separate break-glass job will run
+or deliver. If it suppressed its alert on delegation, a caller that skipped or
+misconfigured that job would lose the only BLOCK notification. So a delegated
+BLOCK gets the normal alert, and a delivered break-glass request adds its own
+interactive message; `_break-glass-lambda.yml` also alerts when its request is
+not delivered. Approvers may therefore see two messages for one BLOCK — a
+duplicate is preferred over silent loss. A future orchestration layer that can
+observe actual delivery may deduplicate.
 
 ### Scan unavailable is not a policy BLOCK
 
@@ -581,6 +753,21 @@ action. The feedback states a conflict rather than headlining one scanner's
 version, and offers a pin command only for a proven direct dependency whose
 evidence agrees. Nothing here is read by a policy decision. The full schema,
 rules, wording and known limits are in [evidence-model.md](evidence-model.md).
+
+### Gate result run evidence (additive)
+
+`security-gate.json` also carries two run-level records that no policy decision
+reads. They exist so the credential-bearing break-glass job can judge the result
+from the evidence instead of trusting its caller:
+
+- `synthetic: { active, fixture }` — **always present**: `active: true` with
+  `fixture: sast | dependency` when `synthetic_block_fixture` injected a
+  fabricated finding, otherwise `{ active: false, fixture: null }`. A result
+  without it is refused by `_break-glass-lambda.yml` rather than assumed real.
+- `provenance: { repository, commitSha, runId, runAttempt? }` — from the runner's
+  `GITHUB_*` variables when the gate runs as a CLI in CI.
+
+Both are covered by the gate digest, so an approval binds to them too.
 
 ### Gate result fields added for guidance (additive, optional)
 

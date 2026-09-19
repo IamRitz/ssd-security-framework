@@ -39,6 +39,11 @@ jobs:
       - name: Toolkit and workflow tests
         run: node --test
 
+      - name: The OIDC-free twin matches its source
+        # _source-scan.yml is generated from _source-security.yml; a stale twin
+        # would let the two workflows' scanner logic drift apart.
+        run: node tools/render-source-scan.mjs --check
+
       - name: Prove a consumer needs zero framework files
         run: ./tools/verify-consumer-isolation.sh
 

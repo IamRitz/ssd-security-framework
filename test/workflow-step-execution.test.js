@@ -216,6 +216,7 @@ describe('example aggregate checks distinguish PASS from BLOCK in log-only', () 
   for (const path of ['examples/container-ecr/security.yml', 'examples/python-self-managed/security.yml']) {
     it(`${path}: PASS/DEPLOY in log-only is not called green by configuration`, () => {
       const { code, out } = runStep(path, STEP, {
+        SSD_TOOLKIT: join(FRAMEWORK, 'security'),
         EVENT: 'pull_request',
         SOURCE_RESULT: 'success',
         IMAGE_RESULT: 'success',
@@ -232,6 +233,7 @@ describe('example aggregate checks distinguish PASS from BLOCK in log-only', () 
 
     it(`${path}: an image BLOCK_DEPLOY in log-only is flagged even when source PASSes`, () => {
       const { code, out } = runStep(path, STEP, {
+        SSD_TOOLKIT: join(FRAMEWORK, 'security'),
         EVENT: 'pull_request',
         SOURCE_RESULT: 'success',
         IMAGE_RESULT: 'success',
@@ -246,6 +248,7 @@ describe('example aggregate checks distinguish PASS from BLOCK in log-only', () 
 
     it(`${path}: enforce + source BLOCK fails`, () => {
       const { code } = runStep(path, STEP, {
+        SSD_TOOLKIT: join(FRAMEWORK, 'security'),
         EVENT: 'pull_request',
         SOURCE_RESULT: 'failure',
         IMAGE_RESULT: 'success',

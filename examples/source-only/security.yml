@@ -27,7 +27,10 @@ permissions:
 
 jobs:
   source-security:
-    uses: IamRitz/ssd-security-framework/.github/workflows/_source-security.yml@v1
+    # `_source-scan.yml`: the OIDC-free source workflow. This repository has no
+    # break-glass, so NO job here is granted `id-token: write` — and GitHub does
+    # not require it, because nothing in the called workflow can request one.
+    uses: IamRitz/ssd-security-framework/.github/workflows/_source-scan.yml@v1
     permissions:
       contents: read
       pull-requests: write
@@ -106,6 +109,9 @@ jobs:
       registry: none
       deploy_target: none
       break_glass_enabled: false
+      # Strict structured break-glass evidence: a status-only record can never
+      # pass. New callers always set this; it is unconditional in v2.
+      strict_break_glass_evidence: true
       # PER-CONTROL evidence. Never feed `needs.source-security.result` to every
       # source control: it is the AGGREGATE, so a policy BLOCK would report all
       # three scanners as failed although they ran and produced usable reports.

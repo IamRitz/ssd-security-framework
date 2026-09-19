@@ -894,6 +894,47 @@ function bootstrapState(bootstrap) {
     : { active: false };
 }
 
+// Run-level evidence (additive). Neither field is read by any policy decision;
+// both exist so a LATER, separately-privileged job (the Lambda break-glass
+// workflow) can judge this result from the evidence itself instead of trusting
+// a caller-supplied value.
+//
+// `synthetic` records whether a fabricated demo fixture was injected into this
+// run's reports. It is ALWAYS present on a result written by this version, so a
+// reader can tell "not synthetic" from "written by a gate that did not say":
+// the break-glass workflow refuses the latter rather than guessing production.
+export const SYNTHETIC_FIXTURES = ['sast', 'dependency'];
+
+export function syntheticState(fixture) {
+  if (fixture === undefined || fixture === null || fixture === '' || fixture === 'none') {
+    return { active: false, fixture: null };
+  }
+  assert(
+    SYNTHETIC_FIXTURES.includes(fixture),
+    `unsupported synthetic fixture '${fixture}'; expected one of ${SYNTHETIC_FIXTURES.join(', ')}`
+  );
+  return { active: true, fixture };
+}
+
+// `provenance` binds the result to the run that produced it: which repository,
+// which commit, which workflow run. Present only when the caller supplied it
+// (the CLI reads the runner's own GITHUB_* variables); tests that call
+// runSecurityGate directly produce results without it, exactly as before.
+export function provenanceFromEnv(env = process.env) {
+  const repository = env.GITHUB_REPOSITORY;
+  const commitSha = env.GITHUB_SHA;
+  const runId = env.GITHUB_RUN_ID;
+  if (!repository || !commitSha || !runId) {
+    return null;
+  }
+  return {
+    repository,
+    commitSha,
+    runId: String(runId),
+    ...(env.GITHUB_RUN_ATTEMPT ? { runAttempt: String(env.GITHUB_RUN_ATTEMPT) } : {})
+  };
+}
+
 async function writeResults(paths, result) {
   const exceptions = result.findings.filter((finding) => finding.action === 'EXCEPTION');
   await mkdir(dirname(paths.output), { recursive: true });
@@ -906,9 +947,13 @@ async function writeResults(paths, result) {
 }
 
 export async function runSecurityGate(options = {}) {
-  const { bootstrap = false, ...customPaths } = options;
+  const { bootstrap = false, syntheticFixture = null, provenance = null, ...customPaths } = options;
   const paths = { ...DEFAULT_PATHS, ...customPaths };
   let result;
+  // Resolved OUTSIDE the try: an unsupported fixture name is a caller error that
+  // must fail the run, never be folded into a report-integrity BLOCK that a
+  // reader could mistake for "not synthetic".
+  const synthetic = syntheticState(syntheticFixture);
   // Read BEFORE any report and outside the try: execution evidence must be
   // present on a report-integrity result — that is exactly when it explains
   // something — and reading it never throws, so it cannot create or clear an
@@ -1021,6 +1066,10 @@ export async function runSecurityGate(options = {}) {
     };
   }
 
+  result.synthetic = synthetic;
+  if (provenance) {
+    result.provenance = provenance;
+  }
   await writeResults(paths, result);
   return result;
 }
@@ -1038,7 +1087,8 @@ function parseArguments(arguments_) {
     '--semgrep-execution': 'semgrepExecution',
     '--baseline': 'baseline',
     '--output': 'output',
-    '--exceptions': 'exceptions'
+    '--exceptions': 'exceptions',
+    '--synthetic-fixture': 'syntheticFixture'
   };
   const options = {};
 
@@ -1071,7 +1121,14 @@ async function main() {
     return;
   }
 
-  const result = await runSecurityGate(paths);
+  let result;
+  try {
+    result = await runSecurityGate({ ...paths, provenance: provenanceFromEnv(process.env) });
+  } catch (error) {
+    console.error(`SECURITY GATE: BLOCK\nBLOCK security-gate configuration: ${error.message}`);
+    process.exitCode = 1;
+    return;
+  }
 
   for (const finding of result.findings) {
     console.log(

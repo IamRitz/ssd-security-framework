@@ -25,7 +25,54 @@ integrity failure means a scanner could not interpret its input, so the findings
 list is **unknown**, not clean. Approving "no findings" that were never actually
 computed is approving nothing at all.
 
+## Where the OIDC permission lives
+
+GitHub checks a called workflow's job permissions **before** any `if:` runs. A
+workflow that contains one `id-token: write` job therefore forces **every**
+caller to grant OIDC — even a repository with break-glass disabled. So:
+
+| Repository | Calls | `id-token: write` granted to |
+| --- | --- | --- |
+| no break-glass | `_source-scan.yml` | **nothing** |
+| Lambda break-glass (recommended) | `_source-scan.yml` + `_break-glass-lambda.yml` | **only** the `break-glass` job |
+| legacy HTTP break-glass | `_source-scan.yml` (HTTP runs in-job) | nothing |
+| existing v1 caller | `_source-security.yml` (unchanged) | the source-security job, as before |
+
+`examples/container-ecr/security.yml` is the canonical Lambda caller.
+
 ## The CI side is fail-closed by construction
+
+### Lambda break-glass (`_break-glass-lambda.yml`)
+
+The credential-bearing job runs **no consumer code**: it never checks out the
+consumer repository, and before the OIDC step it only uses pinned actions and
+framework scripts. In order:
+
+1. Download **this run's** `security-gate-results` artifact.
+2. Re-derive from that evidence, in framework code: the run it belongs to
+   (repository, commit, run id), that it is **the exact gate** the source
+   workflow evaluated (SHA-256 equal to the source `gate_digest` output),
+   eligibility from the **raw findings** (not from the source workflow's
+   `break_glass_eligible` output, which is only a pre-filter), and the broker
+   route from the evidence's `synthetic` record.
+3. **Only then** assume the invoker role through OIDC.
+4. Send the request and poll for a **verified** decision (requestId and gate
+   digest must match exactly).
+5. Publish `decision_status` and friends; the caller's `security-gate` runs
+   `final-gate.mjs`, which requires every fact before reporting an
+   **overridden BLOCK**. The source policy verdict stays BLOCK.
+
+The source workflow's normal Slack BLOCK alert is **never** suppressed by
+delegation, so a skipped or misconfigured break-glass job cannot lose it.
+Approvers may see that alert and the interactive request for the same BLOCK;
+that duplicate is deliberate (fail-safe) until something can observe delivery.
+
+Pin the invoker role's trust policy to this workflow's `job_workflow_ref`
+(`IamRitz/ssd-security-framework/.github/workflows/_break-glass-lambda.yml@<ref>`),
+so only this reviewed job — not an arbitrary job in the consumer repository —
+can assume it.
+
+### In-job break-glass (`_source-security.yml`, and HTTP in `_source-scan.yml`)
 
 The order of operations matters more than any individual check:
 
@@ -66,6 +113,18 @@ whole class of "the secret leaked / the secret rotated and CI broke" problems.
 Prefer it. The `http` transport remains for rollback and for existing consumers.
 
 ## Synthetic runs are isolated by construction
+
+**Lambda (`_break-glass-lambda.yml`): the route comes from the evidence.** The
+source gate records `synthetic: {active, fixture}` in `security-gate.json`
+whenever a fixture is injected (and `active: false` otherwise; a result with
+neither is refused). The break-glass workflow has **no** input that turns
+synthetic routing on or off. For synthetic evidence it requires
+`synthetic_lambda_function` **and** `synthetic_lambda_role_arn`, **and** the
+production pair to compare against, and refuses if either synthetic identifier
+equals production (an ARN of the production function counts as production).
+There is no fallback to production. All of this runs before the OIDC step.
+
+The rest of this section describes the in-job transports.
 
 `synthetic_block_fixture` injects a **fabricated** eligible BLOCK so the approval
 path can be demonstrated without real vulnerable code. That fabricated finding
