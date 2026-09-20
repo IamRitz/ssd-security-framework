@@ -26,7 +26,9 @@ A consumer provides only:
 | --- | --- |
 | `.github/workflows/security.yml` | the thin caller (start from [`examples/`](examples/)) |
 | `security/baseline/semgrep-baseline.json` | its own accepted-findings baseline — generated during onboarding, not copied |
-| `.gitleaks.toml`, `.trufflehog-exclude-paths.txt` | optional; absent means the scanner's default ruleset, never a skipped scan |
+| `.gitleaks.toml`, `.trufflehog-exclude-paths.txt` | optional; absent means the scanner's default ruleset, never a skipped scan. A `.gitleaks.toml` must contain `[extend] useDefault = true`, or it **replaces** every built-in rule |
+| `.semgrepignore` | recommended; without one Semgrep silently skips `tests/`, `build/`, `vendor/`, `node_modules/` |
+| `.ssd/onboarding.yml` | when onboarded with [`ssd-onboard`](docs/onboarding-cli.md): the non-secret config every generated workflow is rendered from |
 | `security/exemptions.json` | optional; deliberate, owned, expiring exceptions |
 
 `tools/verify-consumer-isolation.sh` proves this claim rather than asserting it,
@@ -36,11 +38,11 @@ and runs on every framework PR.
 
 | File | Purpose | Cloud credentials |
 | --- | --- | --- |
-| `_source-scan.yml` | secret scan, dependency scan, SAST, source gate — **for new callers**; no job can request OIDC | **none** |
-| `_break-glass-lambda.yml` | Lambda break-glass for an eligible BLOCK; validates this run's gate evidence before assuming any role | break-glass invoker role, **after** validation |
-| `_source-security.yml` | the v1 source workflow (the twin above is generated from it); keeps in-job Lambda break-glass for existing callers, so callers must grant `id-token: write` | break-glass invoker role only, after eligibility |
-| `_image-scan-prepush.yml` | Trivy over a built image tarball + pre-push gate | **none** |
-| `_artifact-gate.yml` | policy over a normalized registry report; names no registry | **none** |
+| `_source-scan.yml` | secret scan, dependency scan, SAST, source gate — **for new callers**; no job can request OIDC | **none** (optional Slack webhook secret, notifier only) |
+| `_break-glass-lambda.yml` | the dedicated credential-bearing path: Lambda break-glass for an eligible BLOCK; validates this run's gate evidence before assuming any role | break-glass invoker role, **after** validation (optional Slack webhook secret, notifier only) |
+| `_source-security.yml` | the v1 source workflow (the twin above is generated from it); keeps in-job Lambda break-glass for existing callers, so callers must grant `id-token: write` | break-glass invoker role only, after eligibility (optional Slack webhook secret, notifier only) |
+| `_image-scan-prepush.yml` | Trivy over a built image tarball + pre-push gate | **none** (optional Slack webhook secret, notifier only) |
+| `_artifact-gate.yml` | policy over a normalized registry report; names no registry | **none** (optional Slack webhook secret, notifier only) |
 | `_ecr-collect.yml` | the ECR adapter: push, poll by digest, normalize | ECR push+scan role |
 | `_conformance.yml` | which controls apply here, and what happened to each | **none** |
 
@@ -49,6 +51,15 @@ normalized report. The gate and the policy do not change.
 
 ## Quick start
 
+The supported path is [`ssd-onboard`](docs/onboarding-cli.md), which generates
+and maintains the callers below from a reviewed `.ssd/onboarding.yml`:
+
+```sh
+node <framework-checkout>/onboarding/cli.mjs init     # then: render, and open a PR
+```
+
+By hand, the minimal caller is:
+
 ```yaml
 jobs:
   source-security:
@@ -56,13 +67,18 @@ jobs:
     permissions:               # no id-token: nothing in _source-scan.yml can request one
       contents: read
       pull-requests: write
+    # A Slack webhook URL is a credential: it travels as a declared SECRET that
+    # reaches the notifier step only — never a repository variable under `with:`,
+    # never `secrets: inherit`.
+    secrets:
+      slack_notify_webhook: ${{ secrets.SECURITY_NOTIFY_SLACK_URL }}
     with:
       toolkit_ref: v1          # MUST match the @v1 above
       gate_mode: log-only      # start here; see the rollout sequence
       semgrep_configs: |
         p/owasp-top-ten
         p/javascript
-      semgrep_paths: src
+      semgrep_paths: .         # the whole repository; narrowing leaves code outside SAST
 ```
 
 Do not start at `enforce`. A repo that has never had SAST has a backlog, and
@@ -94,6 +110,8 @@ A conformance report that renders both as "skipped" tells a reviewer nothing.
 
 | Document | What it covers |
 | --- | --- |
+| [`docs/onboarding-cli.md`](docs/onboarding-cli.md) | `ssd-onboard`: the config file, the commands, generated profiles, coverage rules, migration |
+| [`docs/onboarding-architecture.md`](docs/onboarding-architecture.md) | why `ssd-onboard` is built the way it is: verified scanner behaviour, gaps found, API changes, the Phase 2 (AWS) and Phase 3 (break-glass) designs |
 | [`docs/onboarding.md`](docs/onboarding.md) | the full per-repo setup, AWS side included, and the rollout sequence |
 | [`docs/workflow-contracts.md`](docs/workflow-contracts.md) | every input, output, and portability rule |
 | [`docs/evidence-model.md`](docs/evidence-model.md) | the dependency evidence schema (relationship, version resolution, provenance, benchmarking reuse), scanner execution evidence, and the bounded developer summary built on them |
@@ -114,8 +132,10 @@ is always the default.
 ## Development
 
 ```sh
-node --test                          # toolkit + workflow structural guards
-./tools/verify-consumer-isolation.sh # prove a consumer needs no framework files
+node --test                              # toolkit, onboarding CLI + workflow structural guards
+./tools/verify-consumer-isolation.sh     # prove a consumer needs no framework files
+./tools/verify-generated-workflows.sh    # actionlint + PyYAML over every generated profile (docker)
+node tools/mutation-check-onboarding.mjs # every onboarding security invariant is actually tested
 ```
 
 The toolkit imports **Node builtins only**. That is what lets it drop onto any

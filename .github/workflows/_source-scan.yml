@@ -89,7 +89,7 @@ on:
         type: string
         default: ''
       slack_notify_url:
-        description: Slack incoming-webhook URL for developer-readable BLOCK alerts. Empty disables Slack. Suppressed only in log-only mode, or when an interactive break-glass request for the BLOCK was actually delivered.
+        description: 'DEPRECATED — use the slack_notify_webhook secret. A webhook URL is a credential; an input is printed unmasked in run logs. Slack incoming-webhook URL for developer-readable BLOCK alerts. Empty disables Slack. Suppressed only in log-only mode, or when an interactive break-glass request for the BLOCK was actually delivered.'
         type: string
         default: ''
       pr_number:
@@ -169,6 +169,13 @@ on:
     secrets:
       break_glass_shared_secret:
         description: HMAC shared secret for the break-glass request/decision channel. Not a cloud credential; required only when break_glass_enabled is true.
+        required: false
+      slack_notify_webhook:
+        description: >-
+          Slack incoming-webhook URL for developer-readable BLOCK alerts, passed as a SECRET: the URL is itself a
+          credential (anyone holding it can post to the channel). It reaches the notifier step
+          ONLY. Takes precedence over the deprecated `slack_notify_url` input, whose value is
+          printed unmasked in run logs.
         required: false
     outputs:
       verdict:
@@ -1032,6 +1039,22 @@ jobs:
           echo "accepted set, which is only meaningful while the gate is not enforcing." >&2
           exit 1
 
+      - name: Refuse baseline bootstrap from a diff-aware scan
+        # On pull_request and push, the SAST job runs Semgrep with
+        # --baseline-commit, so its report holds only findings the change
+        # INTRODUCED. A baseline generated from it would omit the repository's
+        # existing backlog, and the next full scan would BLOCK on everything the
+        # baseline was meant to accept. Only workflow_dispatch and schedule runs
+        # scan the full tree.
+        if: ${{ inputs.bootstrap_baseline && (github.event_name == 'pull_request' || github.event_name == 'push') }}
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          echo "bootstrap_baseline refused on a '$EVENT_NAME' run: that SAST scan is diff-aware (--baseline-commit)" >&2
+          echo "and would produce a baseline missing the existing backlog. Dispatch the workflow instead" >&2
+          echo "(workflow_dispatch runs a full-tree scan). See docs/onboarding.md § bootstrap." >&2
+          exit 1
+
       - name: Evaluate security policy
         id: evaluate
         continue-on-error: true
@@ -1130,7 +1153,22 @@ jobs:
         if: ${{ inputs.bootstrap_baseline && steps.verdict.outputs.integrity_trusted == 'true' }}
         env:
           SEMGREP_CONFIGS: ${{ inputs.semgrep_configs }}
+          SEMGREP_PATHS: ${{ inputs.semgrep_paths }}
           BASELINE_PATH: ${{ inputs.semgrep_baseline_path }}
+          # Provenance: binds the candidate to exactly this scan (repository,
+          # commit, ref, event, run, framework ref, Semgrep image/configs/paths,
+          # .semgrepignore hash). ssd-onboard refuses a candidate whose
+          # provenance does not match the repository it is accepted into.
+          CI_REPOSITORY: ${{ github.repository }}
+          CI_REPOSITORY_ID: ${{ github.repository_id }}
+          CI_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          CI_SHA: ${{ github.sha }}
+          CI_REF: ${{ github.ref }}
+          CI_EVENT: ${{ github.event_name }}
+          CI_RUN_ID: ${{ github.run_id }}
+          CI_RUN_ATTEMPT: ${{ github.run_attempt }}
+          TOOLKIT_REPOSITORY: ${{ inputs.toolkit_repository }}
+          TOOLKIT_REF: ${{ inputs.toolkit_ref }}
         run: |
           set -euo pipefail
           # Recorded in the baseline so a later scan with different rules cannot
@@ -1141,6 +1179,11 @@ jobs:
             --gate reports/security-gate.json \
             --rulesets "$rulesets" \
             --output reports/semgrep-baseline.candidate.json
+          node "$SSD_TOOLKIT/scripts/baseline-provenance.mjs" \
+            --candidate reports/semgrep-baseline.candidate.json \
+            --gate reports/security-gate.json \
+            --semgrepignore .semgrepignore \
+            --output reports/semgrep-baseline.candidate.provenance.json
           {
             echo "## Semgrep baseline candidate generated"
             echo
@@ -1259,6 +1302,13 @@ jobs:
           BREAK_GLASS_TIMEOUT_SECONDS: ${{ inputs.break_glass_timeout_seconds }}
         run: node "$SSD_TOOLKIT/scripts/break-glass-poll.mjs"
 
+      - name: Warn that the Slack webhook was passed as a plain input
+        # The URL is a credential. A workflow input is not masked, and a step's
+        # env is printed in the run log, so the value is readable by anyone with
+        # read access to Actions. The value itself is never echoed here.
+        if: ${{ always() && inputs.slack_notify_url != '' }}
+        run: echo "::warning::slack_notify_url is deprecated and unsafe — a webhook URL is a credential, and an input is printed unmasked in this run's log. Store it as a repository secret and pass it as the slack_notify_webhook secret (which takes precedence when both are set)."
+
       - name: Post developer-readable findings (Slack + PR comment + job summary)
         # Feedback only — never fails the gate (the gate's own verdict decides the
         # job result). Routing: BLOCK -> Slack + PR + summary; EXCEPTION -> PR +
@@ -1280,7 +1330,8 @@ jobs:
           # Distinguishes a fork PR's expected read-only-token denial from a
           # misconfigured permission. Read-only context; no trust decision rests on it.
           PR_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
-          SECURITY_NOTIFY_SLACK_URL: ${{ inputs.slack_notify_url }}
+          # The declared secret first; the legacy input only when no secret is passed.
+          SECURITY_NOTIFY_SLACK_URL: ${{ secrets.slack_notify_webhook || inputs.slack_notify_url }}
           SECURITY_REPRODUCE_COMMANDS: ${{ inputs.reproduce_commands }}
           BREAK_GLASS_ENABLED: ${{ inputs.break_glass_enabled }}
           BREAK_GLASS_DELEGATED: ${{ steps.delegate.outputs.break_glass_delegated }}
@@ -1335,6 +1386,7 @@ jobs:
             reports/break-glass-request.json
             reports/break-glass-decision.json
             reports/semgrep-baseline.candidate.json
+            reports/semgrep-baseline.candidate.provenance.json
             reports/DO-NOT-BASELINE.txt
           if-no-files-found: error
           retention-days: 14

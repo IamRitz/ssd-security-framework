@@ -222,7 +222,7 @@ describe('example aggregate checks distinguish PASS from BLOCK in log-only', () 
         IMAGE_RESULT: 'success',
         SOURCE_VERDICT: 'PASS',
         IMAGE_VERDICT: 'DEPLOY',
-        MODE: 'log-only',
+        SOURCE_MODE: 'log-only',
         IMAGE_MODE: 'log-only'
       });
       assert.equal(code, 0);
@@ -239,7 +239,7 @@ describe('example aggregate checks distinguish PASS from BLOCK in log-only', () 
         IMAGE_RESULT: 'success',
         SOURCE_VERDICT: 'PASS',
         IMAGE_VERDICT: 'BLOCK_DEPLOY',
-        MODE: 'log-only',
+        SOURCE_MODE: 'log-only',
         IMAGE_MODE: 'log-only'
       });
       assert.equal(code, 0);
@@ -254,7 +254,7 @@ describe('example aggregate checks distinguish PASS from BLOCK in log-only', () 
         IMAGE_RESULT: 'success',
         SOURCE_VERDICT: 'BLOCK',
         IMAGE_VERDICT: 'DEPLOY',
-        MODE: 'enforce',
+        SOURCE_MODE: 'enforce',
         IMAGE_MODE: 'enforce'
       });
       assert.equal(code, 1);

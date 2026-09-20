@@ -39,6 +39,12 @@ conformance report says so in words rather than leaving a hole.
 
 ## Part 1 — The repository **[REPO]**
 
+> **Recommended:** let [`ssd-onboard`](onboarding-cli.md) do Part 1. It records
+> the decisions below in a reviewed, non-secret `.ssd/onboarding.yml`, generates
+> the workflows and scanner configs from it, refuses layouts the scanners do not
+> fully cover, and walks the baseline lifecycle with explicit confirmations. The
+> rest of this part is the manual procedure it automates.
+
 ### 1.1 Bootstrap the first Semgrep baseline
 
 **Start here on a brand-new repository.** Everything else in Part 1 assumes this
@@ -71,18 +77,28 @@ while every scanner-integrity check stays exactly as strict.
 
 #### Run it once
 
-1. Add the caller workflow (§1.2) with `gate_mode: log-only`.
-2. Set the repository variable **`BOOTSTRAP_BASELINE=true`**
-   (the source-only example already wires this to the `bootstrap_baseline`
-   input; add the same line to any other caller).
-3. Run the workflow — open a PR, or dispatch it.
+1. Add the caller workflow (§1.2) with `gate_mode: log-only` and a
+   `workflow_dispatch` input wired to `bootstrap_baseline` (the source-only
+   example shows the exact lines).
+2. **Dispatch** the workflow on the default branch with the box ticked
+   (`gh workflow run security.yml -f bootstrap_baseline=true`). It must be a
+   dispatch (or scheduled) run: on `pull_request` and `push` the SAST scan is
+   diff-aware (`--baseline-commit`), reports only findings the change
+   introduced, and would produce a baseline missing the existing backlog. The
+   framework refuses bootstrap on those events.
+3. Wait for the run to finish.
 4. Download the **`security-gate-results`** artifact from that run.
+   The artifact also carries `semgrep-baseline.candidate.provenance.json`, which
+   binds the candidate to that run's repository, commit, framework ref, Semgrep
+   configs, paths and `.semgrepignore`. `ssd-onboard baseline prepare` /
+   `baseline accept` verify it and refuse a candidate that does not match the
+   checkout it is accepted into; copying the file by hand skips those checks.
 5. **Review `semgrep-baseline.candidate.json`.** This is the set of findings the
    repository is about to formally accept. Read it; do not rubber-stamp it.
 6. Commit it as `security/baseline/semgrep-baseline.json`
    (or whatever `semgrep_baseline_path` says).
-7. **Unset `BOOTSTRAP_BASELINE`.** Leaving it set is caught anyway — see below —
-   but the variable should not linger.
+7. **Remove the dispatch input** from the caller. Dispatching it again is caught
+   anyway — see below — but the option should not linger.
 
 From here the gate runs normally: your accepted findings log, and anything new
 blocks. Proceed to §1.5 and the rollout in Part 4.
@@ -209,7 +225,8 @@ carries a warning that a control which did not execute cannot have passed.
 
 **Feed conformance per-control evidence, never the aggregate.** Copy the `observed`
 block from your example as-is. It reads each source control from its own output of
-`_source-security.yml`:
+the source workflow (`_source-scan.yml` for new callers, `_source-security.yml`
+for legacy v1 callers — both publish the same per-control outputs):
 
 ```yaml
 observed: >-
@@ -270,10 +287,19 @@ security gate.
 # .github/CODEOWNERS
 /.github/workflows/          @your-org/security-engineering
 /.github/CODEOWNERS          @your-org/security-engineering
+/.ssd/                       @your-org/security-engineering
 /security/baseline/          @your-org/security-engineering
 /security/exemptions.json    @your-org/security-engineering
 /security/policy.yaml        @your-org/security-engineering
+/.semgrepignore              @your-org/security-engineering
+/.gitleaks.toml              @your-org/security-engineering
+/.trufflehog-exclude-paths.txt @your-org/security-engineering
 ```
+
+The last three narrow what the scanners see without touching a workflow: a
+`.semgrepignore` line removes code from SAST, a `.gitleaks.toml` without
+`[extend] useDefault = true` replaces every built-in secret rule, and an exclude
+line hides paths from TruffleHog.
 
 **This file alone enforces nothing.** It is advisory until branch protection
 enables *Require review from Code Owners* with at least one required approval
@@ -561,6 +587,12 @@ Variables, not static AWS secrets:
 | `EC2_INSTANCE_ID` | `i-0123456789abcdef0` |
 | `GATE_MODE` | `log-only` during rollout, then unset or `enforce` |
 
+`SECURITY_NOTIFY_SLACK_URL` is **not** a variable: the webhook URL is a
+credential. Store it as a repository **secret** and pass it as
+`secrets: slack_notify_webhook` (see [workflow-contracts.md](workflow-contracts.md)).
+`ssd-onboard` renders these values as literals from `.ssd/onboarding.yml`
+instead of variables, so a change to any of them is a reviewed diff.
+
 If any are missing, the AWS stages detect that and **visibly skip** rather than
 failing — so a repo can adopt Part 1 today and Part 2 later.
 
@@ -698,7 +730,7 @@ findings they did not introduce.
 
 | Phase | Setting | Leave when |
 | --- | --- | --- |
-| **0. Bootstrap** | `gate_mode: log-only` + `bootstrap_baseline: true`, once | the candidate baseline is reviewed and committed, and the variable is unset (§1.1) |
+| **0. Bootstrap** | `gate_mode: log-only` + one **dispatched** `bootstrap_baseline: true` run | the candidate baseline is reviewed and committed, and the dispatch input is removed (§1.1) |
 | **1. Log-only** | `gate_mode: log-only` | you have seen a few real PRs' worth of findings |
 | **2. Tune / baseline** | still `log-only` | rule noise is tuned and the baseline is regenerated from a **trusted** run if needed |
 | **3. Enforce on PRs** | `gate_mode: enforce`, `security-gate` required | the team is merging green without heroics for a week or two |
@@ -728,6 +760,10 @@ being "in rollout" and started being "unprotected".
 | `bootstrap refused: a Semgrep baseline already exists` | Bootstrap is for first onboarding only. If the baseline genuinely needs rebuilding, delete it in a reviewed PR first (§1.1). |
 | `Baseline bootstrap FAILED: this run's scans could not be trusted` | A scanner could not interpret its input, so nothing may be baselined from it. Fix the scanner failure reported above it (§1.1). |
 | Bootstrap ran but no candidate appeared | It refuses outside `gate_mode: log-only`, and refuses when a baseline exists (§1.1). |
+| `bootstrap_baseline refused on a 'pull_request' run` | PR and push scans are diff-aware; dispatch the workflow instead (§1.1). |
+| The run log warns `slack_notify_url is deprecated and unsafe` | The webhook URL was passed as an input and printed in the log. Rotate it, store it as a secret, and pass `secrets: slack_notify_webhook` ([onboarding-cli.md § Slack](onboarding-cli.md#slack-from-a-repository-variable-to-a-secret)). |
+| A secret the default Gitleaks rules would catch is not reported | A `.gitleaks.toml` without `[extend] useDefault = true` replaces the built-in ruleset. |
+| Semgrep never reports anything in `tests/` | No `.semgrepignore`: Semgrep's built-in ignore list skips `tests/`, `test/`, `build/`, `vendor/`, `node_modules/`. Commit an explicit one. |
 | A container PR merged with a failing image gate | The required check aggregated only source security. Use the shipped example's `security-gate` job, which aggregates both (§1.6). |
 | Conformance shows `deferred` controls | Correct on a pull request: those controls run in the `delivery` phase. They are required, and proven by the `deploy.yml` run (§1.3). |
 | Conformance reports secret scanning, dependency scanning **and** SAST failed whenever the gate BLOCKs | The caller feeds `needs.source-security.result` (the aggregate) to every source control. Use the per-control outputs `secret_scan_result`, `dependency_scan_result`, `sast_result`, `source_gate_result` (§1.3). |

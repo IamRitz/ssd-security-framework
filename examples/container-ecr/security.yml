@@ -43,6 +43,10 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
+    # The webhook URL is a credential: pass it as a declared SECRET (never a
+    # repository variable, never `secrets: inherit`). Only the notifier step reads it.
+    secrets:
+      slack_notify_webhook: ${{ secrets.SECURITY_NOTIFY_SLACK_URL }}
     with:
       # toolkit_ref MUST match the @v1 above. See docs/versioning.md.
       toolkit_ref: v1
@@ -50,8 +54,9 @@ jobs:
       semgrep_configs: |
         p/owasp-top-ten
         p/javascript
-      semgrep_paths: src
-      slack_notify_url: ${{ vars.SECURITY_NOTIFY_SLACK_URL }}
+      # `.` = the whole repository. Narrowing puts everything else OUTSIDE SAST, and
+      # without a .semgrepignore Semgrep silently skips tests/, build/, vendor/ … too.
+      semgrep_paths: .
       break_glass_enabled: true
       break_glass_transport: lambda
 
@@ -70,6 +75,11 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    # The source workflow always sends its own BLOCK alert; this adds one if the
+    # approval request could not be delivered. The webhook URL is a credential:
+    # it travels as a declared SECRET reaching the notifier step only.
+    secrets:
+      slack_notify_webhook: ${{ secrets.SECURITY_NOTIFY_SLACK_URL }}
     with:
       toolkit_ref: v1
       gate_mode: ${{ needs.source-security.outputs.gate_mode }}
@@ -77,9 +87,6 @@ jobs:
       lambda_function: ${{ vars.BREAK_GLASS_LAMBDA_FUNCTION }}
       lambda_role_arn: ${{ vars.BREAK_GLASS_LAMBDA_ROLE_ARN }}
       aws_region: ${{ vars.AWS_REGION }}
-      # The source workflow always sends its own BLOCK alert; this adds one if
-      # the approval request could not be delivered.
-      slack_notify_url: ${{ vars.SECURITY_NOTIFY_SLACK_URL }}
 
   container-build:
     # Repo-specific: the consumer owns its own build. Holds ZERO cloud
@@ -118,11 +125,14 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
+    # The webhook URL is a credential: pass it as a declared SECRET (never a
+    # repository variable, never `secrets: inherit`). Only the notifier step reads it.
+    secrets:
+      slack_notify_webhook: ${{ secrets.SECURITY_NOTIFY_SLACK_URL }}
     with:
       toolkit_ref: v1
       image_artifact: application-image-${{ github.sha }}
       gate_mode: ${{ vars.GATE_MODE || 'enforce' }}
-      slack_notify_url: ${{ vars.SECURITY_NOTIFY_SLACK_URL }}
 
   security-gate:
     # THE stable required check for branch protection, and it must represent
@@ -175,7 +185,7 @@ jobs:
           IMAGE_RESULT: ${{ needs.image-security.result }}
           SOURCE_VERDICT: ${{ needs.source-security.outputs.verdict }}
           IMAGE_VERDICT: ${{ needs.image-security.outputs.verdict }}
-          MODE: ${{ needs.source-security.outputs.gate_mode }}
+          SOURCE_MODE: ${{ needs.source-security.outputs.gate_mode }}
           IMAGE_MODE: ${{ needs.image-security.outputs.gate_mode }}
           # Every further fact the source-leg decision needs (final-gate.mjs also
           # reads SOURCE_RESULT and SOURCE_VERDICT above). Empty = missing = BLOCK.
@@ -238,7 +248,7 @@ jobs:
               echo "::warning::$control verdict is unavailable, and gate_mode is log-only so nothing is enforced. Treat it as UNKNOWN, not clean."
             fi
           }
-          report_log_only "source" "$MODE" "$SOURCE_VERDICT" BLOCK
+          report_log_only "source" "$SOURCE_MODE" "$SOURCE_VERDICT" BLOCK
           if [ "$IMAGE_RESULT" != "skipped" ]; then
             report_log_only "image" "$IMAGE_MODE" "$IMAGE_VERDICT" BLOCK_DEPLOY
           fi

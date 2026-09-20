@@ -61,6 +61,10 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
+    # The webhook URL is a credential: pass it as a declared SECRET (never a
+    # repository variable, never `secrets: inherit`). Only the notifier step reads it.
+    secrets:
+      slack_notify_webhook: ${{ secrets.SECURITY_NOTIFY_SLACK_URL }}
     with:
       # toolkit_ref MUST match the @v1 above. See docs/versioning.md.
       toolkit_ref: v1
@@ -68,8 +72,9 @@ jobs:
       semgrep_configs: |
         p/owasp-top-ten
         p/javascript
-      semgrep_paths: src
-      slack_notify_url: ${{ vars.SECURITY_NOTIFY_SLACK_URL }}
+      # `.` = the whole repository. Narrowing puts everything else OUTSIDE SAST, and
+      # without a .semgrepignore Semgrep silently skips tests/, build/, vendor/ … too.
+      semgrep_paths: .
       break_glass_enabled: true
       break_glass_transport: lambda
 
@@ -92,6 +97,11 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    # The source workflow always sends its own BLOCK alert; this adds one if the
+    # approval request could not be delivered. The webhook URL is a credential:
+    # it travels as a declared SECRET reaching the notifier step only.
+    secrets:
+      slack_notify_webhook: ${{ secrets.SECURITY_NOTIFY_SLACK_URL }}
     with:
       toolkit_ref: v1
       gate_mode: ${{ needs.source-security.outputs.gate_mode }}
@@ -101,9 +111,6 @@ jobs:
       lambda_function: ${{ vars.BREAK_GLASS_LAMBDA_FUNCTION }}
       lambda_role_arn: ${{ vars.BREAK_GLASS_LAMBDA_ROLE_ARN }}
       aws_region: ${{ vars.AWS_REGION }}
-      # The source workflow always sends its own BLOCK alert; this adds one if
-      # the approval request could not be delivered.
-      slack_notify_url: ${{ vars.SECURITY_NOTIFY_SLACK_URL }}
 
   security-gate:
     # THE AUTHORIZATION BOUNDARY for this delivery run, and the job every
@@ -229,11 +236,14 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
+    # The webhook URL is a credential: pass it as a declared SECRET (never a
+    # repository variable, never `secrets: inherit`). Only the notifier step reads it.
+    secrets:
+      slack_notify_webhook: ${{ secrets.SECURITY_NOTIFY_SLACK_URL }}
     with:
       toolkit_ref: v1
       image_artifact: application-image-${{ github.sha }}
       gate_mode: ${{ vars.GATE_MODE || 'enforce' }}
-      slack_notify_url: ${{ vars.SECURITY_NOTIFY_SLACK_URL }}
 
   aws-configuration:
     name: AWS configuration
@@ -321,6 +331,10 @@ jobs:
     uses: IamRitz/ssd-security-framework/.github/workflows/_artifact-gate.yml@v1
     permissions:
       contents: read
+    # The webhook URL is a credential: pass it as a declared SECRET (never a
+    # repository variable, never `secrets: inherit`). Only the notifier step reads it.
+    secrets:
+      slack_notify_webhook: ${{ secrets.SECURITY_NOTIFY_SLACK_URL }}
     with:
       toolkit_ref: v1
       report_artifact: ${{ needs.ecr-collect.outputs.report_artifact }}
@@ -328,7 +342,6 @@ jobs:
       # Re-assert the exact manifest digest that was pushed and scanned.
       expected_digest: ${{ needs.ecr-collect.outputs.image_digest }}
       gate_mode: ${{ vars.GATE_MODE || 'enforce' }}
-      slack_notify_url: ${{ vars.SECURITY_NOTIFY_SLACK_URL }}
 
   deploy:
     name: Deploy

@@ -15,6 +15,8 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
+import { parseYaml } from '../onboarding/lib/yaml.mjs';
+
 const WORKFLOW_DIR = '.github/workflows';
 
 const read = (file) => readFileSync(join(WORKFLOW_DIR, file), 'utf8');
@@ -24,6 +26,8 @@ const readExecutable = (file) =>
     .split('\n')
     .filter((line) => !/^\s*#/.test(line))
     .join('\n');
+
+const workflowCall = (file) => parseYaml(read(file)).on.workflow_call;
 
 const REUSABLE = readdirSync(WORKFLOW_DIR).filter(
   (name) => name.startsWith('_') && name.endsWith('.yml')
@@ -39,6 +43,16 @@ const CREDENTIAL_FREE = ['_image-scan-prepush.yml', '_artifact-gate.yml', '_conf
 // The credential-bearing break-glass workflow loads its validation code from a
 // FIXED repository, never from an input a caller could repoint.
 const FIXED_TOOLKIT_REPOSITORY = ['_break-glass-lambda.yml'];
+
+// Every reusable workflow that accepts the Slack webhook as a declared secret.
+// The URL is itself a credential, so it must reach exactly one notifier step.
+const SLACK_SECRET_WORKFLOWS = [
+  '_source-security.yml',
+  '_source-scan.yml',
+  '_break-glass-lambda.yml',
+  '_image-scan-prepush.yml',
+  '_artifact-gate.yml'
+];
 
 describe('the framework ships the expected reusable workflows', () => {
   it('has all seven, and they are workflow_call only', () => {
@@ -164,19 +178,58 @@ describe('the credential boundary', () => {
     }
   });
 
-  it('only the source workflows declare a secret, and only the legacy HTTP break-glass one', () => {
-    // `_source-scan.yml` keeps the legacy HTTP transport in-job (it needs no
-    // OIDC), so it keeps the same one non-cloud secret. The Lambda break-glass
-    // workflow needs none at all.
-    for (const file of ['_source-security.yml', '_source-scan.yml']) {
-      const source = read(file);
-      const declared = [...source.matchAll(/^ {6}([a-z0-9_]+):\s*$/gm)]
-        .map((match) => match[1])
-        .filter((name) => source.includes(`secrets:\n      ${name}:`));
-      assert.deepEqual(declared, ['break_glass_shared_secret'], file);
+  it('declares exactly the secrets each workflow needs — none of them a cloud credential', () => {
+    // The Slack webhook is a credential (anyone holding the URL can post), so it
+    // travels as a declared secret rather than a logged input; see
+    // docs/onboarding-architecture.md A.5. `_source-scan.yml` keeps the legacy
+    // HTTP break-glass transport in-job (it needs no OIDC), so it keeps the same
+    // one non-cloud break-glass secret as the v1 workflow it is generated from.
+    // `_break-glass-lambda.yml` needs none for its transport — only the webhook.
+    // `_ecr-collect.yml` and `_conformance.yml` accept no secrets at all.
+    const expected = {
+      '_source-security.yml': ['break_glass_shared_secret', 'slack_notify_webhook'],
+      '_source-scan.yml': ['break_glass_shared_secret', 'slack_notify_webhook'],
+      '_break-glass-lambda.yml': ['slack_notify_webhook'],
+      '_image-scan-prepush.yml': ['slack_notify_webhook'],
+      '_artifact-gate.yml': ['slack_notify_webhook'],
+      '_ecr-collect.yml': [],
+      '_conformance.yml': []
+    };
+    assert.deepEqual(Object.keys(expected).sort(), [...REUSABLE].sort(), 'every reusable workflow needs a declared secret expectation');
+    for (const [file, names] of Object.entries(expected)) {
+      const declared = workflowCall(file).secrets ?? {};
+      assert.deepEqual(Object.keys(declared).sort(), names, `${file} declares an unexpected secret set`);
+      for (const [name, spec] of Object.entries(declared)) {
+        assert.equal(spec.required, false, `${file}: secret ${name} must be optional`);
+      }
     }
-    for (const file of [...CREDENTIAL_FREE.filter((name) => name !== '_source-scan.yml'), '_break-glass-lambda.yml']) {
-      assert.ok(!/^ {4}secrets:/m.test(read(file)), `${file} must accept no secrets`);
+  });
+
+  it('the Slack webhook secret reaches the notifier step and nothing else', () => {
+    for (const file of SLACK_SECRET_WORKFLOWS) {
+      const { jobs } = parseYaml(read(file));
+      const readers = [];
+      for (const [jobId, job] of Object.entries(jobs)) {
+        const { steps = [], ...jobLevel } = job;
+        assert.ok(!/secrets\./.test(JSON.stringify(jobLevel)), `${file}: job ${jobId} must not read a secret at job level`);
+        for (const step of steps) {
+          if (JSON.stringify(step).includes('secrets.slack_notify_webhook')) {
+            readers.push(`${jobId}/${step.name}`);
+            assert.ok(!('run' in step && /secrets\./.test(step.run)), 'the secret must never be interpolated into a script');
+          }
+        }
+      }
+      assert.equal(readers.length, 1, `${file}: exactly one step may read the webhook secret (got ${readers.join(', ') || 'none'})`);
+      assert.match(readers[0], /\/Post developer-readable/, `${file}: only the notifier may read the webhook secret`);
+    }
+  });
+
+  it('no scanner job in either source workflow can read any secret', () => {
+    for (const file of ['_source-security.yml', '_source-scan.yml']) {
+      const { jobs } = parseYaml(read(file));
+      for (const jobId of ['secret-scanning', 'dependency-scanning', 'sast']) {
+        assert.ok(!/secrets\./.test(JSON.stringify(jobs[jobId])), `${file}: ${jobId} must not reference any secret`);
+      }
     }
   });
 });
@@ -640,8 +693,21 @@ describe('the notifier receives the break-glass state it describes', () => {
     }
   });
 
-  it('holds no approval credential', () => {
-    assert.ok(!/secrets\./.test(notify), 'the notifier must not receive the break-glass secret');
+  it('holds no approval credential; the only secret it reads is the notification webhook', () => {
+    assert.ok(!/secrets\.break_glass_shared_secret/.test(notify), 'the notifier must not receive the break-glass secret');
+    assert.deepEqual([...new Set([...notify.matchAll(/secrets\.([a-z_]+)/g)].map((m) => m[1]))], ['slack_notify_webhook']);
+  });
+
+  it('refuses a bootstrap on a diff-aware (pull_request / push) scan, before the gate evaluates', () => {
+    // A PR/push Semgrep scan uses --baseline-commit and reports only new
+    // findings; a baseline built from it would omit the existing backlog.
+    const guard = step('Refuse baseline bootstrap from a diff-aware scan');
+    assert.match(
+      guard,
+      /if: \$\{\{ inputs\.bootstrap_baseline && \(github\.event_name == 'pull_request' \|\| github\.event_name == 'push'\) \}\}/
+    );
+    assert.match(guard, /exit 1/);
+    assert.ok(gate.indexOf('Refuse baseline bootstrap from a diff-aware scan') < gate.indexOf('Evaluate security policy'));
   });
 
   it('image gates pass no break-glass state: they have no break-glass path', () => {

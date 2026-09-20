@@ -1,0 +1,13 @@
+name: caller (repro)
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  call:
+    uses: ./.github/workflows/_reusable.yml
+    permissions:
+      contents: read
+      # id-token: write   # uncomment and the run starts
+    with:
+      enabled: false

@@ -54,13 +54,30 @@ jobs:
         # for the container profiles.
         run: ./tools/verify-onboarding-profiles.sh
 
+      - name: Prove generated consumer workflows are valid Actions (actionlint, PyYAML)
+        # ssd-onboard renders every profile variant; actionlint (pinned by digest)
+        # checks them and the examples independently of ssd-onboard's own parser.
+        run: ./tools/verify-generated-workflows.sh
+
+      - name: Re-verify pinned scanner behaviour the onboarding model depends on
+        # Semgrep's scope with/without .semgrepignore (vs the recorded fixture)
+        # and Gitleaks default-rule inheritance, run with the pinned images.
+        run: node tools/verify-scanner-behaviour.mjs
+
+      - name: Prove the onboarding tests guard their security invariants
+        # Breaks each invariant (default Gitleaks rules, credential separation,
+        # no silent baseline acceptance, ...) in a scratch copy; every mutation
+        # must make the tests fail.
+        run: node tools/mutation-check-onboarding.mjs
+
       - name: The toolkit must stay dependency-free
         # Every script imports only Node builtins. That is what lets the toolkit
         # be dropped into any consumer's runner with nothing installed, and it is
         # why there is no lockfile here for a consumer's OSV scan to trip over.
+        # The onboarding CLI follows the same rule.
         run: |
-          if grep -rnE "^import .* from '(?!node:)[^.]" security/scripts --include='*.mjs' -P; then
-            echo "A toolkit script imports a third-party module; the toolkit must use Node builtins only." >&2
+          if grep -rnE "^import .* from '(?!node:)[^.]" security/scripts onboarding --include='*.mjs' -P; then
+            echo "A toolkit or onboarding script imports a third-party module; they must use Node builtins only." >&2
             exit 1
           fi
-          echo "Toolkit imports are Node builtins and relative paths only."
+          echo "Toolkit and onboarding imports are Node builtins and relative paths only."
