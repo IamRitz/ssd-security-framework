@@ -34,6 +34,16 @@ on:
         description: Whether an approval channel is configured for this repository.
         type: boolean
         default: false
+      strict_break_glass_evidence:
+        description: >-
+          Judge the break-glass control ONLY from structured evidence observed from
+          _break-glass-lambda.yml (status, decision, request_delivered, gate_digest, delegated) plus
+          the source-gate record; a status-only entry such as {"status":"pass"} fails, and a
+          source-gate `override: approved` is honoured only when that evidence proves it.
+          Default `false` keeps v1 behaviour (status-only accepted, with a deprecation warning, and
+          `override` ignored). Every new caller should set `true`; it becomes unconditional in v2.
+        type: boolean
+        default: false
       phase:
         description: >-
           Execution phase of THIS run: `pr` (pull request / scheduled sweep) or `delivery`
@@ -45,8 +55,12 @@ on:
       observed:
         description: >-
           JSON object mapping control id to {"status": "...", "evidence": "..."}. Callers
-          build this from their job results. A control that applies but is absent here is
-          reported FAILED: absence of evidence is not evidence the control ran.
+          build this from PER-CONTROL results — for the source controls, the
+          secret_scan_result / dependency_scan_result / sast_result / source_gate_result
+          outputs of _source-security.yml, never its aggregate job result. A gate control
+          may add "verdict", "gate_mode" and "integrity_trusted" so a failure is explained
+          (policy BLOCK vs fail-closed integrity). A control that applies but is absent
+          here is reported FAILED: absence of evidence is not evidence the control ran.
         type: string
         required: true
       exemptions_path:
@@ -167,6 +181,7 @@ jobs:
           REGISTRY: ${{ inputs.registry }}
           DEPLOY_TARGET: ${{ inputs.deploy_target }}
           BREAK_GLASS_ENABLED: ${{ inputs.break_glass_enabled }}
+          STRICT_BREAK_GLASS_EVIDENCE: ${{ inputs.strict_break_glass_evidence }}
           PHASE: ${{ inputs.phase }}
         run: |
           mkdir -p reports
@@ -176,6 +191,7 @@ jobs:
             --registry "$REGISTRY" \
             --deploy-target "$DEPLOY_TARGET" \
             --break-glass "$BREAK_GLASS_ENABLED" \
+            --strict-break-glass-evidence "${STRICT_BREAK_GLASS_EVIDENCE:-false}" \
             --phase "$PHASE" \
             --exemptions "$EXEMPTIONS_PATH" \
             --observed "$OBSERVED" \
@@ -184,7 +200,11 @@ jobs:
           status=${PIPESTATUS[0]}
           set -e
           # An unreadable report is a failure, not zero failures.
-          failed="$(node -e 'try{process.stdout.write(String(require("./reports/conformance.json").summary.failed))}catch{process.stdout.write("1")}')"
+          readable=true
+          failed="$(node -e 'try{process.stdout.write(String(require("./reports/conformance.json").summary.failed))}catch{process.exit(1)}')" || {
+            readable=false
+            failed=1
+          }
           na="$(node -e 'try{process.stdout.write(String(require("./reports/conformance.json").summary.notApplicable))}catch{process.stdout.write("0")}')"
           exempt="$(node -e 'try{process.stdout.write(String(require("./reports/conformance.json").summary.exempt))}catch{process.stdout.write("0")}')"
           deferred="$(node -e 'try{process.stdout.write(String(require("./reports/conformance.json").summary.deferred))}catch{process.stdout.write("0")}')"
@@ -194,7 +214,18 @@ jobs:
             echo "exempt=$exempt"
             echo "deferred=$deferred"
           } >> "$GITHUB_OUTPUT"
-          exit "$status"
+          # The engine exits 1 when a control failed. That is a RESULT, recorded
+          # in `failed` and decided by the enforce step below — not a crash of this
+          # step. Only an engine that produced no readable report, or a non-zero
+          # exit that recorded no failed control, is an execution failure here.
+          if [ "$readable" != "true" ]; then
+            echo "The conformance engine produced no readable report (exit $status)." >&2
+            exit $(( status == 0 ? 1 : status ))
+          fi
+          if [ "$status" -ne 0 ] && [ "$failed" = "0" ]; then
+            echo "The conformance engine exited $status without recording a failed control." >&2
+            exit "$status"
+          fi
 
       - name: Upload the conformance report
         if: always()
@@ -216,7 +247,11 @@ jobs:
             echo "::warning::${EXEMPT} control(s) are EXEMPT. That is accepted debt with an owner and an expiry, not coverage."
           fi
           if [ "$GATE_MODE" = "log-only" ]; then
-            echo "::warning::gate_mode=log-only — ${FAILED:-?} failed control(s) reported but NOT enforced."
+            if [ "${FAILED:-1}" = "0" ]; then
+              echo "::warning::Conformance: every applicable control passed. gate_mode=log-only; no failed control exists, so nothing was suppressed. log-only is a rollout mode: a future failed control would be reported without failing this job."
+            else
+              echo "::warning::Conformance: ${FAILED:-unknown} applicable control(s) failed, but gate_mode=log-only so the failure is reported and NOT enforced."
+            fi
             exit 0
           fi
           if [ "${FAILED:-1}" != "0" ]; then

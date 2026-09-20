@@ -163,7 +163,9 @@ async function main() {
     await writeFile(options.output, `${JSON.stringify(result, null, 2)}\n`);
     console.log(`Break-glass request ${result.requestId} is pending`);
   } catch (error) {
-    console.error(`BREAK-GLASS: DENIED (${error.message})`);
+    // No decision exists at this point: the request (or, with --check-only, the
+    // eligibility check) failed before any approver could act. Never a denial.
+    console.error(`BREAK-GLASS: ERROR (request not delivered: ${error.message})`);
     process.exitCode = 1;
   }
 }

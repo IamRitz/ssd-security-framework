@@ -119,7 +119,21 @@ function registryFinding(policy, finding, mode) {
       ? { fixedVersion: finding.fixedVersion }
       : {}),
     ...(typeof finding.title === 'string' && finding.title !== '' ? { title: finding.title } : {}),
-    ...(typeof finding.url === 'string' ? { url: finding.url } : {})
+    ...(typeof finding.url === 'string' ? { url: finding.url } : {}),
+    // Optional scanner evidence, passed through for developer guidance only.
+    ...(typeof finding.scannerSeverity === 'string' ? { scannerSeverity: finding.scannerSeverity } : {}),
+    ...(typeof finding.fixAvailability === 'string' ? { fixAvailability: finding.fixAvailability } : {}),
+    ...(Array.isArray(finding.packages)
+      ? {
+          packages: finding.packages
+            .filter((pkg) => pkg && typeof pkg.name === 'string')
+            .map((pkg) => ({
+              name: pkg.name,
+              ...(typeof pkg.version === 'string' ? { version: pkg.version } : {}),
+              ...(typeof pkg.fixedInVersion === 'string' ? { fixedInVersion: pkg.fixedInVersion } : {})
+            }))
+        }
+      : {})
   };
 }
 
@@ -257,6 +271,12 @@ function evaluateTrivy(policy, report) {
         id: vulnerability.VulnerabilityID,
         package: vulnerability.PkgName,
         severity,
+        // Trivy's own rating; UNKNOWN is classified high by trivySeverity.
+        ...(typeof vulnerability.Severity === 'string' ? { scannerSeverity: vulnerability.Severity } : {}),
+        ...(typeof vulnerability.InstalledVersion === 'string'
+          ? { installedVersion: vulnerability.InstalledVersion }
+          : {}),
+        ...(typeof result.Target === 'string' ? { target: result.Target } : {}),
         fixAvailable,
         action: policyAction(policy, policyRule),
         policyRule,
@@ -283,7 +303,12 @@ function evaluateTrivy(policy, report) {
         severity: 'critical',
         action: 'BLOCK_DEPLOY',
         policyRule: 'image.secret',
-        reason: `secret detected in image layer (${secret.Title ?? secret.RuleID})`
+        reason: `secret detected in image layer (${secret.Title ?? secret.RuleID})`,
+        // Trivy's own rating (the gate classifies every image secret critical),
+        // and where inside the IMAGE it was found — not a repository path.
+        ...(typeof secret.Severity === 'string' ? { scannerSeverity: secret.Severity } : {}),
+        ...(typeof secret.Title === 'string' && secret.Title !== '' ? { title: secret.Title } : {}),
+        ...(typeof result.Target === 'string' ? { target: result.Target } : {})
       });
     }
   }
@@ -369,6 +394,85 @@ function parseArguments(arguments_) {
   return paths;
 }
 
+// ---- console output -----------------------------------------------------------
+//
+// PRESENTATION ONLY. The written JSON is the complete record; the console is a
+// bounded pointer to it. A real image routinely carries hundreds of findings,
+// so the log gets the verdict, the recorded counts, a short deterministic
+// blocker preview with its exact omission, and the path to the full result.
+// Integrity failures and image secrets are always printed in full: an
+// integrity failure may be the only evidence there is, and a secret must never
+// be hidden behind a vulnerability preview.
+
+export const CONSOLE_PREVIEW_LIMIT = 5;
+
+const CONSOLE_SEVERITY_RANK = { critical: 0, high: 1, medium: 2, low: 3 };
+
+const isIntegrity = (finding) =>
+  finding.id === 'report-integrity' ||
+  (typeof finding.policyRule === 'string' && finding.policyRule.endsWith('report_integrity'));
+
+function consoleLine(finding) {
+  const pkg = typeof finding.package === 'string' && finding.package !== '' ? ` ${finding.package}` : '';
+  const installed = pkg && typeof finding.installedVersion === 'string' ? ` ${finding.installedVersion}` : '';
+  const fixed = pkg && typeof finding.fixedVersion === 'string' ? ` -> ${finding.fixedVersion}` : '';
+  const where = finding.policyRule === 'image.secret' && typeof finding.target === 'string' ? ` in ${finding.target}` : '';
+  return `  ${String(finding.severity).toUpperCase()} ${finding.id}${pkg}${installed}${fixed}${where} (${finding.policyRule})`;
+}
+
+export function consoleSummary(result, outputPath) {
+  const findings = Array.isArray(result.findings) ? result.findings : [];
+  const summary = result.summary ?? {};
+  const lines = [`IMAGE GATE: ${result.verdict}`];
+
+  const integrity = findings.filter(isIntegrity);
+  for (const finding of integrity) {
+    lines.push(`INTEGRITY FAILURE (${finding.policyRule}): ${finding.reason}`);
+  }
+  if (integrity.length > 0) {
+    lines.push('The image scan could not be trusted: results are UNKNOWN, not clean.');
+  }
+
+  // The counts exactly as recorded in the result's `summary`.
+  const counts = [`${summary.blockDeploy ?? 0} blocking`];
+  if (Object.hasOwn(summary, 'exception')) counts.push(`${summary.exception} exception`);
+  counts.push(`${summary.log ?? 0} logged findings`);
+  lines.push(counts.join(' · '));
+
+  // Secrets first and never truncated, then Critical before High; ties break on
+  // package, id and position so the preview is identical run to run.
+  const blockers = findings
+    .map((finding, index) => ({ finding, index }))
+    .filter(({ finding }) => finding.action === 'BLOCK_DEPLOY' && !isIntegrity(finding));
+  const secrets = blockers.filter(({ finding }) => finding.policyRule === 'image.secret');
+  const vulnerabilities = blockers
+    .filter(({ finding }) => finding.policyRule !== 'image.secret')
+    .sort(
+      (a, b) =>
+        (CONSOLE_SEVERITY_RANK[a.finding.severity] ?? 9) - (CONSOLE_SEVERITY_RANK[b.finding.severity] ?? 9) ||
+        String(a.finding.package ?? '').localeCompare(String(b.finding.package ?? '')) ||
+        String(a.finding.id).localeCompare(String(b.finding.id)) ||
+        a.index - b.index
+    );
+  const preview = vulnerabilities.slice(0, CONSOLE_PREVIEW_LIMIT);
+  if (secrets.length + preview.length > 0) {
+    lines.push(
+      vulnerabilities.length > preview.length
+        ? `Blocking (${secrets.length > 0 ? 'every secret, then ' : ''}the first ${preview.length} of ${vulnerabilities.length} vulnerabilities, Critical first):`
+        : 'Blocking:'
+    );
+    for (const { finding } of [...secrets, ...preview]) {
+      lines.push(consoleLine(finding));
+    }
+    const omitted = vulnerabilities.length - preview.length;
+    if (omitted > 0) {
+      lines.push(`  ... ${omitted} more blocking finding${omitted === 1 ? '' : 's'} not shown`);
+    }
+  }
+  lines.push(`Full normalized findings: ${outputPath}`);
+  return lines.join('\n');
+}
+
 async function main() {
   let paths;
 
@@ -381,12 +485,7 @@ async function main() {
   }
 
   const result = await runImageGate(paths);
-  for (const finding of result.findings) {
-    console.log(
-      `${finding.action} ${finding.id} (${finding.policyRule}): ${finding.reason}`
-    );
-  }
-  console.log(`IMAGE GATE: ${result.verdict}`);
+  console.log(consoleSummary(result, paths.output ?? DEFAULT_PATHS.output));
   process.exitCode = result.verdict === 'BLOCK_DEPLOY' ? 1 : 0;
 }
 

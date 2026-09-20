@@ -27,7 +27,10 @@ permissions:
 
 jobs:
   source-security:
-    uses: IamRitz/ssd-security-framework/.github/workflows/_source-security.yml@v1
+    # `_source-scan.yml`: the OIDC-free source workflow. This repository has no
+    # break-glass, so NO job here is granted `id-token: write` — and GitHub does
+    # not require it, because nothing in the called workflow can request one.
+    uses: IamRitz/ssd-security-framework/.github/workflows/_source-scan.yml@v1
     permissions:
       contents: read
       pull-requests: write
@@ -73,7 +76,19 @@ jobs:
           set -euo pipefail
           echo "source-security: result=$SOURCE_RESULT verdict=${VERDICT:-unknown}"
           if [ "$MODE" = "log-only" ]; then
-            echo "::warning::GREEN BY CONFIGURATION, not by verdict — gate_mode is log-only."
+            # Verdict-specific: only a BLOCK is suppressed by log-only. A PASS has
+            # nothing to suppress, but log-only stays visible as a rollout mode.
+            case "$VERDICT" in
+              BLOCK)
+                echo "::warning::GREEN BY CONFIGURATION, not by verdict — source verdict BLOCK is reported but NOT enforced because gate_mode is log-only."
+                ;;
+              PASS|PASS-WITH-EXCEPTIONS)
+                echo "::warning::Source verdict $VERDICT. gate_mode is log-only; no blocking verdict exists, so nothing was suppressed. A future BLOCK would not fail this check until the repository moves to enforce."
+                ;;
+              *)
+                echo "::warning::Source verdict is unavailable ('${VERDICT}'), and gate_mode is log-only so nothing is enforced. Treat this run as UNKNOWN, not clean."
+                ;;
+            esac
           fi
           if [ "$SOURCE_RESULT" != "success" ]; then
             echo "::error::source security did not pass (result=$SOURCE_RESULT)"
@@ -94,8 +109,17 @@ jobs:
       registry: none
       deploy_target: none
       break_glass_enabled: false
+      # Strict structured break-glass evidence: a status-only record can never
+      # pass. New callers always set this; it is unconditional in v2.
+      strict_break_glass_evidence: true
+      # PER-CONTROL evidence. Never feed `needs.source-security.result` to every
+      # source control: it is the AGGREGATE, so a policy BLOCK would report all
+      # three scanners as failed although they ran and produced usable reports.
+      # A scanning control succeeds when its scanner produced trustworthy
+      # evidence — findings included. Whether that evidence satisfies policy is
+      # the source-gate control, explained by its verdict and integrity outputs.
       observed: >-
-        {"secret-scan":{"status":"${{ needs.source-security.result }}","evidence":"source-security job"},
-         "dependency-scan":{"status":"${{ needs.source-security.result }}","evidence":"source-security job"},
-         "sast":{"status":"${{ needs.source-security.result }}","evidence":"source-security job"},
-         "source-gate":{"status":"${{ needs.source-security.result }}","evidence":"security-gate check"}}
+        {"secret-scan":{"status":"${{ needs.source-security.outputs.secret_scan_result }}","evidence":"Secret scanning job (per-control output)"},
+         "dependency-scan":{"status":"${{ needs.source-security.outputs.dependency_scan_result }}","evidence":"Dependency scanning job (per-control output)"},
+         "sast":{"status":"${{ needs.source-security.outputs.sast_result }}","evidence":"SAST job (per-control output)"},
+         "source-gate":{"status":"${{ needs.source-security.outputs.source_gate_result }}","verdict":"${{ needs.source-security.outputs.verdict }}","gate_mode":"${{ needs.source-security.outputs.gate_mode }}","integrity_trusted":"${{ needs.source-security.outputs.integrity_trusted }}","evidence":"source-gate job"}}

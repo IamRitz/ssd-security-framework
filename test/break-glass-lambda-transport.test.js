@@ -87,7 +87,7 @@ describe('break-glass Lambda transport (OIDC direct invoke)', () => {
     );
   });
 
-  it('poll reads terminal status over invoke and times out to a denial', async () => {
+  it('poll reads terminal status over invoke and times out (a timeout, not a denial)', async () => {
     const request = { requestId: 'r-1', gateDigest: 'd'.repeat(64) };
     let status = 'pending';
     const aws = fakeAws((event) => ({
@@ -115,7 +115,7 @@ describe('break-glass Lambda transport (OIDC direct invoke)', () => {
     assert.equal(approved.status, 'approved');
   });
 
-  it('poll treats an unknown request as a denial', async () => {
+  it('poll treats an unknown request as an error', async () => {
     const aws = fakeAws(() => ({ ok: false, statusCode: 404, error: 'unknown_request' }));
     const invoke = createLambdaInvoker({ functionName: 'f', region: 'us-east-1', execFileImpl: aws.execFileImpl });
     await assert.rejects(

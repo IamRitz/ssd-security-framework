@@ -211,16 +211,16 @@ const INTEGRITY_GATE = {
 };
 
 const CASES = [
-  ['secret (verified)', SECRET_GATE, /Verified leaked credential/],
+  ['secret (verified)', SECRET_GATE, /Verified live credential/],
   ['dependency with_fix', DEP_WITH_FIX_GATE, /dependency `dangerous-package`/],
   ['dependency no_fix (exception)', DEP_NO_FIX_GATE, /dependency `stuck-lib`/],
   ['sast', SAST_GATE, /code security issue in `routes\/user\.js`/],
   ['trivy image with_fix', TRIVY_WITH_FIX_GATE, /image package `libssl3`/],
   ['trivy image no_fix (exception)', TRIVY_NO_FIX_GATE, /image package `zlib`/],
-  ['trivy layer secret', TRIVY_SECRET_GATE, /Secret baked into an image layer/],
+  ['trivy layer secret', TRIVY_SECRET_GATE, /Potential secret in an image layer/],
   ['trivy false-clean integrity', TRIVY_FALSE_CLEAN_GATE, /Scan integrity failure/],
   ['trivy eosl integrity', TRIVY_EOSL_GATE, /Scan integrity failure/],
-  ['ecr severity-only', ECR_SEVERITY_ONLY_GATE, /vulnerability in image \(CVE-2098-1111\)/],
+  ['ecr severity-only', ECR_SEVERITY_ONLY_GATE, /finding CVE-2098-1111 in image \(ECR basic scanning\)/],
   ['generic integrity (malformed report)', INTEGRITY_GATE, /Scan integrity failure/]
 ];
 
@@ -245,16 +245,20 @@ describe('format-findings: every finding type renders on all three surfaces', ()
 describe('format-findings: integrity failures are not rendered as vulnerabilities', () => {
   it('says plainly it is an integrity failure, not a code defect', () => {
     const { markdown } = renderAll(TRIVY_FALSE_CLEAN_GATE);
-    assert.match(markdown, /not a (code defect|vulnerability you introduced)/);
-    assert.match(markdown, /blocked deliberately rather than passed/);
+    assert.match(markdown, /not a code defect/);
+    assert.match(markdown, /This is not a vulnerability finding/);
+    assert.match(markdown, /fails closed/);
   });
 });
 
-describe('format-findings: exceptions are labelled as passed-deliberately, not-your-fault', () => {
-  it('dependency no_fix exception explains it passed and is not actionable', () => {
+describe('format-findings: exceptions are labelled as passed-deliberately', () => {
+  it('dependency no_fix exception explains it passed, without claiming who introduced it', () => {
     const { markdown } = renderAll(DEP_NO_FIX_GATE);
-    assert.match(markdown, /No upstream fix is available/);
+    assert.match(markdown, /No fix is available/);
     assert.match(markdown, /tracked EXCEPTION/);
+    assert.match(markdown, /will block once a fix becomes available/);
+    // The gate has no evidence about whether this change introduced the finding.
+    assert.doesNotMatch(markdown, /not something your change introduced/);
   });
 });
 
@@ -265,7 +269,7 @@ describe('format-findings: fix rendering asymmetry (Trivy fix data vs ECR severi
   });
   it('ECR severity-only does not fabricate fix data', () => {
     const { markdown } = renderAll(ECR_SEVERITY_ONLY_GATE);
-    assert.match(markdown, /does not report a fixed version/);
+    assert.match(markdown, /does not report which package is affected or whether a fix exists/);
     assert.ok(!/Upgrade image package .* to \d/.test(markdown));
   });
 });
@@ -284,7 +288,8 @@ describe('format-findings: every verdict renders distinctly', () => {
       const report = buildReport({ gate, context: CONTEXT });
       assert.equal(report.verdictLabel, expectedLabel);
       const md = renderMarkdown(report);
-      assert.match(md, new RegExp(`Security gate: ${expectedLabel.replace(/[-]/g, '\\-')}`));
+      // Image verdicts are headed "Image gate", source verdicts "Security gate".
+      assert.match(md, new RegExp(`(Security|Image) gate: ${expectedLabel.replace(/[-]/g, '\\-')}`));
       labels.add(report.verdictLabel);
     });
   }
@@ -296,14 +301,15 @@ describe('format-findings: every verdict renders distinctly', () => {
 // --- routing -----------------------------------------------------------------
 
 describe('route: per-verdict and per-mode', () => {
+  const surfaces = ({ slack, prComment, summary }) => ({ slack, prComment, summary });
   it('BLOCK routes to all three surfaces', () => {
-    assert.deepEqual(route({ verdict: 'BLOCK' }), { slack: true, prComment: true, summary: true });
+    assert.deepEqual(surfaces(route({ verdict: 'BLOCK' })), { slack: true, prComment: true, summary: true });
   });
   it('BLOCK_DEPLOY routes to all three surfaces', () => {
-    assert.deepEqual(route({ verdict: 'BLOCK_DEPLOY' }), { slack: true, prComment: true, summary: true });
+    assert.deepEqual(surfaces(route({ verdict: 'BLOCK_DEPLOY' })), { slack: true, prComment: true, summary: true });
   });
   it('EXCEPTION verdict routes to PR + summary, not Slack', () => {
-    assert.deepEqual(route({ verdict: 'PASS-WITH-EXCEPTIONS' }), {
+    assert.deepEqual(surfaces(route({ verdict: 'PASS-WITH-EXCEPTIONS' })), {
       slack: false,
       prComment: true,
       summary: true
@@ -312,12 +318,19 @@ describe('route: per-verdict and per-mode', () => {
   it('log-only mode never routes Slack even on BLOCK', () => {
     assert.deepEqual(route({ verdict: 'BLOCK', mode: 'log-only' }), {
       slack: false,
+      slackReason: 'log-only',
       prComment: true,
       summary: true
     });
   });
-  it('break-glass eligible BLOCK suppresses the plain Slack ping', () => {
-    assert.equal(route({ verdict: 'BLOCK', isBreakGlassEligible: true }).slack, false);
+  it('break-glass ELIGIBILITY alone does not suppress the plain Slack ping', () => {
+    const breakGlass = { eligible: true, enabled: false, requested: false, delivered: false, decision: 'not-requested' };
+    assert.equal(route({ verdict: 'BLOCK', breakGlass }).slack, true);
+  });
+  it('a DELIVERED break-glass request suppresses the plain Slack ping', () => {
+    const breakGlass = { eligible: true, enabled: true, requested: true, delivered: true, decision: 'denied' };
+    assert.deepEqual(surfaces(route({ verdict: 'BLOCK', breakGlass })), { slack: false, prComment: true, summary: true });
+    assert.equal(route({ verdict: 'BLOCK', breakGlass }).slackReason, 'break-glass-request-delivered');
   });
 });
 
@@ -397,7 +410,8 @@ describe('dispatch: routing produces the right surface calls', () => {
     assert.equal(calls.append.length, 1);
   });
 
-  it('break-glass eligible BLOCK does not post the plain Slack ping', async () => {
+  it('break-glass eligible BLOCK with no observed break-glass state still posts the plain Slack ping', async () => {
+    // Nothing tells the notifier a request was sent, so it must not act as if one was.
     const { calls, fetchImpl, appendImpl } = fakeSurfaces();
     const performed = await dispatch({
       gate: DEP_WITH_FIX_GATE,
@@ -409,8 +423,8 @@ describe('dispatch: routing produces the right surface calls', () => {
       appendImpl,
       logger: { log() {} }
     });
-    assert.equal(performed.slack, false);
-    assert.ok(!calls.fetch.some((c) => c.url === 'https://slack.example/hook'));
+    assert.equal(performed.slack, true);
+    assert.ok(calls.fetch.some((c) => c.url === 'https://slack.example/hook'));
   });
 });
 
@@ -490,7 +504,7 @@ describe('dispatch: resilience when a remote surface fails on a BLOCK', () => {
     assert.equal(performed.slack, false);
     assert.equal(performed.failures.length, 2);
     // The primary summary content landed first...
-    assert.match(appended[0], /Verified leaked credential/);
+    assert.match(appended[0], /Verified live credential/);
     assert.match(appended[0], /Security gate: BLOCK/);
     // ...and a visible delivery-failure note was appended afterwards.
     assert.ok(appended.some((chunk) => /Notification delivery incomplete/.test(chunk)));
@@ -597,7 +611,7 @@ describe('dispatch: a clean DEPLOY posts no new PR comment but still writes the 
     assert.equal(performed.summary, true); // summary still written
     assert.equal(performed.slack, false); // clean -> no ping
     assert.ok(!calls.some((c) => c.method === 'POST'));
-    assert.match(appended[0], /Security gate: DEPLOY/);
+    assert.match(appended[0], /Image gate: DEPLOY/);
   });
 });
 
@@ -613,6 +627,7 @@ describe('format-findings: repo-scale finding count renders readably', () => {
         source: 'trivy',
         id: `CVE-2099-1${String(i).padStart(3, '0')}`,
         package: `pkg-block-${i}`,
+        installedVersion: '1.2.2',
         severity: i % 2 ? 'critical' : 'high',
         fixAvailable: true,
         fixedVersion: '1.2.3',
@@ -636,13 +651,18 @@ describe('format-findings: repo-scale finding count renders readably', () => {
     return { verdict: 'BLOCK_DEPLOY', findings };
   }
 
-  it('collapses long lists behind <details> and keeps blocking findings visible', () => {
+  it('bounds the blocking remediation, collapses the logged ones to a count, stating every omission', () => {
     const report = buildReport({ gate: scaleGate(), context: CONTEXT });
     assert.deepEqual(report.counts, { block: 12, exception: 0, log: 26, integrity: 0 });
     const md = renderMarkdown(report);
-    // The 26 logged findings collapse; the 12 blocking findings do not.
-    assert.match(md, /<details><summary>Show 26 findings<\/summary>/);
-    assert.ok(!/<details><summary>Show 12/.test(md));
+    // 12 distinct packages -> 12 remediation groups, 10 shown, the rest counted exactly.
+    assert.match(md, /### ⛔ Blocking — fix these first \(12 remediation groups · 12 findings\)/);
+    assert.equal((md.match(/^- \*\*(Critical|High)\*\* · image package/gm) ?? []).length, 10);
+    assert.match(md, /_2 more blocking remediation groups not shown here \(2 findings: 2 high\)/);
+    // The 26 logged findings are a count, never rows or cards.
+    assert.match(md, /ℹ️ \*\*26\*\* logged findings \(26 distinct advisories; 26 medium\) are informational/);
+    assert.doesNotMatch(md, /CVE-2099-2\d{3}/);
+    assert.doesNotMatch(md, /<details/);
     // Slack stays concise: at most 5 highlighted blocking findings + a "more" note.
     const slack = renderSlack(report);
     assert.match(slackText(slack), /and 7 more/);
@@ -668,11 +688,20 @@ describe('format-findings: reproduce commands are per-repo, not this repo', () =
     ]
   };
 
-  it('defaults to a direct scanner invocation, never a Makefile target', () => {
-    const report = buildReport({ gate: SEMGREP_GATE, context: CONTEXT });
-    assert.equal(report.cards[0].reproduce, DEFAULT_REPRODUCE_COMMANDS.semgrep);
+  it("defaults to a direct scanner invocation of the run's own Semgrep configs, never a Makefile target", () => {
+    const report = buildReport({
+      gate: SEMGREP_GATE,
+      context: { ...CONTEXT, scan: { semgrepConfigs: ['p/owasp-top-ten', 'rules/local.yml'], semgrepPaths: ['src'] } }
+    });
+    assert.equal(report.cards[0].reproduce, 'semgrep scan --config p/owasp-top-ten --config rules/local.yml src');
     assert.ok(!/\bmake\b/.test(report.cards[0].reproduce));
     assert.match(renderMarkdown(report), /Reproduce locally/);
+  });
+
+  it('offers no Semgrep command at all when neither the configs nor Registry evidence are known', () => {
+    const report = buildReport({ gate: SEMGREP_GATE, context: CONTEXT });
+    assert.equal(report.cards[0].reproduce, null);
+    assert.doesNotMatch(renderMarkdown(report), /Reproduce locally/);
   });
 
   it('uses the per-repo override when the workflow supplies one', () => {

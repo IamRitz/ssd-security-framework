@@ -30,17 +30,25 @@ const REUSABLE = readdirSync(WORKFLOW_DIR).filter(
 );
 
 // Reusable workflows that must never hold cloud credentials. `_ecr-collect.yml`
-// is the registry adapter; `_source-security.yml`'s gate job may assume the
-// narrowly scoped break-glass invoker role after eligibility is confirmed.
-const CREDENTIAL_FREE = ['_image-scan-prepush.yml', '_artifact-gate.yml', '_conformance.yml'];
+// is the registry adapter; `_break-glass-lambda.yml` is the dedicated
+// break-glass credential boundary; `_source-security.yml` is the v1 workflow
+// whose gate job may still assume the invoker role in-job for existing callers.
+// `_source-scan.yml` is its OIDC-free twin and must stay credential-free.
+const CREDENTIAL_FREE = ['_image-scan-prepush.yml', '_artifact-gate.yml', '_conformance.yml', '_source-scan.yml'];
+
+// The credential-bearing break-glass workflow loads its validation code from a
+// FIXED repository, never from an input a caller could repoint.
+const FIXED_TOOLKIT_REPOSITORY = ['_break-glass-lambda.yml'];
 
 describe('the framework ships the expected reusable workflows', () => {
-  it('has all five, and they are workflow_call only', () => {
+  it('has all seven, and they are workflow_call only', () => {
     assert.deepEqual(REUSABLE.sort(), [
       '_artifact-gate.yml',
+      '_break-glass-lambda.yml',
       '_conformance.yml',
       '_ecr-collect.yml',
       '_image-scan-prepush.yml',
+      '_source-scan.yml',
       '_source-security.yml'
     ]);
     for (const file of REUSABLE) {
@@ -73,7 +81,12 @@ describe('the toolkit no longer travels with the consumer', () => {
 
     it(`${file} checks the framework out and pins a non-empty ref`, () => {
       const source = readExecutable(file);
-      assert.match(source, /repository: \$\{\{ inputs\.toolkit_repository \}\}/, 'must check out the toolkit repo');
+      if (FIXED_TOOLKIT_REPOSITORY.includes(file)) {
+        assert.match(source, /repository: IamRitz\/ssd-security-framework\n/, 'must check out the fixed framework repo');
+        assert.ok(!/toolkit_repository|toolkit_path/.test(source), 'a credential-bearing workflow must not let its caller repoint or vendor the toolkit');
+      } else {
+        assert.match(source, /repository: \$\{\{ inputs\.toolkit_repository \}\}/, 'must check out the toolkit repo');
+      }
       assert.match(source, /ref: \$\{\{ inputs\.toolkit_ref \}\}/, 'must check out at the toolkit ref');
       // An empty ref would silently resolve to the framework's default branch —
       // an unpinned, moving dependency in a security control.
@@ -129,7 +142,7 @@ describe('the credential boundary', () => {
 
   it('only approved workflows assume cloud roles', () => {
     const assuming = REUSABLE.filter((file) => /role-to-assume/.test(read(file)));
-    assert.deepEqual(assuming.sort(), ['_ecr-collect.yml', '_source-security.yml']);
+    assert.deepEqual(assuming.sort(), ['_break-glass-lambda.yml', '_ecr-collect.yml', '_source-security.yml']);
   });
 
   it('source-security loads no approval credential before confirming eligibility', () => {
@@ -151,13 +164,18 @@ describe('the credential boundary', () => {
     }
   });
 
-  it('only source-security declares a secret, and only the break-glass one', () => {
-    const source = read('_source-security.yml');
-    const declared = [...source.matchAll(/^ {6}([a-z0-9_]+):\s*$/gm)]
-      .map((match) => match[1])
-      .filter((name) => source.includes(`secrets:\n      ${name}:`));
-    assert.deepEqual(declared, ['break_glass_shared_secret']);
-    for (const file of CREDENTIAL_FREE) {
+  it('only the source workflows declare a secret, and only the legacy HTTP break-glass one', () => {
+    // `_source-scan.yml` keeps the legacy HTTP transport in-job (it needs no
+    // OIDC), so it keeps the same one non-cloud secret. The Lambda break-glass
+    // workflow needs none at all.
+    for (const file of ['_source-security.yml', '_source-scan.yml']) {
+      const source = read(file);
+      const declared = [...source.matchAll(/^ {6}([a-z0-9_]+):\s*$/gm)]
+        .map((match) => match[1])
+        .filter((name) => source.includes(`secrets:\n      ${name}:`));
+      assert.deepEqual(declared, ['break_glass_shared_secret'], file);
+    }
+    for (const file of [...CREDENTIAL_FREE.filter((name) => name !== '_source-scan.yml'), '_break-glass-lambda.yml']) {
       assert.ok(!/^ {4}secrets:/m.test(read(file)), `${file} must accept no secrets`);
     }
   });
@@ -295,7 +313,13 @@ describe('the stable required check represents every control that gates the PR',
 
     it(`${path} fails the aggregate when source security fails`, () => {
       assert.match(gate, /needs\.source-security\.result/, 'must read the source result');
-      assert.match(gate, /SOURCE_RESULT" != "success"/, 'must fail on a non-success source result');
+      if (/final-gate\.mjs/.test(gate)) {
+        // A caller with separate Lambda break-glass decides the source leg with
+        // the framework helper, whose non-zero exit must fail the aggregate.
+        assert.match(gate, /if ! node "\$SSD_TOOLKIT\/scripts\/final-gate\.mjs"; then\s*\n\s*failed=1/, 'the helper verdict must fail the aggregate');
+      } else {
+        assert.match(gate, /SOURCE_RESULT" != "success"/, 'must fail on a non-success source result');
+      }
     });
 
     if (shipsContainer) {
@@ -556,5 +580,82 @@ describe('synthetic break-glass runs are isolated from production by constructio
     const resolve = gate.indexOf('Validate break-glass transport and resolve the effective broker');
     const oidc = gate.indexOf('Assume the break-glass invoker role (OIDC)');
     assert.ok(eligibility >= 0 && resolve > eligibility && oidc > resolve);
+  });
+});
+
+// The developer-feedback notifier describes break-glass from OBSERVED state. The
+// state channel is the step outcomes, so the wiring is the contract: a renamed
+// step id silently becomes '' and the notifier would report "request failed" for
+// a request that was sent (or the reverse). Nothing fails at runtime, so it is
+// asserted here.
+describe('the notifier receives the break-glass state it describes', () => {
+  const source = readExecutable('_source-security.yml');
+  const gate = source.slice(source.indexOf('  source-gate:'));
+
+  // One step's block: from its `- name:` line to the next step.
+  function step(name) {
+    const start = gate.indexOf(`- name: ${name}`);
+    assert.ok(start >= 0, `step "${name}" is missing`);
+    const next = gate.indexOf('\n      - name:', start + 1);
+    return gate.slice(start, next === -1 ? undefined : next);
+  }
+
+  const notify = step('Post developer-readable findings (Slack + PR comment + job summary)');
+
+  it('each break-glass step the notifier reads has the id it reads', () => {
+    assert.match(step('Confirm the BLOCK is eligible before loading any approval credential'), /\n\s+id: break-glass-check\n/);
+    assert.match(step('Request break-glass decision'), /\n\s+id: break-glass-request\n/);
+    assert.match(step('Wait for verified break-glass decision'), /\n\s+id: break-glass\n/);
+  });
+
+  it('passes enabled + every step outcome explicitly', () => {
+    assert.match(notify, /BREAK_GLASS_ENABLED: \$\{\{ inputs\.break_glass_enabled \}\}/);
+    assert.match(notify, /BREAK_GLASS_CHECK_OUTCOME: \$\{\{ steps\.break-glass-check\.outcome \}\}/);
+    assert.match(notify, /BREAK_GLASS_REQUEST_OUTCOME: \$\{\{ steps\.break-glass-request\.outcome \}\}/);
+    assert.match(notify, /BREAK_GLASS_POLL_OUTCOME: \$\{\{ steps\.break-glass\.outcome \}\}/);
+  });
+
+  it('approval in the feedback is the same signal enforcement uses', () => {
+    assert.match(
+      step('Enforce the gate verdict'),
+      /BREAK_GLASS_OUTCOME: \$\{\{ steps\.break-glass\.outcome \}\}/,
+      'enforcement and feedback must read the same poll-step outcome'
+    );
+  });
+
+  it('runs after every break-glass step, and even when they fail', () => {
+    assert.ok(gate.indexOf('Wait for verified break-glass decision') < gate.indexOf('Post developer-readable findings'));
+    assert.match(notify, /\n\s+if: always\(\)\n/);
+    assert.match(notify, /\n\s+continue-on-error: true\n/, 'feedback must never decide the job result');
+  });
+
+  it('passes the scan configuration its reproduce commands are built from', () => {
+    for (const [env, input] of [
+      ['SEMGREP_CONFIGS', 'semgrep_configs'],
+      ['SEMGREP_PATHS', 'semgrep_paths'],
+      ['GITLEAKS_CONFIG', 'gitleaks_config'],
+      ['TRUFFLEHOG_EXCLUDE_PATHS', 'trufflehog_exclude_paths']
+    ]) {
+      assert.match(notify, new RegExp(`${env}: \\$\\{\\{ inputs\\.${input} \\}\\}`));
+    }
+  });
+
+  it('holds no approval credential', () => {
+    assert.ok(!/secrets\./.test(notify), 'the notifier must not receive the break-glass secret');
+  });
+
+  it('image gates pass no break-glass state: they have no break-glass path', () => {
+    for (const file of ['_image-scan-prepush.yml', '_artifact-gate.yml']) {
+      assert.ok(!/BREAK_GLASS_/.test(readExecutable(file)), `${file} must not claim break-glass state`);
+    }
+  });
+
+  it('no workflow runs on pull_request_target (fork code never gets a writable token)', () => {
+    for (const file of readdirSync(WORKFLOW_DIR).filter((name) => name.endsWith('.yml'))) {
+      assert.ok(!/pull_request_target/.test(readExecutable(file)), `${file} must not use pull_request_target`);
+    }
+    for (const path of ['examples/container-ecr/security.yml', 'examples/container-ecr/deploy.yml', 'examples/source-only/security.yml', 'examples/python-self-managed/security.yml']) {
+      assert.ok(!/^\s*pull_request_target\s*:/m.test(readFileSync(path, 'utf8')), `${path} must not use pull_request_target`);
+    }
   });
 });

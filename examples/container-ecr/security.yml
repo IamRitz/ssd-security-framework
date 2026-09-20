@@ -34,11 +34,15 @@ jobs:
   source-security:
     # NEVER change this to `secrets: inherit` — that would hand every repo secret
     # to the scanning jobs.
-    uses: IamRitz/ssd-security-framework/.github/workflows/_source-security.yml@v1
+    #
+    # `_source-scan.yml` is OIDC-free: this job is NOT granted `id-token`. With
+    # `break_glass_transport: lambda` it performs no break-glass itself; an
+    # eligible, enforced BLOCK is DELEGATED to the `break-glass` job below
+    # (output `break_glass_delegated`), which alone holds OIDC.
+    uses: IamRitz/ssd-security-framework/.github/workflows/_source-scan.yml@v1
     permissions:
       contents: read
       pull-requests: write
-      id-token: write
     with:
       # toolkit_ref MUST match the @v1 above. See docs/versioning.md.
       toolkit_ref: v1
@@ -50,9 +54,32 @@ jobs:
       slack_notify_url: ${{ vars.SECURITY_NOTIFY_SLACK_URL }}
       break_glass_enabled: true
       break_glass_transport: lambda
-      break_glass_lambda_role_arn: ${{ vars.BREAK_GLASS_LAMBDA_ROLE_ARN }}
-      break_glass_lambda_function: ${{ vars.BREAK_GLASS_LAMBDA_FUNCTION }}
-      break_glass_aws_region: ${{ vars.AWS_REGION }}
+
+  break-glass:
+    # THE ONLY JOB IN THIS FILE GRANTED `id-token: write`.
+    #
+    # It runs only when the source workflow actually delegated an eligible,
+    # trusted, enforced BLOCK — never for a PASS, a hard block, or an integrity
+    # failure. That output is only a cheap pre-filter: the called workflow
+    # re-validates this run's own gate evidence (eligibility, run binding, gate
+    # digest, synthetic route) BEFORE it assumes any AWS role, and executes no
+    # code from this repository.
+    needs: source-security
+    if: ${{ always() && needs.source-security.outputs.break_glass_delegated == 'true' }}
+    uses: IamRitz/ssd-security-framework/.github/workflows/_break-glass-lambda.yml@v1
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      toolkit_ref: v1
+      gate_mode: ${{ needs.source-security.outputs.gate_mode }}
+      expected_gate_digest: ${{ needs.source-security.outputs.gate_digest }}
+      lambda_function: ${{ vars.BREAK_GLASS_LAMBDA_FUNCTION }}
+      lambda_role_arn: ${{ vars.BREAK_GLASS_LAMBDA_ROLE_ARN }}
+      aws_region: ${{ vars.AWS_REGION }}
+      # The source workflow always sends its own BLOCK alert; this adds one if
+      # the approval request could not be delivered.
+      slack_notify_url: ${{ vars.SECURITY_NOTIFY_SLACK_URL }}
 
   container-build:
     # Repo-specific: the consumer owns its own build. Holds ZERO cloud
@@ -112,20 +139,58 @@ jobs:
     needs:
       - source-security
       - image-security
+      - break-glass
     # `always()` so this job still REPORTS when a dependency fails or is skipped.
     # Without it the job is skipped, the required check never posts, and the PR
     # waits forever on a status that will not arrive.
     if: ${{ always() }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      # pass | overridden-block | block, and `approved` for a verified Lambda
+      # break-glass override. Conformance reads these; the source verdict stays BLOCK.
+      source_outcome: ${{ steps.gate.outputs.source_outcome }}
+      source_override: ${{ steps.gate.outputs.source_override }}
     steps:
+      - name: Check out the security framework toolkit
+        # Only for security/scripts/final-gate.mjs: the override decision is a
+        # framework-owned, tested conjunction, not hand-written shell per repo.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: IamRitz/ssd-security-framework
+          ref: v1
+          path: .ssd-toolkit
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24.21.0'
+          package-manager-cache: false
       - name: Require every security control that gates this pull request
+        id: gate
         env:
+          SSD_TOOLKIT: ${{ github.workspace }}/.ssd-toolkit/security
           EVENT: ${{ github.event_name }}
           SOURCE_RESULT: ${{ needs.source-security.result }}
           IMAGE_RESULT: ${{ needs.image-security.result }}
           SOURCE_VERDICT: ${{ needs.source-security.outputs.verdict }}
           IMAGE_VERDICT: ${{ needs.image-security.outputs.verdict }}
           MODE: ${{ needs.source-security.outputs.gate_mode }}
+          IMAGE_MODE: ${{ needs.image-security.outputs.gate_mode }}
+          # Every further fact the source-leg decision needs (final-gate.mjs also
+          # reads SOURCE_RESULT and SOURCE_VERDICT above). Empty = missing = BLOCK.
+          SOURCE_GATE_MODE: ${{ needs.source-security.outputs.gate_mode }}
+          SOURCE_INTEGRITY_TRUSTED: ${{ needs.source-security.outputs.integrity_trusted }}
+          SOURCE_BREAK_GLASS_ELIGIBLE: ${{ needs.source-security.outputs.break_glass_eligible }}
+          SOURCE_BREAK_GLASS_DELEGATED: ${{ needs.source-security.outputs.break_glass_delegated }}
+          SOURCE_SECRET_SCAN_RESULT: ${{ needs.source-security.outputs.secret_scan_result }}
+          SOURCE_DEPENDENCY_SCAN_RESULT: ${{ needs.source-security.outputs.dependency_scan_result }}
+          SOURCE_SAST_RESULT: ${{ needs.source-security.outputs.sast_result }}
+          SOURCE_GATE_DIGEST: ${{ needs.source-security.outputs.gate_digest }}
+          BREAK_GLASS_RESULT: ${{ needs.break-glass.result }}
+          BREAK_GLASS_DECISION: ${{ needs.break-glass.outputs.decision_status }}
+          BREAK_GLASS_REQUEST_DELIVERED: ${{ needs.break-glass.outputs.request_delivered }}
+          BREAK_GLASS_GATE_DIGEST: ${{ needs.break-glass.outputs.gate_digest }}
         run: |
           set -euo pipefail
           echo "event=$EVENT"
@@ -133,8 +198,12 @@ jobs:
           echo "image-security:  result=$IMAGE_RESULT verdict=${IMAGE_VERDICT:-unknown}"
 
           failed=0
-          if [ "$SOURCE_RESULT" != "success" ]; then
-            echo "::error::source security did not pass (result=$SOURCE_RESULT)"
+          # The source leg: pass | overridden-block | block. A source FAILURE
+          # becomes an overridden BLOCK only with every fact final-gate.mjs
+          # requires (eligible trusted policy BLOCK, clean scanner results, an
+          # approved decision bound to this exact gate digest). Anything else,
+          # including a scanner crash or a hard block, stays failed.
+          if ! node "$SSD_TOOLKIT/scripts/final-gate.mjs"; then
             failed=1
           fi
 
@@ -155,8 +224,23 @@ jobs:
             failed=1
           fi
 
-          if [ "$MODE" = "log-only" ]; then
-            echo "::warning::GREEN BY CONFIGURATION, not by verdict — gate_mode is log-only."
+          # Verdict-specific log-only reporting, per control: only a blocking
+          # verdict is suppressed by log-only. A PASS/DEPLOY has nothing to
+          # suppress, but log-only stays visible as a rollout mode.
+          report_log_only() {
+            local control="$1" mode="$2" verdict="$3" blocking="$4"
+            [ "$mode" = "log-only" ] || return 0
+            if [ "$verdict" = "$blocking" ]; then
+              echo "::warning::GREEN BY CONFIGURATION, not by verdict — $control verdict $verdict is reported but NOT enforced because gate_mode is log-only."
+            elif [ -n "$verdict" ]; then
+              echo "::warning::$control verdict $verdict. gate_mode is log-only; no blocking verdict exists, so nothing was suppressed. A future $blocking would not fail this check until the repository moves to enforce."
+            else
+              echo "::warning::$control verdict is unavailable, and gate_mode is log-only so nothing is enforced. Treat it as UNKNOWN, not clean."
+            fi
+          }
+          report_log_only "source" "$MODE" "$SOURCE_VERDICT" BLOCK
+          if [ "$IMAGE_RESULT" != "skipped" ]; then
+            report_log_only "image" "$IMAGE_MODE" "$IMAGE_VERDICT" BLOCK_DEPLOY
           fi
 
           if [ "$failed" -ne 0 ]; then
@@ -174,6 +258,8 @@ jobs:
     needs:
       - source-security
       - image-security
+      - break-glass
+      - security-gate
     if: ${{ always() && github.event_name != 'schedule' }}
     uses: IamRitz/ssd-security-framework/.github/workflows/_conformance.yml@v1
     with:
@@ -183,10 +269,19 @@ jobs:
       registry: ecr
       deploy_target: framework-gated
       break_glass_enabled: true
+      # Strict structured break-glass evidence: a status-only record can never
+      # pass. New callers always set this; it is unconditional in v2.
+      strict_break_glass_evidence: true
+      # PER-CONTROL evidence. Never feed `needs.source-security.result` to every
+      # source control: it is the AGGREGATE, so a policy BLOCK would report all
+      # three scanners as failed although they ran and produced usable reports.
+      # A scanning control succeeds when its scanner produced trustworthy
+      # evidence — findings included. Whether that evidence satisfies policy is
+      # the source-gate control, explained by its verdict and integrity outputs.
       observed: >-
-        {"secret-scan":{"status":"${{ needs.source-security.result }}","evidence":"source-security job"},
-         "dependency-scan":{"status":"${{ needs.source-security.result }}","evidence":"source-security job"},
-         "sast":{"status":"${{ needs.source-security.result }}","evidence":"source-security job"},
-         "source-gate":{"status":"${{ needs.source-security.result }}","evidence":"security-gate check"},
-         "image-scan-prepush":{"status":"${{ needs.image-security.result }}","evidence":"security-gate check"},
-         "break-glass":{"status":"pass","evidence":"lambda transport configured for this repo"}}
+        {"secret-scan":{"status":"${{ needs.source-security.outputs.secret_scan_result }}","evidence":"Secret scanning job (per-control output)"},
+         "dependency-scan":{"status":"${{ needs.source-security.outputs.dependency_scan_result }}","evidence":"Dependency scanning job (per-control output)"},
+         "sast":{"status":"${{ needs.source-security.outputs.sast_result }}","evidence":"SAST job (per-control output)"},
+         "source-gate":{"status":"${{ needs.source-security.outputs.source_gate_result }}","verdict":"${{ needs.source-security.outputs.verdict }}","gate_mode":"${{ needs.source-security.outputs.gate_mode }}","integrity_trusted":"${{ needs.source-security.outputs.integrity_trusted }}","break_glass_eligible":"${{ needs.source-security.outputs.break_glass_eligible }}","gate_digest":"${{ needs.source-security.outputs.gate_digest }}","override":"${{ needs.security-gate.outputs.source_override }}","evidence":"source-gate job; override claim from security-gate, verified against break-glass"},
+         "image-scan-prepush":{"status":"${{ needs.image-security.result }}","verdict":"${{ needs.image-security.outputs.verdict }}","gate_mode":"${{ needs.image-security.outputs.gate_mode }}","integrity_trusted":"${{ needs.image-security.outputs.integrity_trusted }}","evidence":"pre-push Trivy gate"},
+         "break-glass":{"status":"${{ needs.break-glass.result }}","decision":"${{ needs.break-glass.outputs.decision_status }}","request_delivered":"${{ needs.break-glass.outputs.request_delivered }}","gate_digest":"${{ needs.break-glass.outputs.gate_digest }}","delegated":"${{ needs.source-security.outputs.break_glass_delegated }}","evidence":"_break-glass-lambda.yml (observed decision)"}}

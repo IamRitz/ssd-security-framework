@@ -82,34 +82,54 @@ const DELIVERY_ONLY = ['delivery'];
 //
 // `phases` lists the execution phases in which the control is EXPECTED to run.
 // Outside those phases it is `deferred`, never `pass`.
+//
+// `kind` decides what a result MEANS, because two different questions hide
+// behind "did it pass?":
+//
+//   scan      did the scanner execute and produce TRUSTWORTHY EVIDENCE? A scan
+//             that finds vulnerabilities has succeeded. It fails only when no
+//             trustworthy report exists (crash, cancellation, integrity failure).
+//   gate      did that evidence SATISFY SECURITY POLICY? A blocking verdict is a
+//             gate failure — never a scanner failure.
+//   delivery  did the delivery step (collection, deploy) complete?
+//   approval  is the approval channel in place?
+//
+// A finding is not a scanner failure, and a report must never say it is.
 export const CONTROLS = [
   {
     id: 'secret-scan',
     name: 'Secret scanning (Gitleaks + TruffleHog)',
+    kind: 'scan',
     phases: SOURCE_PHASES,
     appliesWhen: () => true
   },
   {
     id: 'dependency-scan',
     name: 'Dependency scanning (npm audit / pip-audit / OSV-Scanner)',
+    kind: 'scan',
     phases: SOURCE_PHASES,
     appliesWhen: () => true
   },
   {
     id: 'sast',
     name: 'SAST (Semgrep)',
+    kind: 'scan',
     phases: SOURCE_PHASES,
     appliesWhen: () => true
   },
   {
     id: 'source-gate',
     name: 'Source security gate',
+    kind: 'gate',
+    gateLabel: 'the source security policy gate',
     phases: SOURCE_PHASES,
     appliesWhen: () => true
   },
   {
     id: 'image-scan-prepush',
     name: 'Pre-push image scan (Trivy) and image gate',
+    kind: 'gate',
+    gateLabel: 'the pre-push image gate',
     // Runs on the PR too: the whole point is catching an image problem BEFORE
     // the image is pushed anywhere.
     phases: SOURCE_PHASES,
@@ -120,6 +140,7 @@ export const CONTROLS = [
   {
     id: 'registry-scan-collect',
     name: 'Registry scan collection (push, poll by digest, normalize)',
+    kind: 'delivery',
     phases: DELIVERY_ONLY,
     appliesWhen: ({ artifact_type: artifactType, registry }) => {
       if (artifactType !== 'container') {
@@ -134,6 +155,8 @@ export const CONTROLS = [
   {
     id: 'artifact-gate',
     name: 'Artifact gate over the normalized registry report',
+    kind: 'gate',
+    gateLabel: 'the artifact gate',
     phases: DELIVERY_ONLY,
     appliesWhen: ({ artifact_type: artifactType, registry }) => {
       if (artifactType !== 'container') {
@@ -148,6 +171,7 @@ export const CONTROLS = [
   {
     id: 'gated-deploy',
     name: 'Deploy gated on the artifact verdict',
+    kind: 'delivery',
     phases: DELIVERY_ONLY,
     appliesWhen: ({ deploy_target: deployTarget }) => {
       if (deployTarget === 'self-managed') {
@@ -162,6 +186,7 @@ export const CONTROLS = [
   {
     id: 'break-glass',
     name: 'Break-glass approval for an eligible BLOCK',
+    kind: 'approval',
     phases: SOURCE_PHASES,
     appliesWhen: (_capabilities, { breakGlassEnabled }) =>
       breakGlassEnabled === true ||
@@ -280,9 +305,294 @@ export async function loadExemptions(path) {
   return entries.map(validateExemption);
 }
 
+const PASSED_STATUSES = new Set(['pass', 'passed', 'success', 'applied']);
+const BLOCKING_VERDICTS = new Set(['BLOCK', 'BLOCK_DEPLOY']);
+
+function text(value) {
+  return typeof value === 'string' ? value.trim() : value === undefined || value === null ? '' : String(value).trim();
+}
+
+// Turns one observed result into { passed, reason?, detail? } with a reason a
+// newcomer can read and that states only what the evidence supports.
+//
+// Optional evidence a caller may add beside `status` for a gate control:
+//   verdict            the gate's verdict output (PASS, BLOCK, BLOCK_DEPLOY, ...)
+//   gate_mode          the mode the gate actually ran in (echoed output)
+//   integrity_trusted  'false' when a scan report could not be interpreted
+// Without them the reason says only what the status proves.
+export function explainObserved(control, result) {
+  const status = text(result?.status).toLowerCase();
+  const verdict = text(result?.verdict).toUpperCase();
+  const mode = text(result?.gate_mode ?? result?.gateMode).toLowerCase();
+  const trusted = text(result?.integrity_trusted ?? result?.integrityTrusted).toLowerCase();
+  const kind = control.kind ?? 'other';
+  const gateLabel = control.gateLabel ?? 'the gate';
+
+  if (PASSED_STATUSES.has(status)) {
+    if (kind === 'scan') {
+      return {
+        passed: true,
+        detail:
+          'scanner executed and produced trustworthy evidence; any findings are judged by the policy gate, not counted as a scanner failure'
+      };
+    }
+    if (kind === 'gate' && verdict !== '') {
+      if (BLOCKING_VERDICTS.has(verdict)) {
+        const suppressed =
+          mode === 'log-only'
+            ? `verdict ${verdict} reported but NOT enforced (gate_mode=log-only)`
+            : `verdict ${verdict} did not fail the gate job (gate_mode=${mode || 'unknown'}); only a verified break-glass approval permits that in enforce mode`;
+        return {
+          passed: true,
+          detail: trusted === 'false' ? `${suppressed}; a scan report could not be trusted, so results are UNKNOWN` : suppressed
+        };
+      }
+      return {
+        passed: true,
+        detail: `policy verdict ${verdict}${mode === 'log-only' ? ' (gate_mode=log-only; no blocking verdict to suppress)' : ''}`
+      };
+    }
+    return { passed: true };
+  }
+
+  if (status === '') {
+    return {
+      passed: false,
+      reason: 'no result was supplied (empty status); absence of evidence is not evidence the control ran'
+    };
+  }
+  if (status === 'skipped') {
+    return { passed: false, reason: 'the job was skipped, so the control did not execute' };
+  }
+  if (status === 'cancelled') {
+    return {
+      passed: false,
+      reason:
+        kind === 'scan'
+          ? 'the scanner job was cancelled before producing a trustworthy report; findings are UNKNOWN, not clean'
+          : 'the job was cancelled before the control completed'
+    };
+  }
+
+  if (kind === 'scan') {
+    if (status === 'untrusted') {
+      return {
+        passed: false,
+        reason:
+          'the scanner job completed, but the security gate could not interpret its report (report-integrity failure); findings are UNKNOWN, not clean'
+      };
+    }
+    if (['failure', 'fail', 'failed'].includes(status)) {
+      return {
+        passed: false,
+        reason:
+          'the scanner job failed, so no trustworthy report was produced; findings are UNKNOWN, not clean. (Findings alone never fail a scanning control.)'
+      };
+    }
+  }
+
+  if (kind === 'gate' && ['failure', 'fail', 'failed'].includes(status)) {
+    if (BLOCKING_VERDICTS.has(verdict) && trusted === 'false') {
+      return {
+        passed: false,
+        reason: `${gateLabel} failed closed: a scan report could not be trusted (report-integrity failure), so the verdict is ${verdict}; results are UNKNOWN, not clean`
+      };
+    }
+    if (BLOCKING_VERDICTS.has(verdict)) {
+      return {
+        passed: false,
+        reason: `${gateLabel} returned a blocking result (verdict ${verdict}): the scan evidence did not satisfy security policy`
+      };
+    }
+    if (verdict !== '') {
+      return {
+        passed: false,
+        reason: `the gate job failed although its verdict was ${verdict}, so the gate did not complete; treated as failed (fail-closed)`
+      };
+    }
+    return {
+      passed: false,
+      reason: 'the gate job failed; no verdict was supplied to say whether policy blocked or the job errored'
+    };
+  }
+
+  if (['failure', 'fail', 'failed'].includes(status)) {
+    return { passed: false, reason: 'the job failed' };
+  }
+  return { passed: false, reason: `unrecognized result '${result?.status}'; treated as failed (fail-closed)` };
+}
+
+// ---- break-glass evidence ----------------------------------------------------
+//
+// Two modes, chosen EXPLICITLY by the caller (`strict_break_glass_evidence` on
+// _conformance.yml -> `strictBreakGlassEvidence` here), never inferred from
+// which fields an entry happens to carry — otherwise a producer could opt out
+// of strict checking by omitting fields.
+//
+//   legacy (v1 default)  the break-glass entry is judged exactly as before
+//                        this schema existed: by `status` alone, like any other
+//                        control. A loud deprecation warning says the evidence
+//                        proves no delivery, decision, delegation or digest.
+//                        Source-gate `override` claims are IGNORED (they never
+//                        had meaning in v1), so legacy mode gains nothing new.
+//   strict (opt-in; unconditional in v2)
+//                        the rules below.
+//
+// STRICT: with `break_glass_enabled=true` the control accepts ONLY structured
+// evidence observed from `_break-glass-lambda.yml` and the source workflow. A
+// bare `{"status": "pass"}` — the fabricated shape this schema exists to
+// remove — fails, as does any entry missing a required field. (Other controls
+// keep their v1 status-based handling in both modes.)
+//
+// Required fields on the `break-glass` entry (all present, even if empty):
+//   status             the break-glass job's result (needs.<job>.result)
+//   decision           its decision_status output ('' when the job did not run)
+//   request_delivered  its request_delivered output
+//   gate_digest        its gate_digest output
+//   delegated          the SOURCE workflow's break_glass_delegated output
+// and an observed `source-gate` entry (non-empty status).
+//
+// Exactly two shapes pass:
+//   not exercised  delegated=false, status=skipped, decision ''/not-applicable,
+//                  request_delivered ''/false, gate_digest '', no override
+//                  claimed on source-gate, and the source gate did not report
+//                  an eligible, trusted, enforced BLOCK
+//   approved       delegated=true, status=success, request_delivered=true,
+//                  decision=approved, a SHA-256 gate_digest equal to the
+//                  source-gate gate_digest, and a source verdict BLOCK that was
+//                  trusted, break-glass eligible and enforced
+// Everything else — denied, expired, timeout, refused, error, cancelled,
+// delegated-but-skipped, missing or inconsistent fields — fails.
+const HEX64 = /^[0-9a-f]{64}$/;
+
+export const BREAK_GLASS_EVIDENCE_FIELDS = ['status', 'decision', 'request_delivered', 'gate_digest', 'delegated'];
+
+export function explainBreakGlass(result, sourceGate = null) {
+  const missing = BREAK_GLASS_EVIDENCE_FIELDS.filter(
+    (field) => !result || typeof result !== 'object' || !Object.hasOwn(result, field)
+  );
+  if (missing.length > 0) {
+    return {
+      passed: false,
+      reason:
+        `break-glass is enabled, so structured observed evidence is required; missing ${missing.join(', ')}. ` +
+        'A status-only entry proves only that something reported success, not that a decision was observed.'
+    };
+  }
+  if (!sourceGate || text(sourceGate.status) === '') {
+    return { passed: false, reason: 'no source-gate result was observed, so the break-glass evidence cannot be judged against it' };
+  }
+
+  const status = text(result.status).toLowerCase();
+  const decision = text(result.decision).toLowerCase();
+  const delivered = text(result.request_delivered).toLowerCase();
+  // Digests are compared exactly, as final-gate.mjs does: no case folding.
+  const digest = text(result.gate_digest);
+  const delegated = text(result.delegated).toLowerCase();
+  const sg = {
+    verdict: text(sourceGate.verdict).toUpperCase(),
+    trusted: text(sourceGate.integrity_trusted).toLowerCase(),
+    eligible: text(sourceGate.break_glass_eligible).toLowerCase(),
+    mode: text(sourceGate.gate_mode).toLowerCase(),
+    digest: text(sourceGate.gate_digest),
+    override: text(sourceGate.override).toLowerCase()
+  };
+
+  if (delegated === 'false') {
+    const notExercised = [
+      [status === 'skipped', `the break-glass job result is '${status}', but nothing was delegated to it`],
+      [['', 'not-applicable'].includes(decision), `a decision '${decision}' is reported although nothing was delegated`],
+      [['', 'false'].includes(delivered), 'a delivered request is reported although nothing was delegated'],
+      [digest === '', 'a gate digest is reported although nothing was delegated'],
+      [sg.override === '', `the source gate claims override '${sg.override}' although no break-glass was exercised`],
+      [
+        !(sg.verdict === 'BLOCK' && sg.eligible === 'true' && sg.trusted === 'true' && sg.mode === 'enforce'),
+        'the source gate reported an eligible enforced BLOCK, but it was not delegated to break-glass, so no approval was attempted'
+      ]
+    ];
+    for (const [ok, reason] of notExercised) {
+      if (!ok) return { passed: false, reason };
+    }
+    return {
+      passed: true,
+      exercised: false,
+      detail: 'approval channel configured; not exercised in this run — the source gate produced no eligible enforced BLOCK, so no approval attempt was needed'
+    };
+  }
+
+  if (delegated !== 'true') {
+    return { passed: false, reason: `delegated is '${delegated}'; expected the source workflow's break_glass_delegated output (true | false)` };
+  }
+  if (status === 'skipped' || status === '') {
+    return { passed: false, reason: 'an eligible BLOCK was delegated to break-glass, but the break-glass workflow did not run; no approval was requested' };
+  }
+  if (status === 'cancelled') {
+    return { passed: false, reason: 'the break-glass job was cancelled before a verified decision existed' };
+  }
+  if (['denied', 'expired', 'timeout'].includes(decision)) {
+    return {
+      passed: false,
+      reason: `approval channel ${delivered === 'true' ? 'executed and delivered the request' : 'executed'}, but the decision was ${decision}; nothing was approved and the BLOCK stands`
+    };
+  }
+  if (decision === 'refused') {
+    return { passed: false, reason: 'the break-glass workflow refused the evidence before any request (not an overridable BLOCK, or not bound to this run); nothing was approved' };
+  }
+
+  const approved = [
+    [status === 'success', `the break-glass job result is '${status}'`],
+    [decision === 'approved', `the break-glass decision is '${decision || 'none'}'`],
+    [delivered === 'true', `request_delivered is '${delivered}'`],
+    [HEX64.test(digest), 'the break-glass gate digest is missing or malformed'],
+    [digest === sg.digest, 'the approval is bound to a different gate digest than the source gate'],
+    [sg.verdict === 'BLOCK', `the source verdict is '${sg.verdict}', not BLOCK`],
+    [sg.trusted === 'true', 'the source scans were not trusted (integrity), which is never overridable'],
+    [sg.eligible === 'true', 'the source BLOCK is not break-glass eligible'],
+    [sg.mode === 'enforce', `the source gate_mode is '${sg.mode}', not enforce`]
+  ];
+  for (const [ok, reason] of approved) {
+    if (!ok) {
+      return { passed: false, reason: `the approval channel did not produce a verified approval for this gate: ${reason} (fail-closed)` };
+    }
+  }
+  return {
+    passed: true,
+    exercised: true,
+    detail: `approval channel executed; request delivered; decision approved for gate sha256 ${digest}`
+  };
+}
+
+// A source-gate `override` claim is only believed when the break-glass
+// observation proves it. Returns { verified, reason }.
+export function verifySourceOverride(sourceGate, breakGlass, breakGlassEnabled) {
+  const fail = (reason) => ({
+    verified: false,
+    reason: `the source gate claims a break-glass override, but ${reason}; a claimed override without matching break-glass evidence is not an override`
+  });
+  if (breakGlassEnabled !== true) return fail('break_glass_enabled=false for this repository');
+  if (!breakGlass) return fail('no break-glass observation was supplied');
+  const sgDigest = text(sourceGate.gate_digest);
+  const checks = [
+    [text(sourceGate.verdict).toUpperCase() === 'BLOCK', `the source verdict is '${text(sourceGate.verdict)}', not BLOCK`],
+    [text(sourceGate.gate_mode).toLowerCase() === 'enforce', `the source gate_mode is '${text(sourceGate.gate_mode)}', not enforce`],
+    [text(sourceGate.integrity_trusted).toLowerCase() === 'true', 'the source scans were not trusted (integrity), which is never overridable'],
+    [text(sourceGate.break_glass_eligible).toLowerCase() === 'true', 'the source BLOCK is not break-glass eligible'],
+    [text(breakGlass.status).toLowerCase() === 'success', `the break-glass job result is '${text(breakGlass.status)}'`],
+    [text(breakGlass.decision).toLowerCase() === 'approved', `the break-glass decision is '${text(breakGlass.decision)}'`],
+    [text(breakGlass.request_delivered).toLowerCase() === 'true', 'no break-glass request was delivered'],
+    [HEX64.test(sgDigest), 'the source gate digest is missing or malformed'],
+    [text(breakGlass.gate_digest) === sgDigest, 'the approval is bound to a different gate digest']
+  ];
+  for (const [ok, reason] of checks) {
+    if (!ok) return fail(reason);
+  }
+  return { verified: true, digest: sgDigest };
+}
+
 // Builds the conformance report.
 //
-// `observed` maps control id -> { status: 'pass'|'fail'|..., evidence: string }.
+// `observed` maps control id -> { status: 'pass'|'fail'|..., evidence: string },
+// optionally with gate evidence (see explainObserved).
 // A control that applies AND is expected in this phase but was never observed is
 // `failed`: absence of evidence is not evidence the control ran.
 export function buildConformance({
@@ -290,6 +600,8 @@ export function buildConformance({
   observed = {},
   exemptions = [],
   breakGlassEnabled = false,
+  // Explicit, default false (v1 compatibility). See "break-glass evidence".
+  strictBreakGlassEvidence = false,
   phase = DEFAULT_PHASE,
   now = Date.now(),
   repository = null
@@ -303,6 +615,7 @@ export function buildConformance({
     const base = {
       id: control.id,
       name: control.name,
+      kind: control.kind,
       phases: control.phases
     };
 
@@ -378,14 +691,60 @@ export function buildConformance({
       continue;
     }
 
-    const passed = ['pass', 'passed', 'success', 'applied'].includes(
-      String(result.status).toLowerCase()
-    );
+    let explained;
+    const extra = {};
+    if (control.id === 'break-glass' && strictBreakGlassEvidence === true) {
+      // Only reached when break-glass is enabled (otherwise N/A above).
+      explained = explainBreakGlass(result, observed['source-gate'] ?? null);
+      extra.exercised = explained.exercised;
+      if (text(result.decision) !== '') extra.decision = text(result.decision);
+      if (text(result.request_delivered) !== '') extra.requestDelivered = text(result.request_delivered) === 'true';
+    } else {
+      explained = explainObserved(control, result);
+      if (control.id === 'break-glass') {
+        warnings.push(
+          "DEPRECATED (v1 legacy break-glass evidence): control 'break-glass' was judged by its status alone " +
+            `('${text(result.status)}'). That proves NOTHING about request delivery, the approval decision, ` +
+            'delegation, or binding to a gate digest — it is not verified evidence. Set ' +
+            'strict_break_glass_evidence: true and feed the structured fields from _break-glass-lambda.yml. ' +
+            'Legacy mode is removed in v2.'
+        );
+      }
+    }
+
+    // A policy BLOCK stays a policy BLOCK. The source-gate control may read as
+    // applied on a failed job ONLY when a verified approval for this exact gate
+    // was observed, and the report says so explicitly.
+    const override = text(result.override).toLowerCase();
+    if (control.id === 'source-gate' && override !== '' && strictBreakGlassEvidence !== true) {
+      // v1 never interpreted `override`; legacy mode must not start now.
+      warnings.push(
+        `control 'source-gate' claims override '${override}', which is IGNORED in legacy break-glass evidence mode: ` +
+          'an override is only honoured when strict_break_glass_evidence is true and proven by the break-glass observation.'
+      );
+    }
+    if (control.id === 'source-gate' && override === 'approved' && strictBreakGlassEvidence === true) {
+      const verdict = verifySourceOverride(result, observed['break-glass'], breakGlassEnabled);
+      if (verdict.verified) {
+        explained = {
+          passed: true,
+          detail: `policy verdict BLOCK; override: verified approved break-glass for gate sha256 ${verdict.digest}`
+        };
+        extra.override = 'approved';
+      } else {
+        explained = { passed: false, reason: verdict.reason };
+      }
+    }
+
     controls.push({
       ...base,
       appliesToRepository: true,
-      status: passed ? 'applied' : 'failed',
-      reason: passed ? undefined : `observed result '${result.status}'`,
+      status: explained.passed ? 'applied' : 'failed',
+      reason: explained.passed ? undefined : explained.reason,
+      detail: explained.detail,
+      observedStatus: text(result.status),
+      ...(text(result.verdict) !== '' ? { verdict: text(result.verdict) } : {}),
+      ...Object.fromEntries(Object.entries(extra).filter(([, value]) => value !== undefined)),
       evidence: result.evidence ?? undefined
     });
   }
@@ -399,6 +758,8 @@ export function buildConformance({
     phase,
     capabilities,
     breakGlassEnabled,
+    // Additive: which break-glass evidence rules this report applied.
+    breakGlassEvidence: strictBreakGlassEvidence === true ? 'strict' : 'legacy',
     controls,
     warnings,
     summary: {
@@ -414,7 +775,111 @@ export function buildConformance({
   };
 }
 
+// Presentation only. A clean run (nothing failed, exempt or warned, and no
+// legacy break-glass evidence) renders compactly: it is a confirmation, not a
+// diagnosis. Anything else keeps the full diagnostic report. Neither changes
+// conformance.json, a control status, or the exit code.
+//
+// A DEFERRED control is not a degraded state: it applies to the repository and
+// simply does not run in this phase (registry collection, artifact gate and
+// deploy on a PR). It is named on its own line in the compact report instead of
+// forcing the diagnostic one.
+export function isCleanConformance(report) {
+  const { summary } = report;
+  return (
+    summary.failed === 0 &&
+    summary.exempt === 0 &&
+    report.warnings.length === 0 &&
+    !(report.breakGlassEnabled && report.breakGlassEvidence !== 'strict')
+  );
+}
+
 export function renderMarkdown(report) {
+  return isCleanConformance(report) ? renderCompactMarkdown(report) : renderDetailedMarkdown(report);
+}
+
+const SHORT_NAMES = {
+  'secret-scan': 'secret scanning',
+  'dependency-scan': 'dependency scanning',
+  sast: 'SAST',
+  'source-gate': 'source gate',
+  'image-scan-prepush': 'image scan',
+  'registry-scan-collect': 'registry collection',
+  'artifact-gate': 'artifact gate',
+  'gated-deploy': 'deploy',
+  'break-glass': 'break-glass'
+};
+
+function appliedNote(control) {
+  if (control.id === 'source-gate') {
+    if (control.override === 'approved') return ` — ${control.verdict ?? 'BLOCK'} overridden by verified approval`;
+    return control.verdict ? ` — verdict ${control.verdict}` : '';
+  }
+  if (control.id === 'break-glass') {
+    if (control.decision) return ` — ${control.decision}`;
+    if (control.exercised === false) return ' — not exercised';
+  }
+  return '';
+}
+
+export function renderCompactMarkdown(report) {
+  const { summary } = report;
+  const lines = [
+    '## ✅ Conformance',
+    '',
+    `Phase: \`${report.phase}\` · Required controls: **${summary.applied}/${summary.requiredByRepository}** applied` +
+      (summary.deferred > 0 ? `, **${summary.deferred}** deferred to another phase` : '') +
+      (report.breakGlassEnabled ? ` · Break-glass evidence: **${report.breakGlassEvidence}**` : ''),
+    '',
+    '| Control | Result |',
+    '| --- | --- |'
+  ];
+  // In a clean report the only statuses left are applied, deferred and N/A.
+  for (const control of report.controls.filter((entry) => entry.status === 'applied')) {
+    lines.push(`| ${control.name} | ✅ applied${appliedNote(control)} |`);
+  }
+  const deferred = report.controls.filter((entry) => entry.status === 'deferred');
+  if (deferred.length > 0) {
+    // The phases those controls DO run in, from the controls themselves. A
+    // deferred control never lists the current phase, by definition.
+    const phases = [...new Set(deferred.flatMap((control) => control.phases))];
+    lines.push(
+      '',
+      `Deferred to ${phases.join('/')}: ${deferred.map((control) => SHORT_NAMES[control.id] ?? control.name).join(', ')}`
+    );
+  }
+  lines.push(...renderNotApplicable(report));
+  return lines.join('\n');
+}
+
+// Every N/A reason begins with the `key=value` that made the control not apply
+// (`artifact_type=library: …`, `break_glass_enabled=false: …`). Controls are
+// grouped by that key, so a line's reason always belongs to the controls on it:
+// the capability keys (whatever the declaration holds) share one line with the
+// declared triple, and any other key — break_glass_enabled today — gets its own.
+function reasonKey(control) {
+  return /^([a-z_]+)=([^:]*):/.exec(control.reason ?? '')?.slice(1) ?? null;
+}
+
+function renderNotApplicable(report) {
+  const notApplicable = report.controls.filter((entry) => !entry.appliesToRepository);
+  const capabilityTriple = Object.entries(report.capabilities).map(([key, value]) => `\`${key}=${value}\``).join(' ');
+  const groups = new Map();
+  for (const control of notApplicable) {
+    const parsed = reasonKey(control);
+    // A capability key groups with the declaration; anything else stands alone;
+    // an unparsable reason is listed with no reason rather than a borrowed one.
+    const key = parsed && Object.hasOwn(report.capabilities, parsed[0]) ? '' : parsed ? parsed.join('=') : null;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(SHORT_NAMES[control.id] ?? control.name);
+  }
+  return [...groups].map(([key, names]) => {
+    const why = key === '' ? ` (${capabilityTriple})` : key === null ? '' : ` (\`${key}\`)`;
+    return `\nNot applicable: ${names.join(', ')}${why}`;
+  });
+}
+
+export function renderDetailedMarkdown(report) {
   const symbol = {
     applied: '✅ applied',
     deferred: '⏳ deferred',
@@ -422,6 +887,8 @@ export function renderMarkdown(report) {
     exempt: '⚠️ exempt',
     failed: '❌ failed'
   };
+  const { summary } = report;
+  const plural = (count, word) => `**${count}** ${word}${count === 1 ? '' : 's'}`;
   const lines = [
     '## Conformance',
     '',
@@ -431,9 +898,24 @@ export function renderMarkdown(report) {
       `\`registry=${report.capabilities.registry}\` ` +
       `\`deploy_target=${report.capabilities.deploy_target}\``,
     '',
-    `This repository requires **${report.summary.requiredByRepository}** controls; ` +
-      `**${report.summary.applied}** executed successfully in this run, ` +
-      `**${report.summary.deferred}** run in another phase.`,
+    ...(report.breakGlassEnabled
+      ? [
+          report.breakGlassEvidence === 'strict'
+            ? 'Break-glass evidence: **strict** (structured, observed decision required).'
+            : '> ⚠️ Break-glass evidence: **legacy (deprecated)** — the break-glass control is judged by status alone, which proves no delivery, decision, delegation or digest binding. Set `strict_break_glass_evidence: true`; legacy mode is removed in v2.',
+          ''
+        ]
+      : []),
+    `This repository requires ${plural(summary.requiredByRepository, 'control')}. In this \`${report.phase}\` run: ` +
+      `**${summary.applied}** applied (executed successfully), ` +
+      `**${summary.failed}** failed, ` +
+      `**${summary.deferred}** deferred to another phase, ` +
+      `**${summary.exempt}** exempt. ` +
+      `${plural(summary.notApplicable, 'control')} ${summary.notApplicable === 1 ? 'is' : 'are'} not applicable to this repository.`,
+    '',
+    '> **Scanning controls** answer *did the scanner execute and produce trustworthy evidence?* ' +
+      'A scanner that finds vulnerabilities has still been applied. **Gate controls** answer ' +
+      '*did that evidence satisfy security policy?* A finding is not a scanner failure.',
     '',
     '| Control | Status | Why |',
     '| --- | --- | --- |'
@@ -442,7 +924,7 @@ export function renderMarkdown(report) {
     const why =
       control.status === 'exempt'
         ? `${control.reason} — owner ${control.owner}, expires ${control.expires}`
-        : (control.reason ?? '');
+        : (control.reason ?? control.detail ?? '');
     lines.push(`| ${control.name} | ${symbol[control.status]} | ${why} |`);
   }
   if (report.warnings.length > 0) {
@@ -461,6 +943,7 @@ function parseArguments(argv) {
     exemptions: null,
     output: 'reports/conformance.json',
     breakGlassEnabled: false,
+    strictBreakGlassEvidence: false,
     phase: DEFAULT_PHASE,
     repository: null
   };
@@ -481,6 +964,12 @@ function parseArguments(argv) {
         break;
       case '--break-glass':
         options.breakGlassEnabled = value === 'true';
+        break;
+      case '--strict-break-glass-evidence':
+        // Fail closed on anything but an explicit boolean: a typo must not
+        // silently select either mode.
+        assert(value === 'true' || value === 'false', `--strict-break-glass-evidence must be true or false, got '${value}'`);
+        options.strictBreakGlassEvidence = value === 'true';
         break;
       case '--phase':
         options.phase = value;
@@ -516,6 +1005,7 @@ async function main() {
     observed: options.observed,
     exemptions,
     breakGlassEnabled: options.breakGlassEnabled,
+    strictBreakGlassEvidence: options.strictBreakGlassEvidence,
     phase,
     repository: options.repository
   });

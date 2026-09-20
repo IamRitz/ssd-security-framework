@@ -36,7 +36,9 @@ and runs on every framework PR.
 
 | File | Purpose | Cloud credentials |
 | --- | --- | --- |
-| `_source-security.yml` | secret scan, dependency scan, SAST, source gate | **none** (break-glass invoker role only, after eligibility) |
+| `_source-scan.yml` | secret scan, dependency scan, SAST, source gate — **for new callers**; no job can request OIDC | **none** |
+| `_break-glass-lambda.yml` | Lambda break-glass for an eligible BLOCK; validates this run's gate evidence before assuming any role | break-glass invoker role, **after** validation |
+| `_source-security.yml` | the v1 source workflow (the twin above is generated from it); keeps in-job Lambda break-glass for existing callers, so callers must grant `id-token: write` | break-glass invoker role only, after eligibility |
 | `_image-scan-prepush.yml` | Trivy over a built image tarball + pre-push gate | **none** |
 | `_artifact-gate.yml` | policy over a normalized registry report; names no registry | **none** |
 | `_ecr-collect.yml` | the ECR adapter: push, poll by digest, normalize | ECR push+scan role |
@@ -50,8 +52,8 @@ normalized report. The gate and the policy do not change.
 ```yaml
 jobs:
   source-security:
-    uses: IamRitz/ssd-security-framework/.github/workflows/_source-security.yml@v1
-    permissions:
+    uses: IamRitz/ssd-security-framework/.github/workflows/_source-scan.yml@v1
+    permissions:               # no id-token: nothing in _source-scan.yml can request one
       contents: read
       pull-requests: write
     with:
@@ -94,6 +96,7 @@ A conformance report that renders both as "skipped" tells a reviewer nothing.
 | --- | --- |
 | [`docs/onboarding.md`](docs/onboarding.md) | the full per-repo setup, AWS side included, and the rollout sequence |
 | [`docs/workflow-contracts.md`](docs/workflow-contracts.md) | every input, output, and portability rule |
+| [`docs/evidence-model.md`](docs/evidence-model.md) | the dependency evidence schema (relationship, version resolution, provenance, benchmarking reuse), scanner execution evidence, and the bounded developer summary built on them |
 | [`docs/versioning.md`](docs/versioning.md) | what is pinned, what moves, and why they differ by layer |
 | [`docs/toolkit-resolution.md`](docs/toolkit-resolution.md) | how the toolkit reaches a consumer that has none of it |
 | [`docs/aws-setup.md`](docs/aws-setup.md) | OIDC, IAM, ECR — split by one-time vs per-repo |

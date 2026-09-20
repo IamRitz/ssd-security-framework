@@ -63,6 +63,43 @@ The producing side must fail closed on a schema it does not recognise. This is
 already how `image-gate.mjs` treats the normalized registry report: an unknown
 `source` is a report-integrity `BLOCK_DEPLOY`, never a best-effort parse.
 
+## The generated OIDC-free twin
+
+`_source-scan.yml` is **generated** from `_source-security.yml`
+(`node tools/render-source-scan.mjs`), and the tests fail if the committed copy
+is stale. It exists because of a v1 constraint, not a preference:
+
+- `_source-security.yml` has shipped an in-job Lambda break-glass path, and the
+  `id-token: write` it needs, since `v1.0.0`. Existing callers rely on it.
+- GitHub validates a called job's permissions statically, so that one line
+  makes every caller grant OIDC — even with break-glass disabled.
+- Removing it in place would silently stop existing Lambda callers' approvals
+  (a v1 semantic break). Nesting one reusable workflow inside the other depends
+  on `./` resolution that GitHub does not document for nested cross-repository
+  calls, and still could not keep `needs.source-security.result == success` for
+  an approved override.
+
+So `_source-security.yml` keeps its v1 behaviour, and new callers use the twin
+plus `_break-glass-lambda.yml`. The twin is a build artefact, not a fork: edit
+only `_source-security.yml`, re-render, commit both. At **v2**, delete the
+in-job Lambda path and the twin collapses back into one file.
+
+## Strict break-glass evidence: opt-in in v1, unconditional in v2
+
+Rejecting the v1 conformance input `"break-glass": {"status": "pass"}` would be a
+producer-breaking change (see the table above). So:
+
+| | v1 | v2 |
+| --- | --- | --- |
+| `_conformance.yml` `strict_break_glass_evidence` | new input, default **`false`** | removed; strict is the only behaviour |
+| status-only `break-glass` evidence | accepted exactly as before, with a loud deprecation warning | rejected |
+| structured evidence from `_break-glass-lambda.yml` | available and **recommended**; every shipped `_source-scan.yml` example sets `strict_break_glass_evidence: true` | required |
+| source-gate `override` | honoured only in strict mode, and only when proven | honoured only when proven |
+
+No existing v1 caller changes result because of this. A caller migrates by
+setting `strict_break_glass_evidence: true` and feeding the structured
+`break-glass` record.
+
 ## The `toolkit_ref` duplication, and why it exists
 
 A consumer pins the version in **two** places:
@@ -98,8 +135,10 @@ keep the two in sync, and prefer `v1` in both for the common case.
 
 ## Releasing
 
+0. **Resolve every open item in [release-blockers.md](release-blockers.md)** —
+   `node --test` must report `# todo 0`. A failing TODO is a blocker, not noise.
 1. Land the change on `main` with tests green (`node --test` plus
-   `tools/verify-consumer-isolation.sh`).
+   `tools/verify-consumer-isolation.sh`, and `node tools/render-source-scan.mjs --check`).
 2. Update `VERSION` if the major changes.
 3. Tag the immutable release: `git tag v1.1.0 && git push origin v1.1.0`.
 4. Move the major tag: `git tag -f v1 v1.1.0 && git push -f origin v1`.

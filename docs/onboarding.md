@@ -207,6 +207,40 @@ A caller that hard-codes `"gated-deploy": {"status": "pass"}` on a pull request
 does not get a pass — the control is still reported `deferred`, and the report
 carries a warning that a control which did not execute cannot have passed.
 
+**Feed conformance per-control evidence, never the aggregate.** Copy the `observed`
+block from your example as-is. It reads each source control from its own output of
+`_source-security.yml`:
+
+```yaml
+observed: >-
+  {"secret-scan":{"status":"${{ needs.source-security.outputs.secret_scan_result }}","evidence":"Secret scanning job (per-control output)"},
+   "dependency-scan":{"status":"${{ needs.source-security.outputs.dependency_scan_result }}","evidence":"Dependency scanning job (per-control output)"},
+   "sast":{"status":"${{ needs.source-security.outputs.sast_result }}","evidence":"SAST job (per-control output)"},
+   "source-gate":{"status":"${{ needs.source-security.outputs.source_gate_result }}","verdict":"${{ needs.source-security.outputs.verdict }}","gate_mode":"${{ needs.source-security.outputs.gate_mode }}","integrity_trusted":"${{ needs.source-security.outputs.integrity_trusted }}","evidence":"source-gate job"}}
+```
+
+Do **not** use `needs.source-security.result` for these four. It is the aggregate of
+every job, so when the gate BLOCKs it is `failure` and all three scanners would be
+reported failed although they ran. (That is exactly what a live Python consumer
+saw: four failures for three working scanners and one policy BLOCK.)
+
+Read the source controls as two different questions:
+
+- **A scanning control** (secret scanning, dependency scanning, SAST) asks *did the
+  scanner execute and produce trustworthy evidence?* `applied` means a usable report
+  was produced — **not** that no vulnerabilities were found. A scanner that finds
+  vulnerabilities is applied. It fails only when there is no trustworthy report: the
+  job failed, was cancelled or skipped, or the gate could not interpret its report
+  (`untrusted`).
+- **The source security gate** asks *did that evidence satisfy security policy?* A
+  BLOCK fails this control, with the reason spelled out (*the source security policy
+  gate returned a blocking result*, or *failed closed: a scan report could not be
+  trusted*).
+
+A finding is not a scanner failure. The dependency scanning job may show a blue
+notice such as *pip-audit exited 1 (vulnerabilities found) with a valid report* —
+that is a working scan, not an error.
+
 To exempt something, add `security/exemptions.json`:
 
 ```json
@@ -254,6 +288,15 @@ source-only example. Everything runs and reports; nothing fails; no Slack.
 Expect a `gate-mode: LOG-ONLY (gate NOT enforcing)` check on every PR. That
 check going away is how you know the repo reached enforcement; it reappearing is
 how you notice a regression.
+
+The log-only warnings depend on the verdict, so they stay honest:
+
+- **PASS in log-only** — *Security gate verdict: PASS. gate_mode=log-only; no blocking
+  verdict exists, so nothing was suppressed.* There was nothing to enforce; the
+  warning is only a reminder that the repository is still in rollout mode.
+- **BLOCK in log-only** — *Security gate verdict: BLOCK, but gate_mode=log-only so the
+  BLOCK is reported and NOT enforced*, and the `security-gate` aggregate says
+  **GREEN BY CONFIGURATION, not by verdict**. This is the one to act on.
 
 ### 1.6 Branch protection **[REPO]**
 
@@ -576,8 +619,15 @@ the interaction handler, not the DynamoDB table, not the secrets. Scope its
 trust policy the same way as §2.2, and confirm the negative case: assuming it
 and calling anything else must return AccessDenied.
 
-Pass it as `break_glass_lambda_role_arn` with `break_glass_transport: lambda`.
-This path needs **no repository secret at all**.
+Call `_source-scan.yml` with `break_glass_transport: lambda`, and pass the role
+to a separate `break-glass` job calling `_break-glass-lambda.yml`
+(`lambda_role_arn`) — the only job granted `id-token: write`. See
+`examples/container-ecr/security.yml` and
+[workflow-contracts.md](workflow-contracts.md#_break-glass-lambdayml). (Existing
+v1 callers of `_source-security.yml` keep passing `break_glass_lambda_role_arn`
+there.) Set `strict_break_glass_evidence: true` on `_conformance.yml` and feed
+it the structured `break-glass` record, as the example does. This path needs
+**no repository secret at all**.
 
 ### 3.3 The Slack app **[ORG]**
 
@@ -680,6 +730,12 @@ being "in rollout" and started being "unprotected".
 | Bootstrap ran but no candidate appeared | It refuses outside `gate_mode: log-only`, and refuses when a baseline exists (§1.1). |
 | A container PR merged with a failing image gate | The required check aggregated only source security. Use the shipped example's `security-gate` job, which aggregates both (§1.6). |
 | Conformance shows `deferred` controls | Correct on a pull request: those controls run in the `delivery` phase. They are required, and proven by the `deploy.yml` run (§1.3). |
+| Conformance reports secret scanning, dependency scanning **and** SAST failed whenever the gate BLOCKs | The caller feeds `needs.source-security.result` (the aggregate) to every source control. Use the per-control outputs `secret_scan_result`, `dependency_scan_result`, `sast_result`, `source_gate_result` (§1.3). |
+| A source scanning control is `untrusted` | The scanner job ran, but the gate could not interpret its report. Findings are UNKNOWN, not clean; see the integrity failure in the gate summary and never baseline from the run. |
+| The dependency scanning job fails with `SCANNER RUN INVALID` | The scanner's exit status and report disagree, the status was unexpected (e.g. OSV-Scanner 127), or the report is empty/malformed. A plain "vulnerabilities found" exit never fails this step. |
+| The PR comment shows fewer findings than `security-gate.json` | Records from different scanners describing the same advisory for the same package (shared advisory ids/aliases) are shown as one issue. The comment says "N unique issues from M scanner findings"; every raw record is still listed inside the issue and kept in `findings`. |
+| The comment says a dependency's "effective version is disputed" | The scanners (or a scanner and your `requirements.txt` pin) reported different versions of that package, e.g. pip-audit `idna 3.19` vs OSV-Scanner `idna 3.9.0`. The policy action is unchanged. Establish the version actually installed (lockfile, build, environment) before remediating; do not pin from the report. See [evidence-model.md](evidence-model.md). |
+| A dependency's relationship is "unknown" although it is not in `requirements.txt` | By design. Absence from the manifest does not prove a package is transitive, and no scanner report the framework runs records dependency paths ([evidence-model.md](evidence-model.md)). |
 | Deploy hangs, then fails | `ssm:GetCommandInvocation` scoped to the instance ARN. It must be `*` (§2.2). |
 | `chat.postMessage` returns `not_in_channel` | The bot was never invited to the channel (§3.3). |
 | Slack rejects the Request URL | The endpoint was not live when you saved it (§3.3). |

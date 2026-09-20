@@ -171,11 +171,37 @@ function normalizeEnhancedFinding(finding, imageDigest) {
   const fixedVersion = packages
     .map((pkg) => pkg.fixedInVersion)
     .find((version) => typeof version === 'string' && version !== '' && version !== 'NotAvailable');
+  // Per-package identity and fix, deduped. `package`/`fixedVersion` above are a
+  // lossy summary (joined names, first fix found); this keeps which fix belongs
+  // to which package so guidance never pairs a version with the wrong package.
+  const packageFacts = [
+    ...new Map(
+      packages
+        .filter((pkg) => typeof pkg.name === 'string')
+        .map((pkg) => {
+          const fact = {
+            name: pkg.name,
+            ...(typeof pkg.version === 'string' ? { version: pkg.version } : {}),
+            ...(typeof pkg.fixedInVersion === 'string' &&
+            pkg.fixedInVersion !== '' &&
+            pkg.fixedInVersion !== 'NotAvailable'
+              ? { fixedInVersion: pkg.fixedInVersion }
+              : {})
+          };
+          return [JSON.stringify(fact), fact];
+        })
+    ).values()
+  ];
 
   return {
     id,
     severity: mappedSeverity(finding.severity, 'enhanced'),
+    // Inspector's own values, kept beside the framework's interpretation of them
+    // (UNTRIAGED -> high; PARTIAL -> fix available).
+    scannerSeverity: finding.severity,
     fixAvailable: FIX_AVAILABLE[finding.fixAvailable],
+    fixAvailability: finding.fixAvailable,
+    ...(packageFacts.length > 0 ? { packages: packageFacts } : {}),
     ...(names.length > 0 ? { package: names.join(', ') } : {}),
     ...(fixedVersion ? { fixedVersion } : {}),
     ...(typeof finding.title === 'string' ? { title: finding.title } : {}),

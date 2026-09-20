@@ -212,8 +212,14 @@ jobs:
           GATE_MODE: ${{ inputs.gate_mode }}
           GITHUB_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+          PR_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
           SECURITY_NOTIFY_SLACK_URL: ${{ inputs.slack_notify_url }}
           SECURITY_REPRODUCE_COMMANDS: ${{ inputs.reproduce_commands }}
+          # The tarball Trivy scanned, for an accurate reproduce command. Image
+          # gates have no break-glass, so no BREAK_GLASS_* state is passed.
+          SSD_IMAGE_TARBALL: ${{ inputs.image_tarball }}
+          # Named in the bounded summary as the raw scanner evidence (uploaded below).
+          SECURITY_RAW_REPORT: reports/trivy-image.json
         run: node "$SSD_TOOLKIT/scripts/notify.mjs" --gate reports/image-gate-prepush.json
 
       - name: Flag an untrusted image scan (blocks baseline generation)
@@ -244,6 +250,7 @@ jobs:
           path: |
             reports/trivy-image.json
             reports/image-gate-prepush.json
+            reports/image-gate-prepush-evidence.md
             reports/DO-NOT-BASELINE.txt
           if-no-files-found: warn
           retention-days: 14
@@ -258,7 +265,18 @@ jobs:
           VERDICT: ${{ steps.verdict.outputs.verdict }}
         run: |
           if [ "$GATE_MODE" = "log-only" ]; then
-            echo "::warning::gate_mode=log-only — pre-push image verdict $VERDICT is reported but NOT enforced."
+            # Verdict-specific: a DEPLOY has nothing to suppress; a BLOCK_DEPLOY does.
+            case "$VERDICT" in
+              BLOCK_DEPLOY)
+                echo "::warning::Pre-push image gate verdict: BLOCK_DEPLOY, but gate_mode=log-only so the BLOCK_DEPLOY is reported and NOT enforced."
+                ;;
+              DEPLOY|DEPLOY-WITH-EXCEPTIONS)
+                echo "::warning::Pre-push image gate verdict: $VERDICT. gate_mode=log-only; no blocking verdict exists, so nothing was suppressed. log-only is a rollout mode: a future BLOCK_DEPLOY would be reported without failing this job."
+                ;;
+              *)
+                echo "::warning::Pre-push image gate verdict is unavailable ('${VERDICT}'), and gate_mode=log-only so nothing is enforced. Treat this run as UNKNOWN, not clean."
+                ;;
+            esac
             exit 0
           fi
           if [ "$VERDICT" = "BLOCK_DEPLOY" ]; then

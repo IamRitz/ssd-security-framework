@@ -3,7 +3,10 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { correlationRecord } from './correlate-findings.mjs';
+import { collectDependencyEvidenceSafely } from './dependency-evidence.mjs';
 import { detectEcosystems } from './detect-ecosystems.mjs';
+import { EXECUTION_SCHEMA_VERSION, readExecutionRecords } from './scanner-execution.mjs';
 
 const VALID_ACTIONS = new Set(['BLOCK', 'BLOCK_DEPLOY', 'EXCEPTION', 'LOG']);
 
@@ -18,6 +21,9 @@ const DEFAULT_PATHS = {
   pipAudit: 'reports/pip-audit.json',
   osv: 'reports/osv-scanner.json',
   semgrep: 'reports/semgrep.json',
+  // Scanner execution record written by the SAST job (scanner-execution.mjs).
+  // Optional evidence about WHY a report is missing; never a policy input.
+  semgrepExecution: 'reports/scanner-execution-semgrep.json',
   baseline: 'security/baseline/semgrep-baseline.json',
   output: 'reports/security-gate.json',
   exceptions: 'reports/gate-exceptions.json'
@@ -26,6 +32,32 @@ const DEFAULT_PATHS = {
 function assert(condition, message) {
   if (!condition) {
     throw new Error(message);
+  }
+}
+
+// Which source-security control an input belongs to. A report-integrity failure
+// is attributed to the control whose evidence could not be interpreted, so a
+// caller can tell "the dependency scanner's report was unusable" from "the gate's
+// own inputs (policy, baseline) were unusable" — the scanner that produced a
+// valid report is not blamed for a gate-side failure, and vice versa.
+//
+//   secret-scan      Gitleaks / TruffleHog reports
+//   dependency-scan  npm audit / pip-audit / OSV-Scanner reports
+//   sast             the Semgrep report
+//   source-gate      everything the gate itself owns: policy, the Semgrep
+//                    baseline, ecosystem detection, and anything unattributed
+export const INTEGRITY_CONTROLS = ['secret-scan', 'dependency-scan', 'sast', 'source-gate'];
+
+// Runs `work` and stamps any error it throws with the control it belongs to.
+// An error already stamped by a narrower scope keeps its attribution.
+async function attributed(control, work) {
+  try {
+    return await work();
+  } catch (error) {
+    if (error && typeof error === 'object' && error.control === undefined) {
+      error.control = control;
+    }
+    throw error;
   }
 }
 
@@ -257,7 +289,12 @@ function evaluateSecrets(policy, gitleaks, trufflehog, findings) {
       policyRule: isDemoDummy ? 'secrets.demo_dummy' : 'secrets.unverified',
       reason: isDemoDummy
         ? 'Dedicated non-credential marker activated on a never-merged demo branch'
-        : 'Gitleaks pattern match is not provider-verified'
+        : 'Gitleaks pattern match is not provider-verified',
+      // Optional developer context: the matching rule's own description. Gitleaks
+      // never verifies a credential, so no verification fact is recorded here.
+      ...(typeof finding.Description === 'string' && finding.Description !== ''
+        ? { ruleDescription: finding.Description }
+        : {})
     });
   }
 
@@ -268,13 +305,25 @@ function evaluateSecrets(policy, gitleaks, trufflehog, findings) {
     );
     assert(typeof finding.Verified === 'boolean', 'TruffleHog finding is missing Verified');
     const state = finding.Verified ? 'verified' : 'unverified';
+    // Optional location: TruffleHog's git source metadata, when it carries one.
+    const git = finding.SourceMetadata?.Data?.Git;
+    const location =
+      typeof git?.file === 'string' && git.file !== ''
+        ? `${git.file}:${Number.isInteger(git.line) ? git.line : '?'}`
+        : undefined;
     addFinding(findings, policy, {
       source: 'trufflehog',
       id: finding.DetectorName,
       policyRule: `secrets.${state}`,
       reason: finding.Verified
         ? 'TruffleHog verified the credential with its provider'
-        : 'TruffleHog did not verify the credential'
+        : 'TruffleHog did not verify the credential',
+      ...(location ? { location } : {}),
+      // `--results=unknown` includes credentials whose verification ERRORED.
+      // Recorded as a flag only; the error text is not copied into the report.
+      ...(!finding.Verified && typeof finding.VerificationError === 'string' && finding.VerificationError !== ''
+        ? { verificationErrored: true }
+        : {})
     });
   }
 }
@@ -315,10 +364,19 @@ function evaluateNpmAudit(policy, report, findings) {
     const advisory = Array.isArray(vulnerability.via)
       ? vulnerability.via.find((entry) => entry && typeof entry === 'object')
       : undefined;
-    const fixedVersion =
+    // npm's fixAvailable is `true`, `false`, or an object naming the package
+    // npm would change to resolve it — which is often NOT the vulnerable package
+    // itself (a parent that pulls in a fixed transitive copy). The target is
+    // recorded separately so no surface tells a developer to install a version
+    // of the vulnerable package that does not exist.
+    const fixObject =
       vulnerability.fixAvailable && typeof vulnerability.fixAvailable === 'object'
-        ? vulnerability.fixAvailable.version
+        ? vulnerability.fixAvailable
         : undefined;
+    const fixedVersion = fixObject?.version;
+    const viaPackages = Array.isArray(vulnerability.via)
+      ? vulnerability.via.filter((entry) => typeof entry === 'string' && entry !== '')
+      : [];
 
     addFinding(findings, policy, {
       source: 'npm-audit',
@@ -328,6 +386,9 @@ function evaluateNpmAudit(policy, report, findings) {
       policyRule,
       reason: `${severity} npm advisory; fix ${fixAvailable ? 'available' : 'not available'}`,
       ...(typeof fixedVersion === 'string' ? { fixedVersion } : {}),
+      ...(typeof fixObject?.name === 'string' && fixObject.name !== '' ? { fixPackage: fixObject.name } : {}),
+      ...(typeof fixObject?.isSemVerMajor === 'boolean' ? { fixIsSemVerMajor: fixObject.isSemVerMajor } : {}),
+      ...(viaPackages.length > 0 ? { viaPackages } : {}),
       ...(advisory?.title ? { title: advisory.title } : {}),
       ...(advisory?.url ? { url: advisory.url } : {})
     });
@@ -378,7 +439,8 @@ function evaluatePipAudit(policy, report, findings) {
           id: vulnerability.id,
           package: dependency.name,
           policyRule: 'dependencies.malicious_package',
-          reason: 'pip-audit malicious-package advisory blocks regardless of severity'
+          reason: 'pip-audit malicious-package advisory blocks regardless of severity',
+          ...(typeof dependency.version === 'string' ? { installedVersion: dependency.version } : {})
         });
         continue;
       }
@@ -395,11 +457,21 @@ function evaluatePipAudit(policy, report, findings) {
         id: vulnerability.id,
         package: dependency.name,
         severity: 'high',
+        // The severity above is the framework's fail-closed default, not a value
+        // pip-audit reported. Recorded so no surface attributes it to pip-audit.
+        severitySource: 'framework-default',
         fixAvailable,
         policyRule,
         reason: `Python advisory (pip-audit reports no severity; treated as high); fix ${
           fixAvailable ? 'available' : 'not available'
-        }`
+        }`,
+        ...(typeof dependency.version === 'string' ? { installedVersion: dependency.version } : {}),
+        ...(fixAvailable
+          ? { fixVersions: vulnerability.fix_versions.filter((version) => typeof version === 'string') }
+          : {}),
+        ...(Array.isArray(vulnerability.aliases) && vulnerability.aliases.length > 0
+          ? { aliases: vulnerability.aliases.filter((alias) => typeof alias === 'string') }
+          : {})
       });
     }
   }
@@ -511,6 +583,30 @@ function osvHasFix(vulnerability, scannedPackage) {
   });
 }
 
+// The `fixed` events behind osvHasFix, for developer guidance only. They are
+// listed as OSV records them: a fixed event on one release line is not proof
+// that the installed version's line has a fix, so no surface claims it is.
+function osvFixedVersions(vulnerability, scannedPackage) {
+  const versions = new Set();
+  for (const entry of vulnerability.affected) {
+    if (
+      entry.package?.name !== scannedPackage.name ||
+      (scannedPackage.ecosystem && entry.package.ecosystem !== scannedPackage.ecosystem) ||
+      !Array.isArray(entry.ranges)
+    ) {
+      continue;
+    }
+    for (const range of entry.ranges) {
+      for (const event of range.events ?? []) {
+        if (typeof event.fixed === 'string' && event.fixed !== '') {
+          versions.add(event.fixed);
+        }
+      }
+    }
+  }
+  return [...versions];
+}
+
 function evaluateOsv(policy, report, findings) {
   assert(report && typeof report === 'object', 'OSV-Scanner report must be an object');
   // OSV-Scanner is written in Go, and Go marshals an empty slice as `null`, so a
@@ -554,7 +650,11 @@ function evaluateOsv(policy, report, findings) {
             id: vulnerability.id,
             package: dependency.package.name,
             policyRule: 'dependencies.malicious_package',
-            reason: 'OSV malicious-package advisory blocks regardless of severity'
+            reason: 'OSV malicious-package advisory blocks regardless of severity',
+            installedVersion: dependency.package.version,
+            ...(typeof dependency.package.ecosystem === 'string'
+              ? { ecosystem: dependency.package.ecosystem }
+              : {})
           });
           continue;
         }
@@ -563,6 +663,7 @@ function evaluateOsv(policy, report, findings) {
         // No CVSS v3 score (common for PyPI/PYSEC advisories) => fail-closed high.
         const severity = score === null ? 'high' : osvSeverity(policy, score);
         const fixAvailable = osvHasFix(vulnerability, dependency.package);
+        const fixVersions = fixAvailable ? osvFixedVersions(vulnerability, dependency.package) : [];
         const suffix = ['critical', 'high'].includes(severity)
           ? `_${fixAvailable ? 'with_fix' : 'no_fix'}`
           : '';
@@ -575,7 +676,18 @@ function evaluateOsv(policy, report, findings) {
           package: dependency.package.name,
           severity,
           ...(score === null ? {} : { cvssScore: score }),
+          // `cvss`: derived from the record's CVSS v3 score by the policy
+          // thresholds. `framework-default`: no CVSS v3 score, fail-closed high.
+          severitySource: score === null ? 'framework-default' : 'cvss',
           fixAvailable,
+          installedVersion: dependency.package.version,
+          ...(typeof dependency.package.ecosystem === 'string'
+            ? { ecosystem: dependency.package.ecosystem }
+            : {}),
+          ...(fixVersions.length > 0 ? { fixVersions } : {}),
+          ...(Array.isArray(vulnerability.aliases) && vulnerability.aliases.length > 0
+            ? { aliases: vulnerability.aliases.filter((alias) => typeof alias === 'string') }
+            : {}),
           policyRule: `dependencies.${severity}${suffix}`,
           reason: `${severity} OSV advisory (${
             score === null ? 'no CVSS score; treated as high' : `CVSS ${score}`
@@ -601,6 +713,13 @@ function semgrepFingerprint(finding) {
     .digest('hex');
 }
 
+function semgrepRegistryUrl(finding) {
+  const source = finding.extra?.metadata?.source;
+  return typeof source === 'string' && /^https:\/\/semgrep\.dev\/r\/[^\s/]+$/.test(source)
+    ? source
+    : null;
+}
+
 function semgrepSeverity(policy, finding) {
   const raw = finding.extra?.severity;
   assert(typeof raw === 'string', `Semgrep ${finding.check_id} is missing severity`);
@@ -619,17 +738,25 @@ function evaluateSemgrep(policy, report, baseline, findings, bootstrap = false) 
   assert(Array.isArray(report.errors), 'Semgrep report is missing errors array');
   assert(Array.isArray(report.paths?.scanned), 'Semgrep report is missing paths.scanned array');
   assert(report.errors.length === 0, `Semgrep report contains ${report.errors.length} errors`);
-  assert(baseline?.schemaVersion === 1, 'Semgrep baseline has unsupported schemaVersion');
-  assert(Array.isArray(baseline.findings), 'Semgrep baseline is missing findings array');
 
-  const knownFingerprints = new Set(
-    baseline.findings.map((finding) => {
-      assert(typeof finding.fingerprint === 'string', 'baseline finding is missing fingerprint');
-      assert(typeof finding.checkId === 'string', 'baseline finding is missing checkId');
-      assert(typeof finding.path === 'string', 'baseline finding is missing path');
-      return finding.fingerprint;
-    })
-  );
+  // The baseline is the gate's accepted state, not scanner output: a broken
+  // baseline is a source-gate integrity failure, never blamed on Semgrep.
+  let knownFingerprints;
+  try {
+    assert(baseline?.schemaVersion === 1, 'Semgrep baseline has unsupported schemaVersion');
+    assert(Array.isArray(baseline.findings), 'Semgrep baseline is missing findings array');
+    knownFingerprints = new Set(
+      baseline.findings.map((finding) => {
+        assert(typeof finding.fingerprint === 'string', 'baseline finding is missing fingerprint');
+        assert(typeof finding.checkId === 'string', 'baseline finding is missing checkId');
+        assert(typeof finding.path === 'string', 'baseline finding is missing path');
+        return finding.fingerprint;
+      })
+    );
+  } catch (error) {
+    error.control = 'source-gate';
+    throw error;
+  }
 
   for (const finding of report.results) {
     const fingerprint = semgrepFingerprint(finding);
@@ -648,7 +775,16 @@ function evaluateSemgrep(policy, report, baseline, findings, bootstrap = false) 
       // is known. `unbaselined` says the honest thing: not yet accepted.
       baselineState: bootstrap ? 'unbaselined' : existing ? 'existing' : 'new',
       policyRule: `sast.${severity}${suffix}`,
-      reason: `${severity} Semgrep finding is ${existing ? 'baseline-known' : 'new'}`,
+      reason: `${severity} Semgrep finding is ${
+        bootstrap ? 'unbaselined' : existing ? 'baseline-known' : 'new'
+      }`,
+      scannerSeverity: finding.extra.severity,
+      // A Semgrep Registry rule carries its registry page in `metadata.source`.
+      // That metadata is the ONLY evidence a rule came from the Registry: a local
+      // rule's check_id is also dotted (the config's directory becomes a prefix,
+      // e.g. security/semgrep/x.yml -> security.semgrep.<id>), so a registry URL
+      // is never constructed from the id.
+      ...(semgrepRegistryUrl(finding) ? { registryUrl: semgrepRegistryUrl(finding) } : {}),
       // Human context for the developer-readable formatter (Semgrep rules carry a
       // `message`); optional, so a minimal report still evaluates.
       ...(typeof finding.extra?.message === 'string' && finding.extra.message !== ''
@@ -696,7 +832,10 @@ export function summarizeIntegrity(findings) {
     trusted: failures.length === 0,
     failures: failures.map((finding) => ({
       source: finding.source,
-      reason: finding.reason
+      reason: finding.reason,
+      // Optional (additive): the control whose input failed. Absent on gates
+      // that do not attribute, and on results written before it existed.
+      ...(typeof finding.control === 'string' ? { control: finding.control } : {})
     }))
   };
 }
@@ -755,6 +894,47 @@ function bootstrapState(bootstrap) {
     : { active: false };
 }
 
+// Run-level evidence (additive). Neither field is read by any policy decision;
+// both exist so a LATER, separately-privileged job (the Lambda break-glass
+// workflow) can judge this result from the evidence itself instead of trusting
+// a caller-supplied value.
+//
+// `synthetic` records whether a fabricated demo fixture was injected into this
+// run's reports. It is ALWAYS present on a result written by this version, so a
+// reader can tell "not synthetic" from "written by a gate that did not say":
+// the break-glass workflow refuses the latter rather than guessing production.
+export const SYNTHETIC_FIXTURES = ['sast', 'dependency'];
+
+export function syntheticState(fixture) {
+  if (fixture === undefined || fixture === null || fixture === '' || fixture === 'none') {
+    return { active: false, fixture: null };
+  }
+  assert(
+    SYNTHETIC_FIXTURES.includes(fixture),
+    `unsupported synthetic fixture '${fixture}'; expected one of ${SYNTHETIC_FIXTURES.join(', ')}`
+  );
+  return { active: true, fixture };
+}
+
+// `provenance` binds the result to the run that produced it: which repository,
+// which commit, which workflow run. Present only when the caller supplied it
+// (the CLI reads the runner's own GITHUB_* variables); tests that call
+// runSecurityGate directly produce results without it, exactly as before.
+export function provenanceFromEnv(env = process.env) {
+  const repository = env.GITHUB_REPOSITORY;
+  const commitSha = env.GITHUB_SHA;
+  const runId = env.GITHUB_RUN_ID;
+  if (!repository || !commitSha || !runId) {
+    return null;
+  }
+  return {
+    repository,
+    commitSha,
+    runId: String(runId),
+    ...(env.GITHUB_RUN_ATTEMPT ? { runAttempt: String(env.GITHUB_RUN_ATTEMPT) } : {})
+  };
+}
+
 async function writeResults(paths, result) {
   const exceptions = result.findings.filter((finding) => finding.action === 'EXCEPTION');
   await mkdir(dirname(paths.output), { recursive: true });
@@ -767,44 +947,63 @@ async function writeResults(paths, result) {
 }
 
 export async function runSecurityGate(options = {}) {
-  const { bootstrap = false, ...customPaths } = options;
+  const { bootstrap = false, syntheticFixture = null, provenance = null, ...customPaths } = options;
   const paths = { ...DEFAULT_PATHS, ...customPaths };
   let result;
+  // Resolved OUTSIDE the try: an unsupported fixture name is a caller error that
+  // must fail the run, never be folded into a report-integrity BLOCK that a
+  // reader could mistake for "not synthetic".
+  const synthetic = syntheticState(syntheticFixture);
+  // Read BEFORE any report and outside the try: execution evidence must be
+  // present on a report-integrity result — that is exactly when it explains
+  // something — and reading it never throws, so it cannot create or clear an
+  // integrity failure.
+  const scannerExecution = {
+    schemaVersion: EXECUTION_SCHEMA_VERSION,
+    records: await readExecutionRecords({ semgrep: paths.semgrepExecution })
+  };
 
   try {
-    const policy = parseSimplePolicy(await readFile(paths.policy, 'utf8'));
-    validatePolicy(policy);
+    const policy = await attributed('source-gate', async () => {
+      const parsed = parseSimplePolicy(await readFile(paths.policy, 'utf8'));
+      validatePolicy(parsed);
+      return parsed;
+    });
     // A language-native dependency report is REQUIRED (fail-closed on a missing
     // file) only when the scanner that produces it would actually run — i.e. its
     // audit-target file exists (package-lock.json for npm audit, requirements.txt
     // for pip-audit). Otherwise its absence is a clean skip. OSV-Scanner is always
     // required and covers every ecosystem's lockfiles, so dependency coverage is
     // never fully absent even when a language-native report is skipped.
-    const ecosystems = await detectEcosystems(paths.repoDir);
+    const ecosystems = await attributed('source-gate', () => detectEcosystems(paths.repoDir));
     const [gitleaks, trufflehog, osv, semgrep, baseline, npmAudit, pipAudit] = await Promise.all([
-      readJson(paths.gitleaks, 'Gitleaks'),
-      readJson(paths.trufflehog, 'TruffleHog'),
-      readJson(paths.osv, 'OSV-Scanner'),
-      readJson(paths.semgrep, 'Semgrep'),
-      readBaseline(paths.baseline, bootstrap),
-      ecosystems.packageLock
-        ? readJson(paths.npmAudit, 'npm audit')
-        : readOptionalJson(paths.npmAudit, 'npm audit'),
-      ecosystems.requirementsTxt
-        ? readJson(paths.pipAudit, 'pip-audit')
-        : readOptionalJson(paths.pipAudit, 'pip-audit')
+      attributed('secret-scan', () => readJson(paths.gitleaks, 'Gitleaks')),
+      attributed('secret-scan', () => readJson(paths.trufflehog, 'TruffleHog')),
+      attributed('dependency-scan', () => readJson(paths.osv, 'OSV-Scanner')),
+      attributed('sast', () => readJson(paths.semgrep, 'Semgrep')),
+      attributed('source-gate', () => readBaseline(paths.baseline, bootstrap)),
+      attributed('dependency-scan', () =>
+        ecosystems.packageLock
+          ? readJson(paths.npmAudit, 'npm audit')
+          : readOptionalJson(paths.npmAudit, 'npm audit')
+      ),
+      attributed('dependency-scan', () =>
+        ecosystems.requirementsTxt
+          ? readJson(paths.pipAudit, 'pip-audit')
+          : readOptionalJson(paths.pipAudit, 'pip-audit')
+      )
     ]);
     const findings = [];
 
-    evaluateSecrets(policy, gitleaks, trufflehog, findings);
+    await attributed('secret-scan', () => evaluateSecrets(policy, gitleaks, trufflehog, findings));
     if (npmAudit !== null) {
-      evaluateNpmAudit(policy, npmAudit, findings);
+      await attributed('dependency-scan', () => evaluateNpmAudit(policy, npmAudit, findings));
     }
     if (pipAudit !== null) {
-      evaluatePipAudit(policy, pipAudit, findings);
+      await attributed('dependency-scan', () => evaluatePipAudit(policy, pipAudit, findings));
     }
-    evaluateOsv(policy, osv, findings);
-    evaluateSemgrep(policy, semgrep, baseline, findings, bootstrap);
+    await attributed('dependency-scan', () => evaluateOsv(policy, osv, findings));
+    await attributed('sast', () => evaluateSemgrep(policy, semgrep, baseline, findings, bootstrap));
     markBreakGlassEligibility(policy, findings);
 
     const summary = summarize(findings);
@@ -814,12 +1013,32 @@ export async function runSecurityGate(options = {}) {
         : summary.exception > 0
           ? 'PASS-WITH-EXCEPTIONS'
           : 'PASS';
+    // Presentation evidence, gathered only AFTER the verdict is fixed and from
+    // the same parsed reports. It cannot throw (failures become `unavailable`),
+    // so it can never turn a result into a report-integrity BLOCK.
+    const dependencyEvidence = await collectDependencyEvidenceSafely({
+      repoDir: paths.repoDir,
+      pipAudit,
+      pipAuditSource: pipAudit !== null ? ecosystems.requirementsTxt : null,
+      osv
+    });
     result = {
       verdict,
       summary,
       integrity: summarizeIntegrity(findings),
       bootstrap: bootstrapState(bootstrap),
       findings,
+      // Developer-facing grouping of `findings` (additive). `summary` above stays
+      // the raw per-record count; `correlation.summary` counts unique issues.
+      correlation: correlationRecord(findings, dependencyEvidence),
+      // Run-level dependency evidence (additive): every package version each
+      // scanner observed, and the manifests those scanners analyzed. See
+      // docs/evidence-model.md. Never read by a policy decision.
+      dependencyEvidence,
+      // Scanner execution evidence (additive): whether each recorded scanner
+      // acquired its image, ran, and wrote a valid report. Kept apart from
+      // `integrity` (could the gate trust a report) and from findings.
+      scannerExecution,
       breakGlass: breakGlassSummary(verdict, findings)
     };
   } catch (error) {
@@ -829,6 +1048,10 @@ export async function runSecurityGate(options = {}) {
       action: 'BLOCK',
       policyRule: 'gate.report_integrity',
       reason: error.message,
+      // The gate stops at the first uninterpretable input, so exactly one
+      // control is known to have failed; the others were not re-validated here
+      // (their own scanner jobs validated them before upload).
+      control: INTEGRITY_CONTROLS.includes(error?.control) ? error.control : 'source-gate',
       breakGlassEligible: false
     };
     result = {
@@ -837,10 +1060,16 @@ export async function runSecurityGate(options = {}) {
       integrity: summarizeIntegrity([finding]),
       bootstrap: bootstrapState(bootstrap),
       findings: [finding],
+      correlation: correlationRecord([finding]),
+      scannerExecution,
       breakGlass: breakGlassSummary('BLOCK', [finding])
     };
   }
 
+  result.synthetic = synthetic;
+  if (provenance) {
+    result.provenance = provenance;
+  }
   await writeResults(paths, result);
   return result;
 }
@@ -855,9 +1084,11 @@ function parseArguments(arguments_) {
     '--pip-audit': 'pipAudit',
     '--osv': 'osv',
     '--semgrep': 'semgrep',
+    '--semgrep-execution': 'semgrepExecution',
     '--baseline': 'baseline',
     '--output': 'output',
-    '--exceptions': 'exceptions'
+    '--exceptions': 'exceptions',
+    '--synthetic-fixture': 'syntheticFixture'
   };
   const options = {};
 
@@ -890,7 +1121,14 @@ async function main() {
     return;
   }
 
-  const result = await runSecurityGate(paths);
+  let result;
+  try {
+    result = await runSecurityGate({ ...paths, provenance: provenanceFromEnv(process.env) });
+  } catch (error) {
+    console.error(`SECURITY GATE: BLOCK\nBLOCK security-gate configuration: ${error.message}`);
+    process.exitCode = 1;
+    return;
+  }
 
   for (const finding of result.findings) {
     console.log(

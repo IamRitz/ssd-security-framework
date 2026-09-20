@@ -1,0 +1,328 @@
+name: Lambda break-glass (reusable)
+
+# The ONLY framework job that may hold `id-token: write` for break-glass.
+#
+# Call it after `_source-scan.yml`, in the same workflow run, as its own job:
+#
+#   break-glass:
+#     needs: source-security
+#     if: ${{ always() && needs.source-security.outputs.break_glass_delegated == 'true' }}
+#     uses: IamRitz/ssd-security-framework/.github/workflows/_break-glass-lambda.yml@v1
+#     permissions:
+#       contents: read
+#       id-token: write
+#
+# CREDENTIAL BOUNDARY. This job obtains AWS credentials, so it runs NOTHING the
+# consumer controls:
+#   - it never checks out the consumer repository (there is no consumer code in
+#     the workspace to run, and no vendored-toolkit escape hatch);
+#   - before the OIDC step it only uses pinned actions (checkout of THIS
+#     framework, setup-node, download-artifact) and framework-owned scripts;
+#   - it reads the gate evidence produced by THIS run's source workflow, from
+#     the `security-gate-results` artifact — never a file or value a caller hands
+#     it — and re-derives eligibility, run binding, the gate digest, and the
+#     synthetic-vs-production route from that evidence;
+#   - it assumes the invoker role only AFTER all of that passed.
+#
+# NOTIFICATION. The source workflow's normal Slack BLOCK alert is never
+# suppressed by delegation, so skipping or misconfiguring this job cannot lose
+# it. An approver may see both that alert and the interactive request: that
+# duplicate is intentional (fail-safe) until an orchestrator can observe delivery.
+# The step order is the control, and test/break-glass-oidc-boundary.test.js
+# asserts it. It declares no secrets: the Lambda transport needs none.
+#
+# RECOMMENDED AWS TRUST POLICY: pin the invoker role's `job_workflow_ref` claim
+# to this file (IamRitz/ssd-security-framework/.github/workflows/_break-glass-lambda.yml@<ref>),
+# so only this reviewed job can assume it — not any job in the consumer repo.
+#
+# OUTCOME. The job fails unless a verified approval for this exact gate exists.
+# Denied, expired, timeout, refused, malformed, and unreachable all fail. The
+# caller's `security-gate` decides the final result with
+# security/scripts/final-gate.mjs from BOTH workflows' outputs.
+
+on:
+  workflow_call:
+    inputs:
+      toolkit_ref:
+        description: >-
+          Ref of IamRitz/ssd-security-framework to load the toolkit from. MUST match the ref this
+          workflow is called at (see docs/versioning.md). The repository itself is fixed: this job
+          holds credentials, so its validation code cannot be pointed at another repository.
+        type: string
+        default: v1
+      node_version:
+        description: Node version used to run the toolkit scripts.
+        type: string
+        default: '24.21.0'
+      gate_mode:
+        description: The source workflow's echoed `gate_mode` output. Anything but `enforce` is refused.
+        type: string
+        required: true
+      expected_gate_digest:
+        description: >-
+          The source workflow's `gate_digest` output. The downloaded evidence must hash to exactly
+          this, so an approval can only ever be requested for the gate that was evaluated.
+        type: string
+        required: true
+      lambda_function:
+        description: Production break-glass broker function (name or ARN).
+        type: string
+        default: ''
+      lambda_role_arn:
+        description: Production invoker role, assumed through GitHub OIDC.
+        type: string
+        default: ''
+      aws_region:
+        description: Region of the production broker.
+        type: string
+        default: ''
+      synthetic_lambda_function:
+        description: >-
+          Test broker, used ONLY when the gate evidence records an injected synthetic fixture. Must
+          differ from lambda_function. There is no fallback to production.
+        type: string
+        default: ''
+      synthetic_lambda_role_arn:
+        description: Test invoker role for a synthetic request. Must differ from lambda_role_arn.
+        type: string
+        default: ''
+      synthetic_aws_region:
+        description: Region of the test broker. Defaults to aws_region.
+        type: string
+        default: ''
+      timeout_seconds:
+        description: How long to wait for a verified decision.
+        type: string
+        default: '900'
+      slack_notify_url:
+        description: >-
+          Slack incoming webhook. The source workflow always sends its own BLOCK alert; this
+          workflow additionally alerts when its approval request was NOT delivered. Empty disables
+          it.
+        type: string
+        default: ''
+      pr_number:
+        description: PR number recorded in the approval request. Defaults to the PR of a pull_request run.
+        type: string
+        default: ''
+    outputs:
+      decision_status:
+        description: 'approved | denied | expired | timeout | refused | error. Empty when the job did not run.'
+        value: ${{ jobs.break-glass.outputs.decision_status }}
+      request_delivered:
+        description: '`true` when the broker accepted a pending approval request.'
+        value: ${{ jobs.break-glass.outputs.request_delivered }}
+      gate_digest:
+        description: SHA-256 of the gate the request and decision are bound to. Empty if none was validated.
+        value: ${{ jobs.break-glass.outputs.gate_digest }}
+      control_result:
+        description: '`success` only for a verified approval; `failure` otherwise.'
+        value: ${{ jobs.break-glass.outputs.control_result }}
+      synthetic:
+        description: '`true` when the gate evidence records a synthetic fixture (and the test broker was used).'
+        value: ${{ jobs.break-glass.outputs.synthetic }}
+      request_id:
+        description: Broker request id, when a request was delivered.
+        value: ${{ jobs.break-glass.outputs.request_id }}
+
+permissions:
+  contents: read
+
+env:
+  SSD_REQUIRED_TOOLKIT_MAJOR: '1'
+
+jobs:
+  break-glass:
+    name: break-glass
+    runs-on: ubuntu-latest
+    # Bounds the whole approval wait. A job killed here is `cancelled`, which the
+    # caller's final gate treats as no approval.
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      # The reason this workflow exists as a separate file: only this job can
+      # request an OIDC token, and only its caller job must grant it.
+      id-token: write
+    outputs:
+      decision_status: ${{ steps.result.outputs.decision_status }}
+      request_delivered: ${{ steps.result.outputs.request_delivered }}
+      gate_digest: ${{ steps.result.outputs.gate_digest }}
+      control_result: ${{ steps.result.outputs.control_result }}
+      synthetic: ${{ steps.result.outputs.synthetic }}
+      request_id: ${{ steps.result.outputs.request_id }}
+
+    steps:
+      # ---- before any credential: framework code and this run's evidence only ----
+
+      - name: Check out the security framework toolkit
+        # The ONLY checkout in this job, and it is the framework — never the
+        # consumer. The repository is fixed, not an input.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: IamRitz/ssd-security-framework
+          ref: ${{ inputs.toolkit_ref }}
+          path: .ssd-toolkit-checkout
+          persist-credentials: false
+
+      - name: Place the toolkit outside the workspace
+        env:
+          TOOLKIT_REF: ${{ inputs.toolkit_ref }}
+        run: |
+          set -euo pipefail
+          test -n "$TOOLKIT_REF" || { echo "toolkit_ref is empty." >&2; exit 1; }
+          rm -rf "$RUNNER_TEMP/ssd-toolkit"
+          mv .ssd-toolkit-checkout "$RUNNER_TEMP/ssd-toolkit"
+          version="$(cat "$RUNNER_TEMP/ssd-toolkit/VERSION" 2>/dev/null || true)"
+          test -n "$version" || { echo "Toolkit checkout has no VERSION file." >&2; exit 1; }
+          major="${version#v}"; major="${major%%.*}"
+          [ "$major" = "$SSD_REQUIRED_TOOLKIT_MAJOR" ] || {
+            echo "Toolkit $version incompatible (needs major v${SSD_REQUIRED_TOOLKIT_MAJOR})." >&2
+            exit 1
+          }
+          # Every evidence path lives under RUNNER_TEMP: nothing in this job reads
+          # or writes the (empty) workspace.
+          {
+            echo "SSD_TOOLKIT=$RUNNER_TEMP/ssd-toolkit/security"
+            echo "SSD_GATE_PATH=$RUNNER_TEMP/ssd-gate-evidence/security-gate.json"
+            echo "SSD_PREFLIGHT_PATH=$RUNNER_TEMP/ssd-break-glass/break-glass-preflight.json"
+            echo "SSD_REQUEST_PATH=$RUNNER_TEMP/ssd-break-glass/break-glass-request.json"
+            echo "SSD_DECISION_PATH=$RUNNER_TEMP/ssd-break-glass/break-glass-decision.json"
+            echo "SSD_RESULT_PATH=$RUNNER_TEMP/ssd-break-glass/break-glass-result.json"
+          } >> "$GITHUB_ENV"
+          echo "Toolkit $version loaded."
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ inputs.node_version }}
+          package-manager-cache: false
+
+      - name: Download this run's security gate evidence
+        # No run-id / repository / token inputs: download-artifact then reads
+        # ONLY the current workflow run. A missing artifact is judged by the
+        # preflight below (fail-closed), so this step never decides alone.
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: security-gate-results
+          path: ${{ runner.temp }}/ssd-gate-evidence
+
+      - name: Validate the gate evidence and resolve the broker before any credential
+        # Framework code over data. Re-derives from the evidence: run binding
+        # (repository, commit, run id), the exact gate digest, eligibility from
+        # the raw findings (PASS, integrity, verified secret, malicious package,
+        # mixed BLOCK are all refused), and the production-vs-synthetic route.
+        # A refusal here means the OIDC step below never runs.
+        id: preflight
+        env:
+          GATE_MODE: ${{ inputs.gate_mode }}
+          EXPECTED_GATE_DIGEST: ${{ inputs.expected_gate_digest }}
+          PROD_FUNCTION: ${{ inputs.lambda_function }}
+          PROD_ROLE: ${{ inputs.lambda_role_arn }}
+          PROD_REGION: ${{ inputs.aws_region }}
+          SYNTH_FUNCTION: ${{ inputs.synthetic_lambda_function }}
+          SYNTH_ROLE: ${{ inputs.synthetic_lambda_role_arn }}
+          SYNTH_REGION: ${{ inputs.synthetic_aws_region }}
+        run: node "$SSD_TOOLKIT/scripts/break-glass-evidence.mjs"
+
+      # ---- credential boundary ----------------------------------------------------
+
+      - name: Assume the break-glass invoker role (OIDC)
+        if: ${{ steps.preflight.outcome == 'success' }}
+        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+        with:
+          # The role the PREFLIGHT resolved from the evidence — the isolated test
+          # role for a synthetic gate, production otherwise. Never a raw input.
+          role-to-assume: ${{ steps.preflight.outputs.role_arn }}
+          aws-region: ${{ steps.preflight.outputs.region }}
+          role-session-name: break-glass-gate
+
+      - name: Request break-glass decision
+        id: request
+        if: ${{ steps.preflight.outcome == 'success' }}
+        env:
+          BREAK_GLASS_TRANSPORT: lambda
+          BREAK_GLASS_FUNCTION_NAME: ${{ steps.preflight.outputs.function_name }}
+          AWS_REGION: ${{ steps.preflight.outputs.region }}
+          BREAK_GLASS_TIMEOUT_SECONDS: ${{ inputs.timeout_seconds }}
+          CI_REPOSITORY: ${{ github.repository }}
+          CI_COMMIT_SHA: ${{ github.sha }}
+          CI_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          CI_PULL_REQUEST: ${{ github.event.pull_request.number || inputs.pr_number }}
+          CI_SYSTEM: github-actions
+        run: node "$SSD_TOOLKIT/scripts/break-glass-notify.mjs" --gate "$SSD_GATE_PATH" --output "$SSD_REQUEST_PATH"
+
+      - name: Wait for verified break-glass decision
+        id: poll
+        if: ${{ steps.request.outcome == 'success' }}
+        env:
+          BREAK_GLASS_TRANSPORT: lambda
+          BREAK_GLASS_FUNCTION_NAME: ${{ steps.preflight.outputs.function_name }}
+          AWS_REGION: ${{ steps.preflight.outputs.region }}
+          BREAK_GLASS_TIMEOUT_SECONDS: ${{ inputs.timeout_seconds }}
+        run: node "$SSD_TOOLKIT/scripts/break-glass-poll.mjs" "$SSD_REQUEST_PATH" "$SSD_DECISION_PATH"
+
+      # ---- evidence, feedback, enforcement (always) ------------------------------
+
+      - name: Record the break-glass result
+        # approved only when the poll succeeded AND the decision's requestId and
+        # gateDigest match the delivered request, which matches the validated
+        # gate. Everything else is a bounded failure status. It also writes the
+        # "Break-glass review" job summary (source verdict, decision, effective
+        # disposition) — presentation only, after the outputs.
+        id: result
+        if: always()
+        env:
+          PREFLIGHT_OUTCOME: ${{ steps.preflight.outcome }}
+          REQUEST_OUTCOME: ${{ steps.request.outcome }}
+          POLL_OUTCOME: ${{ steps.poll.outcome }}
+        run: node "$SSD_TOOLKIT/scripts/break-glass-result.mjs"
+
+      - name: Post developer-readable findings (Slack + job summary)
+        # The source workflow has ALREADY sent the normal Slack BLOCK alert (it
+        # never suppresses it on delegation). This job adds a second alert when
+        # its approval request was NOT delivered (refused, configuration error,
+        # broker rejection), saying break-glass failed; a delivered request is
+        # itself the interactive message. Duplicates are the accepted fail-safe
+        # cost. No PR comment: this job holds no pull-requests permission.
+        if: always()
+        continue-on-error: true
+        env:
+          GATE_MODE: ${{ inputs.gate_mode }}
+          SECURITY_NOTIFY_SLACK_URL: ${{ inputs.slack_notify_url }}
+          BREAK_GLASS_ENABLED: 'true'
+          BREAK_GLASS_CHECK_OUTCOME: ${{ steps.preflight.outcome }}
+          BREAK_GLASS_REQUEST_OUTCOME: ${{ steps.request.outcome }}
+          BREAK_GLASS_POLL_OUTCOME: ${{ steps.poll.outcome }}
+          # The "Record the break-glass result" step wrote this job's summary
+          # (the break-glass review). The notifier adds only a pointer to the
+          # source findings; Slack and failure reporting are unchanged.
+          SECURITY_SUMMARY_ROLE: break-glass
+        run: |
+          export BREAK_GLASS_REQUEST_PATH="$SSD_REQUEST_PATH" BREAK_GLASS_DECISION_PATH="$SSD_DECISION_PATH"
+          if [ ! -f "$SSD_GATE_PATH" ]; then
+            echo "::error::The security gate evidence could not be read, so no developer alert can be rendered. The BLOCK stands; see the source workflow's summary."
+            exit 1
+          fi
+          node "$SSD_TOOLKIT/scripts/notify.mjs" --gate "$SSD_GATE_PATH"
+
+      - name: Upload the break-glass decision
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: break-glass-results
+          path: ${{ runner.temp }}/ssd-break-glass/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Enforce the break-glass decision
+        if: always()
+        env:
+          DECISION: ${{ steps.result.outputs.decision_status }}
+        run: |
+          if [ "$DECISION" = "approved" ]; then
+            echo "::warning::Break-glass APPROVED for this exact gate. The source policy verdict remains BLOCK; the caller's security-gate records an overridden BLOCK."
+            exit 0
+          fi
+          echo "Break-glass did not approve this BLOCK (decision_status='${DECISION}'). The BLOCK stands." >&2
+          exit 1

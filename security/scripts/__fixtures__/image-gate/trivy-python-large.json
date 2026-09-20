@@ -1,0 +1,1501 @@
+{
+  "SchemaVersion": 2,
+  "CreatedAt": "2026-09-18T00:00:00Z",
+  "ArtifactName": "app:prepush",
+  "ArtifactType": "container_image",
+  "Metadata": {
+    "ImageID": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    "OS": {
+      "Family": "debian",
+      "Name": "12.11",
+      "EOSL": false
+    }
+  },
+  "Results": [
+    {
+      "Target": "app:prepush (debian 12.11)",
+      "Class": "os-pkgs",
+      "Type": "debian",
+      "Vulnerabilities": [
+        {
+          "VulnerabilityID": "CVE-2099-1001",
+          "PkgName": "libssl3",
+          "InstalledVersion": "3.0.15-1~deb12u1",
+          "FixedVersion": "3.0.17-1~deb12u2",
+          "Severity": "CRITICAL",
+          "Title": "openssl: buffer overflow in X.509 name checks",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-1001"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-1002",
+          "PkgName": "libssl3",
+          "InstalledVersion": "3.0.15-1~deb12u1",
+          "FixedVersion": "3.0.17-1~deb12u2",
+          "Severity": "HIGH",
+          "Title": "openssl: timing side channel",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-1002"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-1003",
+          "PkgName": "libssl3",
+          "InstalledVersion": "3.0.15-1~deb12u1",
+          "FixedVersion": "3.0.17-1~deb12u2",
+          "Severity": "HIGH",
+          "Title": "openssl: denial of service in ASN.1 parsing",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-1003"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-1001",
+          "PkgName": "openssl",
+          "InstalledVersion": "3.0.15-1~deb12u1",
+          "FixedVersion": "3.0.17-1~deb12u2",
+          "Severity": "CRITICAL",
+          "Title": "openssl: buffer overflow in X.509 name checks",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-1001"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-1002",
+          "PkgName": "openssl",
+          "InstalledVersion": "3.0.15-1~deb12u1",
+          "FixedVersion": "3.0.17-1~deb12u2",
+          "Severity": "HIGH",
+          "Title": "openssl: timing side channel",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-1002"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-1003",
+          "PkgName": "openssl",
+          "InstalledVersion": "3.0.15-1~deb12u1",
+          "FixedVersion": "3.0.17-1~deb12u2",
+          "Severity": "HIGH",
+          "Title": "openssl: denial of service in ASN.1 parsing",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-1003"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-1010",
+          "PkgName": "libxml2",
+          "InstalledVersion": "2.9.14+dfsg-1.3~deb12u1",
+          "FixedVersion": "2.9.14+dfsg-1.3~deb12u2",
+          "Severity": "HIGH",
+          "Title": "libxml2: use-after-free",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-1010"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-1011",
+          "PkgName": "libxml2",
+          "InstalledVersion": "2.9.14+dfsg-1.3~deb12u1",
+          "FixedVersion": "2.9.14+dfsg-1.3~deb12u2",
+          "Severity": "HIGH",
+          "Title": "libxml2: null dereference",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-1011"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-1012",
+          "PkgName": "libxml2",
+          "InstalledVersion": "2.9.14+dfsg-1.3~deb12u1",
+          "FixedVersion": "2.9.14+dfsg-1.3~deb12u3",
+          "Severity": "HIGH",
+          "Title": "libxml2: integer overflow",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-1012"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-1040",
+          "PkgName": "zlib1g",
+          "InstalledVersion": "1:1.2.13.dfsg-1",
+          "FixedVersion": "1:1.2.13.dfsg-1+deb12u1",
+          "Severity": "CRITICAL",
+          "Title": "zlib: heap overflow in inflate",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-1040"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-1050",
+          "PkgName": "perl-base",
+          "InstalledVersion": "5.36.0-7+deb12u1",
+          "FixedVersion": "5.36.0-7+deb12u2",
+          "Severity": "HIGH",
+          "Title": "perl: heap overflow",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-1050"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-1051",
+          "PkgName": "perl-base",
+          "InstalledVersion": "5.36.0-7+deb12u1",
+          "FixedVersion": "5.36.0-7+deb12u2",
+          "Severity": "HIGH",
+          "Title": "perl: regex denial of service",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-1051"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-2001",
+          "PkgName": "libc6",
+          "InstalledVersion": "2.36-9+deb12u10",
+          "FixedVersion": "",
+          "Severity": "CRITICAL",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-2001"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-2001",
+          "PkgName": "libc-bin",
+          "InstalledVersion": "2.36-9+deb12u10",
+          "FixedVersion": "",
+          "Severity": "CRITICAL",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-2001"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-2001",
+          "PkgName": "libgssapi-krb5-2",
+          "InstalledVersion": "2.36-9+deb12u10",
+          "FixedVersion": "",
+          "Severity": "CRITICAL",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-2001"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-2001",
+          "PkgName": "libkrb5-3",
+          "InstalledVersion": "2.36-9+deb12u10",
+          "FixedVersion": "",
+          "Severity": "CRITICAL",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-2001"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-2001",
+          "PkgName": "libk5crypto3",
+          "InstalledVersion": "2.36-9+deb12u10",
+          "FixedVersion": "",
+          "Severity": "CRITICAL",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-2001"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-2002",
+          "PkgName": "libc6",
+          "InstalledVersion": "2.36-9+deb12u10",
+          "FixedVersion": "",
+          "Severity": "CRITICAL",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-2002"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-2002",
+          "PkgName": "libc-bin",
+          "InstalledVersion": "2.36-9+deb12u10",
+          "FixedVersion": "",
+          "Severity": "CRITICAL",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-2002"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-2002",
+          "PkgName": "libgssapi-krb5-2",
+          "InstalledVersion": "2.36-9+deb12u10",
+          "FixedVersion": "",
+          "Severity": "CRITICAL",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-2002"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-2002",
+          "PkgName": "libkrb5-3",
+          "InstalledVersion": "2.36-9+deb12u10",
+          "FixedVersion": "",
+          "Severity": "CRITICAL",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-2002"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-2002",
+          "PkgName": "libk5crypto3",
+          "InstalledVersion": "2.36-9+deb12u10",
+          "FixedVersion": "",
+          "Severity": "CRITICAL",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-2002"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-2003",
+          "PkgName": "libc6",
+          "InstalledVersion": "2.36-9+deb12u10",
+          "FixedVersion": "",
+          "Severity": "HIGH",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-2003"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-2003",
+          "PkgName": "libc-bin",
+          "InstalledVersion": "2.36-9+deb12u10",
+          "FixedVersion": "",
+          "Severity": "HIGH",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-2003"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-2003",
+          "PkgName": "libgssapi-krb5-2",
+          "InstalledVersion": "2.36-9+deb12u10",
+          "FixedVersion": "",
+          "Severity": "HIGH",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-2003"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-2003",
+          "PkgName": "libkrb5-3",
+          "InstalledVersion": "2.36-9+deb12u10",
+          "FixedVersion": "",
+          "Severity": "HIGH",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-2003"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-2003",
+          "PkgName": "libk5crypto3",
+          "InstalledVersion": "2.36-9+deb12u10",
+          "FixedVersion": "",
+          "Severity": "HIGH",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-2003"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-2004",
+          "PkgName": "libc6",
+          "InstalledVersion": "2.36-9+deb12u10",
+          "FixedVersion": "",
+          "Severity": "HIGH",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-2004"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-2004",
+          "PkgName": "libc-bin",
+          "InstalledVersion": "2.36-9+deb12u10",
+          "FixedVersion": "",
+          "Severity": "HIGH",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-2004"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-2004",
+          "PkgName": "libgssapi-krb5-2",
+          "InstalledVersion": "2.36-9+deb12u10",
+          "FixedVersion": "",
+          "Severity": "HIGH",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-2004"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-2004",
+          "PkgName": "libkrb5-3",
+          "InstalledVersion": "2.36-9+deb12u10",
+          "FixedVersion": "",
+          "Severity": "HIGH",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-2004"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-2004",
+          "PkgName": "libk5crypto3",
+          "InstalledVersion": "2.36-9+deb12u10",
+          "FixedVersion": "",
+          "Severity": "HIGH",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-2004"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-2005",
+          "PkgName": "libc6",
+          "InstalledVersion": "2.36-9+deb12u10",
+          "FixedVersion": "",
+          "Severity": "HIGH",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-2005"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-2005",
+          "PkgName": "libc-bin",
+          "InstalledVersion": "2.36-9+deb12u10",
+          "FixedVersion": "",
+          "Severity": "HIGH",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-2005"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-2005",
+          "PkgName": "libgssapi-krb5-2",
+          "InstalledVersion": "2.36-9+deb12u10",
+          "FixedVersion": "",
+          "Severity": "HIGH",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-2005"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-2005",
+          "PkgName": "libkrb5-3",
+          "InstalledVersion": "2.36-9+deb12u10",
+          "FixedVersion": "",
+          "Severity": "HIGH",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-2005"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-2005",
+          "PkgName": "libk5crypto3",
+          "InstalledVersion": "2.36-9+deb12u10",
+          "FixedVersion": "",
+          "Severity": "HIGH",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-2005"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-2006",
+          "PkgName": "libc6",
+          "InstalledVersion": "2.36-9+deb12u10",
+          "FixedVersion": "",
+          "Severity": "HIGH",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-2006"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-2006",
+          "PkgName": "libc-bin",
+          "InstalledVersion": "2.36-9+deb12u10",
+          "FixedVersion": "",
+          "Severity": "HIGH",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-2006"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-2006",
+          "PkgName": "libgssapi-krb5-2",
+          "InstalledVersion": "2.36-9+deb12u10",
+          "FixedVersion": "",
+          "Severity": "HIGH",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-2006"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-2006",
+          "PkgName": "libkrb5-3",
+          "InstalledVersion": "2.36-9+deb12u10",
+          "FixedVersion": "",
+          "Severity": "HIGH",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-2006"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-2006",
+          "PkgName": "libk5crypto3",
+          "InstalledVersion": "2.36-9+deb12u10",
+          "FixedVersion": "",
+          "Severity": "HIGH",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-2006"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-2007",
+          "PkgName": "libc6",
+          "InstalledVersion": "2.36-9+deb12u10",
+          "FixedVersion": "",
+          "Severity": "HIGH",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-2007"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-2007",
+          "PkgName": "libc-bin",
+          "InstalledVersion": "2.36-9+deb12u10",
+          "FixedVersion": "",
+          "Severity": "HIGH",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-2007"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-2007",
+          "PkgName": "libgssapi-krb5-2",
+          "InstalledVersion": "2.36-9+deb12u10",
+          "FixedVersion": "",
+          "Severity": "HIGH",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-2007"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-2007",
+          "PkgName": "libkrb5-3",
+          "InstalledVersion": "2.36-9+deb12u10",
+          "FixedVersion": "",
+          "Severity": "HIGH",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-2007"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-2007",
+          "PkgName": "libk5crypto3",
+          "InstalledVersion": "2.36-9+deb12u10",
+          "FixedVersion": "",
+          "Severity": "HIGH",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-2007"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-2008",
+          "PkgName": "libc6",
+          "InstalledVersion": "2.36-9+deb12u10",
+          "FixedVersion": "",
+          "Severity": "HIGH",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-2008"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-2008",
+          "PkgName": "libc-bin",
+          "InstalledVersion": "2.36-9+deb12u10",
+          "FixedVersion": "",
+          "Severity": "HIGH",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-2008"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-2008",
+          "PkgName": "libgssapi-krb5-2",
+          "InstalledVersion": "2.36-9+deb12u10",
+          "FixedVersion": "",
+          "Severity": "HIGH",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-2008"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-2008",
+          "PkgName": "libkrb5-3",
+          "InstalledVersion": "2.36-9+deb12u10",
+          "FixedVersion": "",
+          "Severity": "HIGH",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-2008"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-2008",
+          "PkgName": "libk5crypto3",
+          "InstalledVersion": "2.36-9+deb12u10",
+          "FixedVersion": "",
+          "Severity": "HIGH",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-2008"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-2009",
+          "PkgName": "libc6",
+          "InstalledVersion": "2.36-9+deb12u10",
+          "FixedVersion": "",
+          "Severity": "HIGH",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-2009"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-2009",
+          "PkgName": "libc-bin",
+          "InstalledVersion": "2.36-9+deb12u10",
+          "FixedVersion": "",
+          "Severity": "HIGH",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-2009"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-2009",
+          "PkgName": "libgssapi-krb5-2",
+          "InstalledVersion": "2.36-9+deb12u10",
+          "FixedVersion": "",
+          "Severity": "HIGH",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-2009"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-2009",
+          "PkgName": "libkrb5-3",
+          "InstalledVersion": "2.36-9+deb12u10",
+          "FixedVersion": "",
+          "Severity": "HIGH",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-2009"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-2009",
+          "PkgName": "libk5crypto3",
+          "InstalledVersion": "2.36-9+deb12u10",
+          "FixedVersion": "",
+          "Severity": "HIGH",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-2009"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3001",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3001"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3001",
+          "PkgName": "curl",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3001"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3002",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3002"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3002",
+          "PkgName": "curl",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3002"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3003",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "LOW",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3003"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3003",
+          "PkgName": "curl",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "LOW",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3003"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3004",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "7.88.1-10+deb12u9",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3004"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3004",
+          "PkgName": "curl",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "7.88.1-10+deb12u9",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3004"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3005",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3005"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3005",
+          "PkgName": "curl",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3005"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3006",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "LOW",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3006"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3006",
+          "PkgName": "curl",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "LOW",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3006"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3007",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3007"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3007",
+          "PkgName": "curl",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3007"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3008",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "7.88.1-10+deb12u9",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3008"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3008",
+          "PkgName": "curl",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "7.88.1-10+deb12u9",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3008"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3009",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "LOW",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3009"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3009",
+          "PkgName": "curl",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "LOW",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3009"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3010",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3010"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3010",
+          "PkgName": "curl",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3010"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3011",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3011"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3011",
+          "PkgName": "curl",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3011"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3012",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "7.88.1-10+deb12u9",
+          "Severity": "LOW",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3012"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3012",
+          "PkgName": "curl",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "7.88.1-10+deb12u9",
+          "Severity": "LOW",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3012"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3013",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3013"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3013",
+          "PkgName": "curl",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3013"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3014",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3014"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3014",
+          "PkgName": "curl",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3014"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3015",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "LOW",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3015"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3015",
+          "PkgName": "curl",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "LOW",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3015"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3016",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "7.88.1-10+deb12u9",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3016"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3016",
+          "PkgName": "curl",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "7.88.1-10+deb12u9",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3016"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3017",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3017"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3017",
+          "PkgName": "curl",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3017"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3018",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "LOW",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3018"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3018",
+          "PkgName": "curl",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "LOW",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3018"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3019",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3019"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3019",
+          "PkgName": "curl",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3019"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3020",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "7.88.1-10+deb12u9",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3020"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3020",
+          "PkgName": "curl",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "7.88.1-10+deb12u9",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3020"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3021",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "LOW",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3021"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3021",
+          "PkgName": "curl",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "LOW",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3021"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3022",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3022"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3022",
+          "PkgName": "curl",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3022"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3023",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3023"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3023",
+          "PkgName": "curl",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3023"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3024",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "7.88.1-10+deb12u9",
+          "Severity": "LOW",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3024"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3024",
+          "PkgName": "curl",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "7.88.1-10+deb12u9",
+          "Severity": "LOW",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3024"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3025",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3025"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3025",
+          "PkgName": "curl",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3025"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3026",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3026"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3026",
+          "PkgName": "curl",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3026"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3027",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "LOW",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3027"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3027",
+          "PkgName": "curl",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "LOW",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3027"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3028",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "7.88.1-10+deb12u9",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3028"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3028",
+          "PkgName": "curl",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "7.88.1-10+deb12u9",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3028"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3029",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3029"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3029",
+          "PkgName": "curl",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3029"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3030",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "LOW",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3030"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3030",
+          "PkgName": "curl",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "LOW",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3030"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3031",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3031"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3031",
+          "PkgName": "curl",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3031"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3032",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "7.88.1-10+deb12u9",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3032"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3032",
+          "PkgName": "curl",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "7.88.1-10+deb12u9",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3032"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3033",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "LOW",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3033"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3033",
+          "PkgName": "curl",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "LOW",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3033"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3034",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3034"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3034",
+          "PkgName": "curl",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3034"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3035",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3035"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3035",
+          "PkgName": "curl",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3035"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3036",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "7.88.1-10+deb12u9",
+          "Severity": "LOW",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3036"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3036",
+          "PkgName": "curl",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "7.88.1-10+deb12u9",
+          "Severity": "LOW",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3036"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3037",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3037"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3037",
+          "PkgName": "curl",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3037"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3038",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3038"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3038",
+          "PkgName": "curl",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3038"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3039",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "LOW",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3039"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3039",
+          "PkgName": "curl",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "LOW",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3039"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3040",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "7.88.1-10+deb12u9",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3040"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3040",
+          "PkgName": "curl",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "7.88.1-10+deb12u9",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3040"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3041",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3041"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3041",
+          "PkgName": "curl",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3041"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3042",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "LOW",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3042"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3042",
+          "PkgName": "curl",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "LOW",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3042"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3043",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3043"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3043",
+          "PkgName": "curl",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3043"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3044",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "7.88.1-10+deb12u9",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3044"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3044",
+          "PkgName": "curl",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "7.88.1-10+deb12u9",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3044"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3045",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "LOW",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3045"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3045",
+          "PkgName": "curl",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "LOW",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3045"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3046",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3046"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3046",
+          "PkgName": "curl",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3046"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3047",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3047"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3047",
+          "PkgName": "curl",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3047"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3048",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "7.88.1-10+deb12u9",
+          "Severity": "LOW",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3048"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3048",
+          "PkgName": "curl",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "7.88.1-10+deb12u9",
+          "Severity": "LOW",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3048"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3049",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3049"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3049",
+          "PkgName": "curl",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3049"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3050",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3050"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3050",
+          "PkgName": "curl",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3050"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3051",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "LOW",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3051"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3051",
+          "PkgName": "curl",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "LOW",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3051"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3052",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "7.88.1-10+deb12u9",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3052"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3052",
+          "PkgName": "curl",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "7.88.1-10+deb12u9",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3052"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3053",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3053"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3054",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "LOW",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3054"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3055",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3055"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3056",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "7.88.1-10+deb12u9",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3056"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3057",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "LOW",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3057"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3058",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3058"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3059",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3059"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3060",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "7.88.1-10+deb12u9",
+          "Severity": "LOW",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3060"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3061",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3061"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3062",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3062"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3063",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "LOW",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3063"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3064",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "7.88.1-10+deb12u9",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3064"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3065",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3065"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3066",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "LOW",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3066"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3067",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3067"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3068",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "7.88.1-10+deb12u9",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3068"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3069",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "LOW",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3069"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-3070",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.88.1-10+deb12u8",
+          "FixedVersion": "",
+          "Severity": "MEDIUM",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-3070"
+        }
+      ]
+    },
+    {
+      "Target": "Python",
+      "Class": "lang-pkgs",
+      "Type": "python-pkg",
+      "Vulnerabilities": [
+        {
+          "VulnerabilityID": "CVE-2099-1020",
+          "PkgName": "setuptools",
+          "InstalledVersion": "65.5.0",
+          "FixedVersion": "78.1.1",
+          "Severity": "HIGH",
+          "Title": "setuptools: path traversal in PackageIndex",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-1020"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-1021",
+          "PkgName": "setuptools",
+          "InstalledVersion": "65.5.0",
+          "FixedVersion": "78.1.1",
+          "Severity": "HIGH",
+          "Title": "setuptools: remote code execution via download",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-1021"
+        },
+        {
+          "VulnerabilityID": "CVE-2099-1030",
+          "PkgName": "pip",
+          "InstalledVersion": "23.0.1",
+          "FixedVersion": "25.0",
+          "Severity": "HIGH",
+          "Title": "pip: arbitrary file overwrite",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2099-1030"
+        }
+      ]
+    }
+  ]
+}
