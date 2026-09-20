@@ -775,7 +775,111 @@ export function buildConformance({
   };
 }
 
+// Presentation only. A clean run (nothing failed, exempt or warned, and no
+// legacy break-glass evidence) renders compactly: it is a confirmation, not a
+// diagnosis. Anything else keeps the full diagnostic report. Neither changes
+// conformance.json, a control status, or the exit code.
+//
+// A DEFERRED control is not a degraded state: it applies to the repository and
+// simply does not run in this phase (registry collection, artifact gate and
+// deploy on a PR). It is named on its own line in the compact report instead of
+// forcing the diagnostic one.
+export function isCleanConformance(report) {
+  const { summary } = report;
+  return (
+    summary.failed === 0 &&
+    summary.exempt === 0 &&
+    report.warnings.length === 0 &&
+    !(report.breakGlassEnabled && report.breakGlassEvidence !== 'strict')
+  );
+}
+
 export function renderMarkdown(report) {
+  return isCleanConformance(report) ? renderCompactMarkdown(report) : renderDetailedMarkdown(report);
+}
+
+const SHORT_NAMES = {
+  'secret-scan': 'secret scanning',
+  'dependency-scan': 'dependency scanning',
+  sast: 'SAST',
+  'source-gate': 'source gate',
+  'image-scan-prepush': 'image scan',
+  'registry-scan-collect': 'registry collection',
+  'artifact-gate': 'artifact gate',
+  'gated-deploy': 'deploy',
+  'break-glass': 'break-glass'
+};
+
+function appliedNote(control) {
+  if (control.id === 'source-gate') {
+    if (control.override === 'approved') return ` — ${control.verdict ?? 'BLOCK'} overridden by verified approval`;
+    return control.verdict ? ` — verdict ${control.verdict}` : '';
+  }
+  if (control.id === 'break-glass') {
+    if (control.decision) return ` — ${control.decision}`;
+    if (control.exercised === false) return ' — not exercised';
+  }
+  return '';
+}
+
+export function renderCompactMarkdown(report) {
+  const { summary } = report;
+  const lines = [
+    '## ✅ Conformance',
+    '',
+    `Phase: \`${report.phase}\` · Required controls: **${summary.applied}/${summary.requiredByRepository}** applied` +
+      (summary.deferred > 0 ? `, **${summary.deferred}** deferred to another phase` : '') +
+      (report.breakGlassEnabled ? ` · Break-glass evidence: **${report.breakGlassEvidence}**` : ''),
+    '',
+    '| Control | Result |',
+    '| --- | --- |'
+  ];
+  // In a clean report the only statuses left are applied, deferred and N/A.
+  for (const control of report.controls.filter((entry) => entry.status === 'applied')) {
+    lines.push(`| ${control.name} | ✅ applied${appliedNote(control)} |`);
+  }
+  const deferred = report.controls.filter((entry) => entry.status === 'deferred');
+  if (deferred.length > 0) {
+    // The phases those controls DO run in, from the controls themselves. A
+    // deferred control never lists the current phase, by definition.
+    const phases = [...new Set(deferred.flatMap((control) => control.phases))];
+    lines.push(
+      '',
+      `Deferred to ${phases.join('/')}: ${deferred.map((control) => SHORT_NAMES[control.id] ?? control.name).join(', ')}`
+    );
+  }
+  lines.push(...renderNotApplicable(report));
+  return lines.join('\n');
+}
+
+// Every N/A reason begins with the `key=value` that made the control not apply
+// (`artifact_type=library: …`, `break_glass_enabled=false: …`). Controls are
+// grouped by that key, so a line's reason always belongs to the controls on it:
+// the capability keys (whatever the declaration holds) share one line with the
+// declared triple, and any other key — break_glass_enabled today — gets its own.
+function reasonKey(control) {
+  return /^([a-z_]+)=([^:]*):/.exec(control.reason ?? '')?.slice(1) ?? null;
+}
+
+function renderNotApplicable(report) {
+  const notApplicable = report.controls.filter((entry) => !entry.appliesToRepository);
+  const capabilityTriple = Object.entries(report.capabilities).map(([key, value]) => `\`${key}=${value}\``).join(' ');
+  const groups = new Map();
+  for (const control of notApplicable) {
+    const parsed = reasonKey(control);
+    // A capability key groups with the declaration; anything else stands alone;
+    // an unparsable reason is listed with no reason rather than a borrowed one.
+    const key = parsed && Object.hasOwn(report.capabilities, parsed[0]) ? '' : parsed ? parsed.join('=') : null;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(SHORT_NAMES[control.id] ?? control.name);
+  }
+  return [...groups].map(([key, names]) => {
+    const why = key === '' ? ` (${capabilityTriple})` : key === null ? '' : ` (\`${key}\`)`;
+    return `\nNot applicable: ${names.join(', ')}${why}`;
+  });
+}
+
+export function renderDetailedMarkdown(report) {
   const symbol = {
     applied: '✅ applied',
     deferred: '⏳ deferred',

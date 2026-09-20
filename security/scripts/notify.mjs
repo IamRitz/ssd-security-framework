@@ -25,6 +25,7 @@ import {
   buildReport,
   deriveBreakGlassState,
   renderEvidenceMarkdown,
+  renderBreakGlassFindingsPointer,
   renderMarkdown,
   renderSlack,
   resolveReproduceCommands,
@@ -219,9 +220,16 @@ export async function dispatch({
   //    network, so the full, plain-language explanation lands even if every
   //    remote surface below fails. This is the guarantee against the worst case:
   //    a red pipeline (from the gate's own failing step) with no reason shown.
+  //    In the break-glass job (context.summaryRole) the findings already live in
+  //    the source-gate summary, so only a pointer is written; the surfaces below
+  //    are unaffected by the role.
   if (routing.summary) {
+    const summary =
+      context.summaryRole === 'break-glass'
+        ? renderBreakGlassFindingsPointer(report)
+        : renderMarkdown(report, { includeMarker: false });
     try {
-      performed.summary = await writeStepSummary(renderMarkdown(report, { includeMarker: false }), {
+      performed.summary = await writeStepSummary(summary, {
         summaryPath,
         appendImpl
       });
@@ -389,8 +397,8 @@ async function main() {
   const context = {
     evidenceFile: basename(options.gate),
     evidenceMarkdownFile: basename(evidencePath),
-    // `break-glass` only in the Lambda break-glass job: the job summary then
-    // presents the findings under that job's break-glass review.
+    // `break-glass` only in the Lambda break-glass job: its job summary then
+    // carries a pointer to the source findings instead of repeating them.
     summaryRole: env.SECURITY_SUMMARY_ROLE === 'break-glass' ? 'break-glass' : null,
     // The raw scanner report behind this gate result, when the workflow names
     // one (image gates). Only its file name is shown.

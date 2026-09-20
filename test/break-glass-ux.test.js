@@ -17,7 +17,8 @@ import { describe, it } from 'node:test';
 import { describePollOutcome, runPoll } from '../security/scripts/break-glass-poll.mjs';
 import { DECISION_STATUSES, deriveBreakGlassResult, renderBreakGlassSummary } from '../security/scripts/break-glass-result.mjs';
 import { decideSourceGate } from '../security/scripts/final-gate.mjs';
-import { buildReport, renderMarkdown } from '../security/scripts/format-findings.mjs';
+import { buildReport, renderBreakGlassFindingsPointer, renderMarkdown } from '../security/scripts/format-findings.mjs';
+import { dispatch } from '../security/scripts/notify.mjs';
 
 const SCRIPTS = resolve('security/scripts');
 const DIGEST = 'd'.repeat(64);
@@ -203,7 +204,7 @@ describe('break-glass job summary: source verdict, decision and disposition stay
     assert.match(row(md, 'Decision'), /APPROVED by `alice`/);
     assert.match(row(md, 'Effective disposition'), /OVERRIDDEN BLOCK\*\* for this run only/);
     assert.ok(row(md, 'Gate digest').includes(`sha256:${DIGEST}`));
-    assert.match(md, /source policy verdict remains \*\*BLOCK\*\*/);
+    assert.match(md, /source policy verdict remains \*\*BLOCK\*\*\. This approval applies only to this exact gate and run\./);
     assert.doesNotMatch(md, /Security gate: BLOCK/);
     assert.doesNotMatch(md, /\bPASS\b/, 'the policy verdict is never rewritten to PASS');
   });
@@ -350,52 +351,201 @@ describe('break-glass job summary: source verdict, decision and disposition stay
 });
 
 // =================================================================================
-describe('findings summary: raw source-gate rendering is unchanged', () => {
-  it('the source job headlines the raw policy verdict', () => {
-    const md = renderMarkdown(buildReport({ gate: BLOCK_GATE, context: {} }));
+describe('findings summary: full detail in the source-gate job, a pointer in the break-glass job', () => {
+  const DETAILED_GATE = {
+    verdict: 'BLOCK',
+    findings: [{ source: 'semgrep', id: 'r', action: 'BLOCK', severity: 'high', policyRule: 'sast.high_new', baselineState: 'new', file: 'a.js', line: 3, message: 'eval of input' }],
+    breakGlass: { eligible: true }
+  };
+  const RUN_URL = 'https://github.com/o/r/actions/runs/1';
+  // Everything the source-gate report carries that the break-glass job must not repeat.
+  const FINDINGS_DETAIL = [/Issues \(/, /Blocking findings/, /<details/, /eval of input/, /🔧|remediat/i, /🔎|Registry metadata/, /Reproduce|reproduce/, /[Aa]dvisor/, /Evidence conflicts?/, /Security gate:/];
+
+  it('the source-gate job keeps the full detailed findings report', () => {
+    const md = renderMarkdown(buildReport({ gate: DETAILED_GATE, context: { repository: 'o/r', runUrl: RUN_URL } }));
     assert.match(md, /^## ⛔ Security gate: BLOCK$/m);
-    assert.doesNotMatch(md, /Source findings behind this review/);
+    assert.match(md, /^### Issues \(1\)$/m);
+    assert.match(md, /^### ⛔ Blocking findings \(1\)$/m);
+    assert.match(md, /<details open><summary>⛔ BLOCK/);
+    assert.match(md, /eval of input/);
+    assert.match(md, /🔧 Review the flagged code/);
+    assert.match(md, /Full evidence: `security-gate\.json`/);
   });
 
-  it('an unrecognized role is the source rendering, byte for byte', () => {
-    const plain = renderMarkdown(buildReport({ gate: BLOCK_GATE, context: {} }));
-    assert.equal(renderMarkdown(buildReport({ gate: BLOCK_GATE, context: { summaryRole: 'other' } })), plain);
-  });
-
-  it('the break-glass job demotes the findings under the review and still shows BLOCK verbatim', () => {
-    const report = buildReport({ gate: BLOCK_GATE, context: { summaryRole: 'break-glass' } });
-    assert.equal(report.verdict, 'BLOCK');
-    const md = renderMarkdown(report);
-    assert.doesNotMatch(md, /^## .*Security gate:/m);
-    assert.match(md, /^### ⛔ Source findings behind this review — source policy verdict: BLOCK$/m);
-    assert.match(md, /Break-glass review\*\* above/);
-  });
-
-  it('the notifier CLI selects the break-glass role only from SECURITY_SUMMARY_ROLE=break-glass', async () => {
-    await withTempDir(async (directory) => {
-      const gatePath = join(directory, 'security-gate.json');
-      await writeFile(gatePath, JSON.stringify(BLOCK_GATE));
-      const render = (role) => {
-        const summary = join(directory, `summary-${role || 'none'}.md`);
-        const r = spawnSync(process.execPath, [join(SCRIPTS, 'notify.mjs'), '--gate', gatePath], {
-          encoding: 'utf8',
-          env: { PATH: process.env.PATH, GITHUB_STEP_SUMMARY: summary, GATE_MODE: 'enforce', ...(role ? { SECURITY_SUMMARY_ROLE: role } : {}) }
-        });
-        assert.equal(r.status, 0, r.stderr);
-        return readFile(summary, 'utf8');
-      };
-      assert.match(await render(''), /^## ⛔ Security gate: BLOCK$/m);
-      assert.match(await render('BREAK-GLASS'), /^## ⛔ Security gate: BLOCK$/m);
-      assert.match(await render('break-glass'), /^### ⛔ Source findings behind this review — source policy verdict: BLOCK$/m);
-    });
-  });
-
-  it('only the Lambda break-glass notifier step sets the role', async () => {
-    const bg = await readFile('.github/workflows/_break-glass-lambda.yml', 'utf8');
-    assert.equal(bg.match(/SECURITY_SUMMARY_ROLE: break-glass/g)?.length, 1);
-    for (const path of ['.github/workflows/_source-security.yml', '.github/workflows/_source-scan.yml']) {
-      assert.doesNotMatch(await readFile(path, 'utf8'), /SECURITY_SUMMARY_ROLE/, path);
+  it('renderMarkdown ignores the role: the same bytes with or without it', () => {
+    const plain = renderMarkdown(buildReport({ gate: DETAILED_GATE, context: {} }));
+    for (const summaryRole of ['break-glass', 'other']) {
+      assert.equal(renderMarkdown(buildReport({ gate: DETAILED_GATE, context: { summaryRole } })), plain, summaryRole);
     }
+  });
+
+  it('the pointer names the raw verdict, links only the run URL it was given, and repeats no findings', () => {
+    const withRun = renderBreakGlassFindingsPointer(buildReport({ gate: DETAILED_GATE, context: { runUrl: RUN_URL } }));
+    assert.match(withRun, /source policy verdict: BLOCK/);
+    assert.match(withRun, /source-gate job summary and this run's artifacts \(\[run\]\(https:\/\/github\.com\/o\/r\/actions\/runs\/1\)\)/);
+    assert.equal(withRun.trim().split('\n').length, 1);
+    for (const pattern of FINDINGS_DETAIL) assert.doesNotMatch(withRun, pattern);
+    const noRun = renderBreakGlassFindingsPointer(buildReport({ gate: DETAILED_GATE, context: {} }));
+    assert.doesNotMatch(noRun, /\]\(|http/, 'no URL is invented');
+  });
+
+  describe('the whole break-glass job summary (review + notifier) is compact', () => {
+    const preflight = { accepted: true, gateDigest: DIGEST, synthetic: true, route: 'synthetic' };
+    const ok = { preflightOutcome: 'success', requestOutcome: 'success', pollOutcome: 'success', preflight, request: REQUEST };
+    const decision = (status, extra = {}) => ({ requestId: 'req-1', gateDigest: DIGEST, status, ...extra });
+
+    async function jobSummary(resultInput) {
+      const appended = [];
+      const review = renderBreakGlassSummary(deriveBreakGlassResult(resultInput), { verdict: 'BLOCK' });
+      await dispatch({
+        gate: DETAILED_GATE,
+        context: { summaryRole: 'break-glass', runUrl: RUN_URL },
+        mode: 'enforce',
+        breakGlass: { eligible: true, enabled: true, delivered: true, decision: 'approved' },
+        summaryPath: 'summary.md',
+        appendImpl: async (_path, text) => appended.push(text),
+        writeImpl: async () => {},
+        fetchImpl: async () => ({ ok: true, json: async () => [] }),
+        logger: { log() {}, error() {} }
+      });
+      return review + appended.join('');
+    }
+
+    it('approved: decision table, no findings report', async () => {
+      const md = await jobSummary({ ...ok, decision: decision('approved', { approver: { username: 'alice' } }) });
+      assert.match(md, /^## 🔓 Break-glass review: APPROVED$/m);
+      assert.match(md, /\| Source policy verdict \| \*\*BLOCK\*\* \|/);
+      assert.match(md, /\| Request delivered \| yes \(request `req-1`\) \|/);
+      assert.match(md, /\| Decision \| APPROVED by `alice` \|/);
+      assert.match(md, /\| Effective disposition \| \*\*OVERRIDDEN BLOCK\*\* for this run only \|/);
+      assert.match(md, /\| Route \| synthetic fixture — isolated test broker \|/);
+      assert.match(md, /source policy verdict remains \*\*BLOCK\*\*\. This approval applies only to this exact gate and run\./);
+      assert.match(md, /source-gate job summary and this run's artifacts/);
+      assert.doesNotMatch(md, /^_.+_$/m, 'no redundant reason line for a decision the table already states');
+      for (const pattern of FINDINGS_DETAIL) assert.doesNotMatch(md, pattern);
+      assert.ok(md.length < 1500, `compact (${md.length} chars)`);
+    });
+
+    for (const [status, label] of [['timeout', 'TIMEOUT'], ['denied', 'DENIED'], ['expired', 'EXPIRED']]) {
+      it(`${status}: ${label}, delivered, BLOCK STANDS, no findings report`, async () => {
+        const md = await jobSummary({ ...ok, pollOutcome: 'failure', decision: decision(status) });
+        assert.match(md, new RegExp(`Break-glass review: ${label}$`, 'm'));
+        assert.match(md, /\| Request delivered \| yes/);
+        assert.match(md, /BLOCK STANDS/);
+        assert.doesNotMatch(md, /OVERRIDDEN|APPROVED/);
+        assert.doesNotMatch(md, /^_.+_$/m, 'no redundant reason line');
+        for (const pattern of FINDINGS_DETAIL) assert.doesNotMatch(md, pattern);
+      });
+    }
+
+    for (const [name, input, label] of [
+      ['refused', { preflightOutcome: 'failure', preflight: { accepted: false, refusal: { code: 'hard-block', reason: 'verified secret' } } }, 'REFUSED'],
+      ['error before delivery', { ...ok, requestOutcome: 'failure', pollOutcome: 'skipped' }, 'ERROR']
+    ]) {
+      it(`${name}: no approval, no delivery claimed, reason shown, no findings report`, async () => {
+        const md = await jobSummary(input);
+        assert.match(md, new RegExp(`Break-glass review: ${label}$`, 'm'));
+        assert.match(md, /\| Request delivered \| no /);
+        assert.match(md, /no verified approval exists/);
+        assert.match(md, /^_.+_$/m, 'the diagnostic reason is kept for refused/error');
+        assert.doesNotMatch(md, /OVERRIDDEN|APPROVED|\| yes/);
+        for (const pattern of FINDINGS_DETAIL) assert.doesNotMatch(md, pattern);
+      });
+    }
+  });
+
+  describe('the notifier role changes the job summary only', () => {
+    async function dispatchAs(summaryRole, { breakGlass, slackStatus = 200, prNumber = '7' } = {}) {
+      const appended = [];
+      const calls = [];
+      const performed = await dispatch({
+        gate: DETAILED_GATE,
+        context: { summaryRole, repository: 'o/r', prNumber, runUrl: RUN_URL },
+        mode: 'enforce',
+        breakGlass,
+        slackUrl: 'https://hooks.slack.invalid/x',
+        token: 't',
+        summaryPath: 'summary.md',
+        appendImpl: async (_path, text) => appended.push(text),
+        writeImpl: async () => {},
+        fetchImpl: async (url, init = {}) => {
+          calls.push({ url: String(url), method: init.method ?? 'GET', body: init.body ?? null });
+          if (String(url).includes('slack')) return { ok: slackStatus < 400, status: slackStatus };
+          return { ok: true, status: 200, json: async () => [] };
+        },
+        logger: { log() {}, error() {} }
+      });
+      return { performed, calls, summary: appended.join('') };
+    }
+    const undelivered = { eligible: true, enabled: true, requestPathEntered: true, requested: true, delivered: false, decision: 'request-failed' };
+    const delivered = { eligible: true, enabled: true, requestPathEntered: true, requested: true, delivered: true, decision: 'approved' };
+
+    for (const [name, breakGlass] of [['request not delivered (Slack routed)', undelivered], ['request delivered (Slack suppressed)', delivered]]) {
+      it(`${name}: Slack and PR comment identical in both roles`, async () => {
+        const source = await dispatchAs(null, { breakGlass });
+        const bg = await dispatchAs('break-glass', { breakGlass });
+        assert.deepEqual(bg.calls, source.calls, 'same remote calls, same bodies');
+        assert.equal(bg.performed.slack, source.performed.slack);
+        assert.equal(bg.performed.prComment, source.performed.prComment);
+        assert.deepEqual(bg.performed.failures, source.performed.failures);
+        assert.equal(source.performed.slack, breakGlass.delivered === false);
+        // The PR comment is the full report in both roles, never the pointer.
+        const comment = bg.calls.find((call) => call.method === 'POST' && call.url.includes('/issues/'));
+        assert.match(JSON.parse(comment.body).body, /Security gate: BLOCK[\s\S]*Blocking findings/);
+        assert.match(source.summary, /Blocking findings/);
+        assert.doesNotMatch(bg.summary, /Blocking findings|Issues \(/);
+        assert.match(bg.summary, /source-gate job summary/);
+      });
+    }
+
+    it('a Slack failure is still reported in the break-glass job summary', async () => {
+      const bg = await dispatchAs('break-glass', { breakGlass: undelivered, slackStatus: 500 });
+      assert.equal(bg.performed.slack, false);
+      assert.match(bg.performed.failures.join(), /Slack/);
+      assert.match(bg.summary, /Notification delivery incomplete:.*Slack/);
+    });
+
+    it('the notifier CLI selects the pointer only from SECURITY_SUMMARY_ROLE=break-glass', async () => {
+      await withTempDir(async (directory) => {
+        const gatePath = join(directory, 'security-gate.json');
+        await writeFile(gatePath, JSON.stringify(DETAILED_GATE));
+        const render = async (role) => {
+          const summary = join(directory, `summary-${role || 'none'}.md`);
+          const r = spawnSync(process.execPath, [join(SCRIPTS, 'notify.mjs'), '--gate', gatePath], {
+            encoding: 'utf8',
+            env: {
+              PATH: process.env.PATH,
+              GITHUB_STEP_SUMMARY: summary,
+              GATE_MODE: 'enforce',
+              GITHUB_SERVER_URL: 'https://github.com',
+              GITHUB_REPOSITORY: 'o/r',
+              GITHUB_RUN_ID: '1',
+              ...(role ? { SECURITY_SUMMARY_ROLE: role } : {})
+            }
+          });
+          assert.equal(r.status, 0, r.stderr);
+          return readFile(summary, 'utf8');
+        };
+        const expectedSource = renderMarkdown(buildReport({ gate: DETAILED_GATE, context: {} }));
+        for (const role of ['', 'BREAK-GLASS']) {
+          const md = await render(role);
+          assert.match(md, /^## ⛔ Security gate: BLOCK$/m, role);
+          assert.match(md, /Blocking findings/, role);
+          assert.ok(md.length >= expectedSource.length * 0.8, role);
+        }
+        const pointer = await render('break-glass');
+        assert.match(pointer, /source-gate job summary and this run's artifacts \(\[run\]\(https:\/\/github\.com\/o\/r\/actions\/runs\/1\)\)/);
+        for (const pattern of FINDINGS_DETAIL) assert.doesNotMatch(pointer, pattern);
+      });
+    });
+
+    it('only the Lambda break-glass notifier step sets the role', async () => {
+      const bg = await readFile('.github/workflows/_break-glass-lambda.yml', 'utf8');
+      assert.equal(bg.match(/SECURITY_SUMMARY_ROLE: break-glass/g)?.length, 1);
+      for (const path of ['.github/workflows/_source-security.yml', '.github/workflows/_source-scan.yml']) {
+        assert.doesNotMatch(await readFile(path, 'utf8'), /SECURITY_SUMMARY_ROLE/, path);
+      }
+    });
   });
 });
 

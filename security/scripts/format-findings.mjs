@@ -1863,15 +1863,7 @@ export function renderMarkdown(report, { includeMarker = false } = {}) {
   if (includeMarker) {
     head.push(PR_COMMENT_MARKER);
   }
-  // In the Lambda break-glass job the primary outcome is the break-glass review
-  // (rendered above this by break-glass-result.mjs), so the findings are a
-  // secondary section. The raw verdict is still shown verbatim, never rewritten.
-  const breakGlassJob = report.context?.summaryRole === 'break-glass';
-  head.push(
-    breakGlassJob
-      ? `### ${report.emoji} Source findings behind this review — source policy verdict: ${report.headline ?? report.verdictLabel}`
-      : `## ${report.emoji} Security gate: ${report.headline ?? report.verdictLabel}`
-  );
+  head.push(`## ${report.emoji} Security gate: ${report.headline ?? report.verdictLabel}`);
   head.push(`_${report.blurb}_`);
 
   const ctx = contextLine(report.context);
@@ -1890,11 +1882,7 @@ export function renderMarkdown(report, { includeMarker = false } = {}) {
             'log-only is a rollout mode: a future BLOCK would be reported without blocking the merge, and no Slack alert is sent.'
     );
   }
-  if (breakGlassJob) {
-    // Not the notice: the review above is derived from the job's own result
-    // record, and repeating a second derivation here could only disagree with it.
-    head.push('> The break-glass decision for these findings is in **Break-glass review** above.');
-  } else if (report.breakGlassNotice) {
+  if (report.breakGlassNotice) {
     head.push(`> ${report.breakGlassNotice}`);
   }
 
@@ -1918,6 +1906,16 @@ export function renderMarkdown(report, { includeMarker = false } = {}) {
   const details = renderDetails(report, Math.max(0, SUMMARY_LIMITS.maxCharacters - fixed - 2_000));
 
   return [...head, ...details, ...footer].filter(Boolean).join('\n\n') + '\n';
+}
+
+// The break-glass job's findings "summary": a pointer, not a second copy.
+// That job answers "was an exception granted?" (break-glass-result.mjs writes the
+// review); "what is wrong?" is the source-gate job's summary and the run's
+// artifacts. Only the job summary uses this — Slack and the PR comment keep
+// their normal renderers, so routing and content there are unchanged.
+export function renderBreakGlassFindingsPointer(report) {
+  const run = report.context?.runUrl ? ` ([run](${report.context.runUrl}))` : '';
+  return `<sub>Source security findings (source policy verdict: ${report.verdictLabel}) are in the source-gate job summary and this run's artifacts${run}.</sub>\n`;
 }
 
 // ---- full evidence document -----------------------------------------------------

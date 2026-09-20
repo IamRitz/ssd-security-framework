@@ -177,11 +177,12 @@ export function renderBreakGlassSummary(result, { verdict = null } = {}) {
     lines.push('| Route | synthetic fixture — isolated test broker |');
   }
   lines.push('');
-  if (result?.reason) lines.push(`_${cell(result.reason, 500)}_`, '');
+  // The reason is diagnostic: shown only where the table alone cannot say why.
+  if ((status === 'refused' || status === 'error') && result?.reason) lines.push(`_${cell(result.reason, 500)}_`, '');
   lines.push(
     approved
-      ? '> The source policy verdict remains **BLOCK**; this approval overrides it for this run only. The caller\'s aggregate `security-gate` check decides whether the run may continue.'
-      : '> No override is active. The caller\'s aggregate `security-gate` check decides whether the run may continue, and it stays red without a verified approval.'
+      ? '> The source policy verdict remains **BLOCK**. This approval applies only to this exact gate and run.'
+      : '> No override is active; the aggregate `security-gate` check stays red.'
   );
   return `${lines.join('\n')}\n\n`;
 }
