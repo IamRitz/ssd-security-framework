@@ -4,8 +4,13 @@
 # This is the canonical framework-gated delivery pipeline, and it exists to show
 # the trust boundaries explicitly. Each stage holds the least it can:
 #
-#   source-security     no cloud credentials (break-glass invoker only, after
-#                       eligibility is confirmed)
+#   source-security     NO cloud credentials and NO `id-token` — `_source-scan.yml`
+#                       cannot request an OIDC token at all
+#   break-glass         the ONLY job in the source path granted `id-token: write`,
+#                       and only when an eligible BLOCK was actually delegated
+#   security-gate       no cloud credentials — the AUTHORIZATION BOUNDARY. It is
+#                       what every delivery job below depends on, never the raw
+#                       source-security result
 #   container-build     no cloud credentials — untrusted build/install code runs
 #                       here, so it must never share a job with a cloud role
 #   image-security      no cloud credentials, scans a tarball, records the image
@@ -40,12 +45,24 @@ jobs:
   source-security:
     # Re-run on the delivery commit rather than trusting the PR result: what
     # merged may not be what was reviewed.
-    uses: IamRitz/ssd-security-framework/.github/workflows/_source-security.yml@v1
+    #
+    # NEVER change this to `secrets: inherit` — that would hand every repo secret
+    # to the scanning jobs.
+    #
+    # `_source-scan.yml` is OIDC-free: this job is NOT granted `id-token`. With
+    # `break_glass_transport: lambda` it performs no break-glass itself; an
+    # eligible, enforced BLOCK is DELEGATED to the `break-glass` job below
+    # (output `break_glass_delegated`), which alone holds OIDC.
+    #
+    # This job is EXPECTED to fail when the raw verdict is BLOCK. That failure is
+    # not the delivery decision: `security-gate` below is, and every delivery job
+    # depends on it rather than on this job's result.
+    uses: IamRitz/ssd-security-framework/.github/workflows/_source-scan.yml@v1
     permissions:
       contents: read
       pull-requests: write
-      id-token: write
     with:
+      # toolkit_ref MUST match the @v1 above. See docs/versioning.md.
       toolkit_ref: v1
       gate_mode: ${{ vars.GATE_MODE || 'enforce' }}
       semgrep_configs: |
@@ -55,9 +72,123 @@ jobs:
       slack_notify_url: ${{ vars.SECURITY_NOTIFY_SLACK_URL }}
       break_glass_enabled: true
       break_glass_transport: lambda
-      break_glass_lambda_role_arn: ${{ vars.BREAK_GLASS_LAMBDA_ROLE_ARN }}
-      break_glass_lambda_function: ${{ vars.BREAK_GLASS_LAMBDA_FUNCTION }}
-      break_glass_aws_region: ${{ vars.AWS_REGION }}
+
+  break-glass:
+    # THE ONLY JOB IN THIS FILE'S SOURCE PATH GRANTED `id-token: write`.
+    #
+    # It runs only when the source workflow actually delegated an eligible,
+    # trusted, enforced BLOCK — never for a PASS, a hard block, or an integrity
+    # failure. That output is only a cheap pre-filter: the called workflow
+    # re-validates this run's own gate evidence (eligibility, run binding, gate
+    # digest, synthetic route) BEFORE it assumes any AWS role, and executes no
+    # code from this repository.
+    #
+    # PRODUCTION delivery: only the production broker variables are passed. No
+    # synthetic/test broker is wired up here — a real deploy must never be able
+    # to route an approval request to a test broker.
+    needs: source-security
+    if: ${{ always() && needs.source-security.outputs.break_glass_delegated == 'true' }}
+    uses: IamRitz/ssd-security-framework/.github/workflows/_break-glass-lambda.yml@v1
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      toolkit_ref: v1
+      gate_mode: ${{ needs.source-security.outputs.gate_mode }}
+      # The SAME gate digest source-security evaluated: an approval can only ever
+      # be requested for, and bound to, that exact gate.
+      expected_gate_digest: ${{ needs.source-security.outputs.gate_digest }}
+      lambda_function: ${{ vars.BREAK_GLASS_LAMBDA_FUNCTION }}
+      lambda_role_arn: ${{ vars.BREAK_GLASS_LAMBDA_ROLE_ARN }}
+      aws_region: ${{ vars.AWS_REGION }}
+      # The source workflow always sends its own BLOCK alert; this adds one if
+      # the approval request could not be delivered.
+      slack_notify_url: ${{ vars.SECURITY_NOTIFY_SLACK_URL }}
+
+  security-gate:
+    # THE AUTHORIZATION BOUNDARY for this delivery run, and the job every
+    # delivery stage below depends on.
+    #
+    # `source-security` FAILS on a raw BLOCK verdict — that is correct, and the
+    # verdict is never rewritten. What this job decides is whether that BLOCK was
+    # overridden by a VERIFIED break-glass approval bound to the same gate digest.
+    # Depending on `needs.source-security.result` directly would either stop a
+    # legitimately approved delivery or, if loosened, let any source failure
+    # through; `continue-on-error` on source-security would do the latter
+    # silently. The decision is `final-gate.mjs`, a framework-owned and tested
+    # conjunction, not hand-written shell per repo.
+    #
+    # `always()` so it still decides when source-security failed or the
+    # break-glass job was skipped (the normal, non-delegated case).
+    name: security-gate
+    needs:
+      - source-security
+      - break-glass
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      # pass | overridden-block | block, and `approved` for a verified Lambda
+      # break-glass override. Conformance reads these; the source verdict stays BLOCK.
+      source_outcome: ${{ steps.gate.outputs.source_outcome }}
+      source_override: ${{ steps.gate.outputs.source_override }}
+    steps:
+      - name: Check out the security framework toolkit
+        # Only for security/scripts/final-gate.mjs. The consumer repository is
+        # deliberately NOT checked out: this job runs no repo code.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: IamRitz/ssd-security-framework
+          ref: v1
+          path: .ssd-toolkit
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24.21.0'
+          package-manager-cache: false
+      - name: Decide whether source security authorizes this delivery
+        id: gate
+        env:
+          SSD_TOOLKIT: ${{ github.workspace }}/.ssd-toolkit/security
+          # Every fact the source-leg decision needs. Empty = missing = BLOCK.
+          SOURCE_RESULT: ${{ needs.source-security.result }}
+          SOURCE_VERDICT: ${{ needs.source-security.outputs.verdict }}
+          SOURCE_GATE_MODE: ${{ needs.source-security.outputs.gate_mode }}
+          SOURCE_INTEGRITY_TRUSTED: ${{ needs.source-security.outputs.integrity_trusted }}
+          SOURCE_BREAK_GLASS_ELIGIBLE: ${{ needs.source-security.outputs.break_glass_eligible }}
+          SOURCE_BREAK_GLASS_DELEGATED: ${{ needs.source-security.outputs.break_glass_delegated }}
+          SOURCE_SECRET_SCAN_RESULT: ${{ needs.source-security.outputs.secret_scan_result }}
+          SOURCE_DEPENDENCY_SCAN_RESULT: ${{ needs.source-security.outputs.dependency_scan_result }}
+          SOURCE_SAST_RESULT: ${{ needs.source-security.outputs.sast_result }}
+          SOURCE_GATE_DIGEST: ${{ needs.source-security.outputs.gate_digest }}
+          BREAK_GLASS_RESULT: ${{ needs.break-glass.result }}
+          BREAK_GLASS_DECISION: ${{ needs.break-glass.outputs.decision_status }}
+          BREAK_GLASS_REQUEST_DELIVERED: ${{ needs.break-glass.outputs.request_delivered }}
+          BREAK_GLASS_GATE_DIGEST: ${{ needs.break-glass.outputs.gate_digest }}
+          MODE: ${{ needs.source-security.outputs.gate_mode }}
+        run: |
+          set -euo pipefail
+          echo "source-security: result=$SOURCE_RESULT verdict=${SOURCE_VERDICT:-unknown}"
+
+          # pass | overridden-block | block. A source FAILURE becomes an
+          # overridden BLOCK only with every fact final-gate.mjs requires
+          # (eligible trusted policy BLOCK, clean scanner results, an approved
+          # decision bound to this exact gate digest). Anything else, including a
+          # scanner crash or a hard block, stays failed — and this job failing
+          # skips every delivery stage below.
+          node "$SSD_TOOLKIT/scripts/final-gate.mjs"
+
+          if [ "$MODE" = "log-only" ]; then
+            if [ "${SOURCE_VERDICT:-}" = "BLOCK" ]; then
+              echo "::warning::GREEN BY CONFIGURATION, not by verdict — source verdict BLOCK is reported but NOT enforced because gate_mode is log-only. This delivery is proceeding on an unenforced BLOCK."
+            elif [ -n "${SOURCE_VERDICT:-}" ]; then
+              echo "::warning::source verdict ${SOURCE_VERDICT}. gate_mode is log-only; no blocking verdict exists, so nothing was suppressed. A future BLOCK would not stop delivery until the repository moves to enforce."
+            else
+              echo "::warning::source verdict is unavailable, and gate_mode is log-only so nothing is enforced. Treat it as UNKNOWN, not clean."
+            fi
+          fi
+          echo "Source security authorizes delivery."
 
   container-build:
     # ZERO cloud credentials. This is where `npm ci` / `pip install` run other
@@ -90,8 +221,9 @@ jobs:
           retention-days: 1
 
   image-security:
-    # Pre-push gate. A BLOCK_DEPLOY here fails this job, so every job below —
-    # all of which `needs` it transitively — is skipped and nothing is pushed.
+    # Pre-push gate, and an INDEPENDENT required gate: break-glass never touches
+    # image policy, so a BLOCK_DEPLOY here stays red no matter what the source
+    # gate decided. Every delivery job below requires this job's own success.
     needs: container-build
     uses: IamRitz/ssd-security-framework/.github/workflows/_image-scan-prepush.yml@v1
     permissions:
@@ -108,14 +240,18 @@ jobs:
     # Detection only, no credentials. Lets a repo adopt the source controls
     # before its AWS delivery exists: the AWS stages visibly skip instead of
     # failing confusingly.
+    #
+    # Gated on `security-gate`, NOT on the raw source-security result.
     needs:
-      - source-security
+      - security-gate
       - image-security
     if: >-
       github.ref == 'refs/heads/main' &&
-      needs.source-security.result == 'success' &&
+      needs.security-gate.result == 'success' &&
       needs.image-security.result == 'success'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       configured: ${{ steps.detect.outputs.configured }}
     steps:
@@ -146,14 +282,19 @@ jobs:
     # It asserts the loaded image is byte-identical to what Trivy scanned before
     # pushing, then records the immutable manifest digest everything downstream
     # pins to. It makes NO policy decision.
+    #
+    # Authorized by `security-gate` (the source boundary) AND by image-security
+    # (the independent image boundary). It never reads source-security directly:
+    # an eligible BLOCK with a verified approval must be able to ship, and an
+    # unapproved BLOCK — or any scanner/integrity failure — must not.
     needs:
-      - source-security
+      - security-gate
       - container-build
       - image-security
       - aws-configuration
     if: >-
       github.ref == 'refs/heads/main' &&
-      needs.source-security.result == 'success' &&
+      needs.security-gate.result == 'success' &&
       needs.image-security.result == 'success' &&
       needs.aws-configuration.outputs.configured == 'true'
     uses: IamRitz/ssd-security-framework/.github/workflows/_ecr-collect.yml@v1
@@ -261,17 +402,13 @@ jobs:
     # evidence rather than a hard-coded "pass".
     needs:
       - source-security
+      - break-glass
+      - security-gate
       - image-security
       - ecr-collect
       - artifact-gate
       - deploy
     if: ${{ always() && github.ref == 'refs/heads/main' }}
-    # TODO RELEASE BLOCKER RB-1 (docs/release-blockers.md): the "break-glass"
-    # entry below is a hard-coded pass, NOT observed evidence. This file stays on
-    # the v1 COMPATIBILITY path (no strict_break_glass_evidence, so the legacy
-    # default applies and conformance emits a deprecation warning). Migrate it to
-    # _source-scan.yml + _break-glass-lambda.yml with strict evidence before
-    # moving v1 or handing off to DevOps. Do not copy this entry.
     uses: IamRitz/ssd-security-framework/.github/workflows/_conformance.yml@v1
     with:
       toolkit_ref: v1
@@ -280,6 +417,9 @@ jobs:
       registry: ecr
       deploy_target: framework-gated
       break_glass_enabled: true
+      # Strict structured break-glass evidence: a status-only record can never
+      # pass. New callers always set this; it is unconditional in v2.
+      strict_break_glass_evidence: true
       # PER-CONTROL evidence. Never feed `needs.source-security.result` to every
       # source control: it is the AGGREGATE, so a policy BLOCK would report all
       # three scanners as failed although they ran and produced usable reports.
@@ -290,9 +430,9 @@ jobs:
         {"secret-scan":{"status":"${{ needs.source-security.outputs.secret_scan_result }}","evidence":"Secret scanning job (per-control output)"},
          "dependency-scan":{"status":"${{ needs.source-security.outputs.dependency_scan_result }}","evidence":"Dependency scanning job (per-control output)"},
          "sast":{"status":"${{ needs.source-security.outputs.sast_result }}","evidence":"SAST job (per-control output)"},
-         "source-gate":{"status":"${{ needs.source-security.outputs.source_gate_result }}","verdict":"${{ needs.source-security.outputs.verdict }}","gate_mode":"${{ needs.source-security.outputs.gate_mode }}","integrity_trusted":"${{ needs.source-security.outputs.integrity_trusted }}","evidence":"source-gate job"},
+         "source-gate":{"status":"${{ needs.source-security.outputs.source_gate_result }}","verdict":"${{ needs.source-security.outputs.verdict }}","gate_mode":"${{ needs.source-security.outputs.gate_mode }}","integrity_trusted":"${{ needs.source-security.outputs.integrity_trusted }}","break_glass_eligible":"${{ needs.source-security.outputs.break_glass_eligible }}","gate_digest":"${{ needs.source-security.outputs.gate_digest }}","override":"${{ needs.security-gate.outputs.source_override }}","evidence":"source-gate job; override claim from security-gate, verified against break-glass"},
          "image-scan-prepush":{"status":"${{ needs.image-security.result }}","verdict":"${{ needs.image-security.outputs.verdict }}","gate_mode":"${{ needs.image-security.outputs.gate_mode }}","integrity_trusted":"${{ needs.image-security.outputs.integrity_trusted }}","evidence":"pre-push Trivy gate"},
-         "break-glass":{"status":"pass","evidence":"lambda transport configured for this repo"},
+         "break-glass":{"status":"${{ needs.break-glass.result }}","decision":"${{ needs.break-glass.outputs.decision_status }}","request_delivered":"${{ needs.break-glass.outputs.request_delivered }}","gate_digest":"${{ needs.break-glass.outputs.gate_digest }}","delegated":"${{ needs.source-security.outputs.break_glass_delegated }}","evidence":"_break-glass-lambda.yml (observed decision)"},
          "registry-scan-collect":{"status":"${{ needs.ecr-collect.result }}","evidence":"ECR push + scan polled by digest"},
          "artifact-gate":{"status":"${{ needs.artifact-gate.result }}","verdict":"${{ needs.artifact-gate.outputs.verdict }}","evidence":"normalized report gated at the pushed digest"},
          "gated-deploy":{"status":"${{ needs.deploy.result }}","evidence":"SSM deploy pinned to the gated digest"}}

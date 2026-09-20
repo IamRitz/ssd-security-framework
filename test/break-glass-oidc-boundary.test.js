@@ -23,7 +23,7 @@ import {
   revalidateGateForBreakGlass
 } from '../security/scripts/break-glass-evidence.mjs';
 import { deriveBreakGlassResult } from '../security/scripts/break-glass-result.mjs';
-import { decideSourceGate } from '../security/scripts/final-gate.mjs';
+import { decideSourceGate, factsFromEnv } from '../security/scripts/final-gate.mjs';
 import { CONTROLS, buildConformance, explainObserved, resolveCapabilities } from '../security/scripts/conformance.mjs';
 import { deriveBreakGlassState, route } from '../security/scripts/format-findings.mjs';
 import { breakGlassStateFromEnv, dispatch } from '../security/scripts/notify.mjs';
@@ -1116,7 +1116,7 @@ describe('conformance: break-glass is observed, and an override must be proven',
   });
 
   describe('every new caller selects strict mode explicitly', () => {
-    for (const path of ['examples/source-only/security.yml', 'examples/python-self-managed/security.yml', 'examples/container-ecr/security.yml']) {
+    for (const path of ['examples/source-only/security.yml', 'examples/python-self-managed/security.yml', 'examples/container-ecr/security.yml', 'examples/container-ecr/deploy.yml']) {
       it(`${path}`, () => {
         const job = jobBlock(read(path), 'conformance');
         assert.match(job, /_conformance\.yml@/);
@@ -1129,10 +1129,12 @@ describe('conformance: break-glass is observed, and an override must be proven',
         if (/_source-scan\.yml@/.test(text)) assert.match(text, /strict_break_glass_evidence: true/, path);
       }
     });
-    it('deploy.yml is explicitly left on the v1 compatibility path (RB-1), not silently strict or silently correct', () => {
-      const text = read('examples/container-ecr/deploy.yml');
-      assert.ok(!/^\s*strict_break_glass_evidence:/m.test(text));
-      assert.match(text, /v1 COMPATIBILITY path/);
+    it('no example is left on the deprecated legacy break-glass evidence path', () => {
+      for (const path of ['examples/source-only/security.yml', 'examples/python-self-managed/security.yml', 'examples/container-ecr/security.yml', 'examples/container-ecr/deploy.yml']) {
+        const text = read(path);
+        assert.ok(!/COMPATIBILITY path/.test(text), `${path} must not advertise the legacy path`);
+        assert.match(text, /\n {6}strict_break_glass_evidence: true\n/, path);
+      }
     });
   });
 
@@ -1244,32 +1246,189 @@ describe('conformance: break-glass is observed, and an override must be proven',
   });
 
   it('the example callers never hard-code the break-glass control as pass', () => {
-    for (const path of ['examples/container-ecr/security.yml']) {
+    for (const path of ['examples/container-ecr/security.yml', 'examples/container-ecr/deploy.yml']) {
       assert.ok(!/"break-glass":\{"status":"pass"/.test(read(path)), path);
     }
   });
 
-  // RELEASE BLOCKER (docs/release-blockers.md RB-1). Runs and FAILS as a TODO
-  // until the delivery example is migrated; it must not be treated as correct.
-  // When it passes, remove `todo` so it guards the fix.
-  it(
-    'RELEASE BLOCKER RB-1: examples/container-ecr/deploy.yml feeds structured break-glass evidence',
-    { todo: 'RB-1: fix before moving v1 / DevOps handoff — see docs/release-blockers.md' },
-    () => {
-      const source = read('examples/container-ecr/deploy.yml');
-      assert.ok(!/"break-glass":\{"status":"pass"/.test(source), 'deploy.yml hard-codes break-glass as passed');
-      const entry = /"break-glass":(\{[^}]*\})/.exec(source);
-      assert.ok(entry, 'deploy.yml must observe the break-glass control');
-      for (const field of ['status', 'decision', 'request_delivered', 'gate_digest', 'delegated']) {
-        assert.match(entry[1], new RegExp(`"${field}":`), `missing ${field}`);
-      }
-    }
-  );
+  // RELEASE BLOCKER RB-1 (docs/release-blockers.md), now RESOLVED: this guards
+  // the fix. The delivery example must stay on the split architecture —
+  // _source-scan.yml + _break-glass-lambda.yml + final-gate.mjs — with the
+  // aggregate `security-gate` job as the authorization boundary.
+  describe('RB-1: the delivery example is on the split break-glass architecture', () => {
+    const raw = read('examples/container-ecr/deploy.yml');
+    // Assertions are made against the EXECUTABLE file: a comment that merely
+    // mentions `id-token`, `synthetic` or `AWS` must not satisfy — or defeat —
+    // a boundary check.
+    const source = executable(raw);
+    const job = (id) => {
+      const block = jobBlock(source, id);
+      assert.ok(block, `examples/container-ecr/deploy.yml must define a '${id}' job`);
+      return block;
+    };
+    // An observed-evidence entry, whose values contain `${{ ... }}` and so
+    // cannot be matched with a naive [^}]* run.
+    const entryOf = (text, control) =>
+      new RegExp(`"${control}":(\\{(?:[^{}]|\\$\\{\\{[^}]*\\}\\})*\\})`).exec(text);
 
-  it('RB-1 is tracked as a release blocker, not silently accepted', () => {
-    assert.match(read('docs/release-blockers.md'), /## RB-1 — `examples\/container-ecr\/deploy\.yml` hard-codes break-glass as passed\n\n\*\*Status:\*\* open/);
-    assert.match(read('examples/container-ecr/deploy.yml'), /RELEASE BLOCKER RB-1/);
+    it('source security is the OIDC-free _source-scan.yml, and holds no id-token', () => {
+      const sourceJob = job('source-security');
+      assert.match(sourceJob, /uses: IamRitz\/ssd-security-framework\/\.github\/workflows\/_source-scan\.yml@v1/);
+      assert.ok(!/_source-security\.yml/.test(raw), 'the delivery example must not call the in-job OIDC path');
+      assert.ok(!/id-token/.test(sourceJob), 'source-security must not be granted id-token');
+      assert.match(sourceJob, /\n {6}break_glass_transport: lambda\n/);
+      // Lambda configuration belongs to the break-glass job, never to the
+      // credential-free scan workflow.
+      assert.ok(!/break_glass_lambda_/.test(sourceJob), 'Lambda inputs must not be passed to _source-scan.yml');
+    });
+
+    it('a dedicated break-glass job exists, and it alone holds id-token in the source path', () => {
+      const bg = job('break-glass');
+      assert.match(bg, /uses: IamRitz\/ssd-security-framework\/\.github\/workflows\/_break-glass-lambda\.yml@v1/);
+      assert.match(bg, /\n {6}id-token: write\n/);
+      assert.match(bg, /if: \$\{\{ always\(\) && needs\.source-security\.outputs\.break_glass_delegated == 'true' \}\}/);
+      // Same gate digest as the source gate that was evaluated.
+      assert.match(bg, /expected_gate_digest: \$\{\{ needs\.source-security\.outputs\.gate_digest \}\}/);
+      assert.match(bg, /gate_mode: \$\{\{ needs\.source-security\.outputs\.gate_mode \}\}/);
+      // Production brokers only: a real deploy must never be routable to a test
+      // broker.
+      assert.match(bg, /lambda_function: \$\{\{ vars\.BREAK_GLASS_LAMBDA_FUNCTION \}\}/);
+      assert.match(bg, /lambda_role_arn: \$\{\{ vars\.BREAK_GLASS_LAMBDA_ROLE_ARN \}\}/);
+      assert.ok(!/synthetic/i.test(source), 'no synthetic broker may be wired into the production delivery example');
+    });
+
+    it('only break-glass, ecr-collect and deploy hold id-token at all', () => {
+      const allowed = new Set(['break-glass', 'ecr-collect', 'deploy']);
+      for (const id of jobIds(source)) {
+        const holds = /\n {6}id-token: write\n/.test(job(id));
+        assert.equal(holds, allowed.has(id), `${id} id-token: write should be ${allowed.has(id)}`);
+      }
+    });
+
+    it('an aggregate security-gate job runs final-gate.mjs with every required fact', () => {
+      const gate = job('security-gate');
+      assert.match(gate, /\n {4}needs:\n {6}- source-security\n {6}- break-glass\n/);
+      assert.match(gate, /if: \$\{\{ always\(\) \}\}/);
+      assert.match(gate, /final-gate\.mjs/);
+      assert.ok(!/id-token/.test(gate), 'the authorization boundary holds no cloud credential');
+      assert.ok(!/aws-actions\/configure-aws-credentials/.test(gate));
+      for (const [env, expression] of [
+        ['SOURCE_RESULT', 'needs.source-security.result'],
+        ['SOURCE_VERDICT', 'needs.source-security.outputs.verdict'],
+        ['SOURCE_GATE_MODE', 'needs.source-security.outputs.gate_mode'],
+        ['SOURCE_INTEGRITY_TRUSTED', 'needs.source-security.outputs.integrity_trusted'],
+        ['SOURCE_BREAK_GLASS_ELIGIBLE', 'needs.source-security.outputs.break_glass_eligible'],
+        ['SOURCE_BREAK_GLASS_DELEGATED', 'needs.source-security.outputs.break_glass_delegated'],
+        ['SOURCE_SECRET_SCAN_RESULT', 'needs.source-security.outputs.secret_scan_result'],
+        ['SOURCE_DEPENDENCY_SCAN_RESULT', 'needs.source-security.outputs.dependency_scan_result'],
+        ['SOURCE_SAST_RESULT', 'needs.source-security.outputs.sast_result'],
+        ['SOURCE_GATE_DIGEST', 'needs.source-security.outputs.gate_digest'],
+        ['BREAK_GLASS_RESULT', 'needs.break-glass.result'],
+        ['BREAK_GLASS_DECISION', 'needs.break-glass.outputs.decision_status'],
+        ['BREAK_GLASS_REQUEST_DELIVERED', 'needs.break-glass.outputs.request_delivered'],
+        ['BREAK_GLASS_GATE_DIGEST', 'needs.break-glass.outputs.gate_digest']
+      ]) {
+        assert.match(
+          gate,
+          new RegExp(`\\n {10}${env}: \\$\\{\\{ ${expression.replace(/[.]/g, '\\.')} \\}\\}\\n`),
+          `security-gate must feed ${env} from ${expression}`
+        );
+      }
+      // Every env name final-gate.mjs reads is actually supplied.
+      for (const key of Object.keys(factsFromEnv({}))) void key;
+      const supplied = Object.fromEntries([...gate.matchAll(/\n {10}([A-Z_]+): /g)].map((m) => [m[1], 'x']));
+      for (const [fact, value] of Object.entries(factsFromEnv(supplied))) {
+        assert.equal(value, 'x', `final-gate.mjs reads a fact ('${fact}') the security-gate job does not supply`);
+      }
+      // The outcome is exported for conformance.
+      assert.match(gate, /source_outcome: \$\{\{ steps\.gate\.outputs\.source_outcome \}\}/);
+      assert.match(gate, /source_override: \$\{\{ steps\.gate\.outputs\.source_override \}\}/);
+    });
+
+    it('the source gate is never bypassed with continue-on-error', () => {
+      assert.ok(!/continue-on-error/.test(source));
+    });
+
+    it('every delivery job is authorized by security-gate, not by the raw source result', () => {
+      for (const id of ['aws-configuration', 'ecr-collect']) {
+        const block = job(id);
+        assert.match(block, /needs\.security-gate\.result == 'success'/, `${id} must depend on the aggregate gate`);
+        assert.match(block, /needs\.image-security\.result == 'success'/, `${id} must keep the independent image gate`);
+        assert.ok(
+          !/needs\.source-security\.result/.test(block),
+          `${id} must not consume the raw source-security result: an approved eligible BLOCK is a failure there`
+        );
+        assert.ok(!/\n {6}- source-security\n/.test(block), `${id} must not need source-security directly`);
+      }
+      // ...and the rest of the chain hangs off those, unchanged.
+      assert.match(job('artifact-gate'), /\n {4}needs: ecr-collect\n/);
+      assert.match(job('deploy'), /\n {4}needs:\n {6}- artifact-gate\n {6}- ecr-collect\n/);
+    });
+
+    it('the delivery security chain is not weakened', () => {
+      assert.match(job('container-build'), /no-cache: true/);
+      assert.ok(!/aws|AWS/.test(job('container-build')), 'the build job stays credential-free');
+      assert.match(job('ecr-collect'), /expected_image_id: \$\{\{ needs\.image-security\.outputs\.image_id \}\}/);
+      assert.match(job('artifact-gate'), /expected_digest: \$\{\{ needs\.ecr-collect\.outputs\.image_digest \}\}/);
+      assert.ok(!/id-token/.test(job('artifact-gate')));
+      const deploy = job('deploy');
+      assert.match(deploy, /role-to-assume: \$\{\{ vars\.AWS_DEPLOY_ROLE_ARN \}\}/);
+      assert.match(deploy, /IMAGE_DIGEST: \$\{\{ needs\.ecr-collect\.outputs\.image_digest \}\}/);
+      assert.ok(!/AWS_PUSH_SCAN_ROLE_ARN/.test(deploy), 'the deploy job must hold no registry credential');
+    });
+
+    it('conformance is strict and fed structured, observed break-glass evidence', () => {
+      const conformance = job('conformance');
+      assert.match(conformance, /\n {6}strict_break_glass_evidence: true\n/);
+      assert.ok(!/"break-glass":\{"status":"pass"/.test(raw), 'deploy.yml hard-codes break-glass as passed');
+      assert.ok(!/lambda transport configured for this repo/.test(raw), 'the fabricated break-glass evidence string must be gone');
+
+      const entry = entryOf(conformance, 'break-glass');
+      assert.ok(entry, 'deploy.yml must observe the break-glass control');
+      for (const [field, expression] of [
+        ['status', 'needs.break-glass.result'],
+        ['decision', 'needs.break-glass.outputs.decision_status'],
+        ['request_delivered', 'needs.break-glass.outputs.request_delivered'],
+        ['gate_digest', 'needs.break-glass.outputs.gate_digest'],
+        ['delegated', 'needs.source-security.outputs.break_glass_delegated']
+      ]) {
+        assert.match(
+          entry[1],
+          new RegExp(`"${field}":"\\$\\{\\{ ${expression.replace(/[.]/g, '\\.')} \\}\\}"`),
+          `break-glass.${field} must be observed from ${expression}`
+        );
+      }
+
+      const sg = entryOf(conformance, 'source-gate');
+      assert.ok(sg, 'deploy.yml must observe the source-gate control');
+      for (const field of ['status', 'verdict', 'gate_mode', 'integrity_trusted', 'break_glass_eligible', 'gate_digest', 'override']) {
+        assert.match(sg[1], new RegExp(`"${field}":`), `source-gate is missing ${field}`);
+      }
+      // The override CLAIM comes from the aggregate gate's decision, never from
+      // the source workflow and never inferred.
+      assert.match(sg[1], /"override":"\$\{\{ needs\.security-gate\.outputs\.source_override \}\}"/);
+      assert.match(conformance, /\n {6}- break-glass\n/);
+      assert.match(conformance, /\n {6}- security-gate\n/);
+      assert.match(conformance, /if: \$\{\{ always\(\) && github\.ref == 'refs\/heads\/main' \}\}/);
+    });
+
+    it('the observed JSON still parses once the expressions are substituted', () => {
+      const observed = job('conformance').match(/observed: >-\n([\s\S]*?)\n(?:\S|$)/)[1];
+      const report = JSON.parse(observed.replace(/\$\{\{[^}]+\}\}/g, 'success').replace(/\n\s*/g, ''));
+      assert.deepEqual(Object.keys(report).sort(), [
+        'artifact-gate', 'break-glass', 'dependency-scan', 'gated-deploy', 'image-scan-prepush',
+        'registry-scan-collect', 'sast', 'secret-scan', 'source-gate'
+      ]);
+    });
   });
+
+  it('RB-1 is recorded as resolved, not silently dropped', () => {
+    assert.match(
+      read('docs/release-blockers.md'),
+      /## RB-1 — `examples\/container-ecr\/deploy\.yml` hard-codes break-glass as passed\n\n\*\*Status:\*\* resolved/
+    );
+  });
+
 });
 
 // =================================================================================
