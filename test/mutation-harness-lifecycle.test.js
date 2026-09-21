@@ -18,7 +18,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, describe, it } from 'node:test';
 
-import { TEMP_PREFIX, copyRepo, runMutationCheck } from '../tools/mutation-check-onboarding.mjs';
+import { TEMP_PREFIX, copyRepo, killSummary, runMutationCheck } from '../tools/mutation-check-onboarding.mjs';
 
 const SANDBOX = mkdtempSync(join(tmpdir(), 'ssd-mutant-lifecycle-'));
 after(() => rmSync(SANDBOX, { recursive: true, force: true }));
@@ -147,5 +147,60 @@ describe('the mutation harness owns every temp root it creates', () => {
       rmSync(root, { recursive: true, force: true });
     }
     assert.deepEqual(leaked(), []);
+  });
+});
+
+// A kill is proved by the child's non-zero exit status; the failure count is
+// only how that kill is PRINTED. GitHub's runner printed `undefined test(s)
+// failed` because the count was read from stdout alone, in the one shape the
+// TAP reporter uses.
+describe('a killed mutation is reported without inventing anything', () => {
+  it('reads `# fail N` from the TAP reporter', () => {
+    assert.equal(killSummary({ status: 1, stdout: '# tests 12\n# pass 9\n# fail 3\n', stderr: '' }), '3 test(s) failed');
+  });
+
+  it('reads the spec reporter\'s `fail N`, and reads stderr as well as stdout', () => {
+    assert.equal(killSummary({ status: 1, stdout: '', stderr: 'ℹ tests 12\nℹ pass 9\nℹ fail 3\n' }), '3 test(s) failed');
+    assert.equal(killSummary({ status: 1, stdout: 'ℹ fail 2\n', stderr: '' }), '2 test(s) failed');
+  });
+
+  it('falls back to the exit status when no count can be parsed — never `undefined`', () => {
+    for (const result of [
+      { status: 1, stdout: 'something else entirely\n', stderr: '' },
+      { status: 7, stdout: '', stderr: '' },
+      { status: 1 },
+      {}
+    ]) {
+      const summary = killSummary(result);
+      assert.doesNotMatch(summary, /undefined/, JSON.stringify(result));
+      assert.match(summary, /^(\d+ test\(s\) failed|test suite exited .+)$/);
+    }
+    assert.equal(killSummary({ status: 1, stdout: 'no counts here\n', stderr: '' }), 'test suite exited 1');
+    assert.equal(killSummary({ status: null, signal: 'SIGKILL' }), 'test suite exited SIGKILL');
+    assert.equal(killSummary({ status: null }), 'test suite exited non-zero');
+  });
+
+  it('a real killed mutation prints a count and never the string `undefined`', () => {
+    const source = fixtureRepo();
+    const { code, output } = run({
+      source,
+      tests: ['check.test.js'],
+      mutations: [['the invariant is enforced', 'lib/invariant.mjs', 'ENFORCED = true', 'ENFORCED = false']]
+    });
+    assert.equal(code, 0);
+    assert.match(output, /^killed   the invariant is enforced — 1 test\(s\) failed$/m);
+    assert.doesNotMatch(output, /undefined/);
+  });
+
+  // The reporting change must not touch the judgement: non-zero is a kill,
+  // zero is a survivor, and a stale target is still a survivor.
+  it('kill / survive / stale semantics are unchanged', () => {
+    const source = fixtureRepo();
+    const killed = run({ source, tests: ['check.test.js'], mutations: [['killed', 'lib/invariant.mjs', 'ENFORCED = true', 'ENFORCED = false']] });
+    assert.deepEqual([killed.code, /1\/1 mutations killed/.test(killed.output)], [0, true]);
+    const survived = run({ source, tests: ['check.test.js'], mutations: [['survivor', 'lib/invariant.mjs', '// a comment', '// other']] });
+    assert.deepEqual([survived.code, /SURVIVED/.test(survived.output), /0\/1 mutations killed/.test(survived.output)], [1, true, true]);
+    const stale = run({ source, tests: ['check.test.js'], mutations: [['stale', 'lib/invariant.mjs', 'NOT PRESENT', 'x']] });
+    assert.deepEqual([stale.code, /STALE/.test(stale.output), /0\/1 mutations killed/.test(stale.output)], [1, true, true]);
   });
 });

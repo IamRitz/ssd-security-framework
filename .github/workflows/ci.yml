@@ -75,9 +75,31 @@ jobs:
         # be dropped into any consumer's runner with nothing installed, and it is
         # why there is no lockfile here for a consumer's OSV scan to trip over.
         # The onboarding CLI follows the same rule.
+        #
+        # The pattern uses a negative lookahead, so it is PCRE (-P) ONLY: passing
+        # -E as well makes GNU grep exit 2 with "conflicting matchers specified",
+        # and an `if grep ...` around that reads the error as "no match" and
+        # PASSES. This is a security control, so the three grep outcomes are kept
+        # apart and anything that is not a clean "no match" fails closed.
         run: |
-          if grep -rnE "^import .* from '(?!node:)[^.]" security/scripts onboarding --include='*.mjs' -P; then
-            echo "A toolkit or onboarding script imports a third-party module; they must use Node builtins only." >&2
-            exit 1
-          fi
-          echo "Toolkit and onboarding imports are Node builtins and relative paths only."
+          set +e
+          grep -rnP \
+            --include='*.mjs' \
+            "^import .* from '(?!node:)[^.]" \
+            security/scripts onboarding
+          rc=$?
+          set -e
+
+          case "$rc" in
+            0)
+              echo "A toolkit or onboarding script imports a third-party module; they must use Node builtins only." >&2
+              exit 1
+              ;;
+            1)
+              echo "Toolkit and onboarding imports are Node builtins and relative paths only."
+              ;;
+            *)
+              echo "Dependency-free import check itself failed (grep exit $rc)." >&2
+              exit "$rc"
+              ;;
+          esac

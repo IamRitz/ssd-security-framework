@@ -106,6 +106,22 @@ export function copyRepo(source = ROOT, parent = tmpdir()) {
   }
 }
 
+// How a killed mutation is REPORTED — never how it is judged. A non-zero child
+// status is the kill; this only turns the child's output into a human-readable
+// count. `node --test` prints `# fail N` under the TAP reporter and `ℹ fail N`
+// under the spec reporter, and which one a runtime picks is not this script's
+// business, so both are read (from stdout AND stderr) and anything unparseable
+// falls back to the exit status rather than inventing a number — or printing
+// `undefined`, as it did on GitHub's runner.
+export function killSummary(result) {
+  const output = `${result?.stdout ?? ''}\n${result?.stderr ?? ''}`;
+  const failed = /# fail (\d+)/.exec(output)?.[1] ?? /^[^\S\n]*(?:ℹ[^\S\n]*)?fail (\d+)[^\S\n]*$/m.exec(output)?.[1];
+  if (failed !== undefined) {
+    return `${failed} test(s) failed`;
+  }
+  return `test suite exited ${result?.status ?? result?.signal ?? 'non-zero'}`;
+}
+
 // Returns an exit code rather than calling process.exit, so that every failure
 // path — a failing pristine suite included — unwinds through the `finally` that
 // owns the pristine copy. A process.exit here would skip it, which is exactly
@@ -144,8 +160,7 @@ export function runMutationCheck({
           log(`SURVIVED ${invariant} (${file})`);
           survivors += 1;
         } else {
-          const failed = (/# fail (\d+)/.exec(result.stdout ?? '') ?? [])[1];
-          log(`killed   ${invariant} — ${failed} test(s) failed`);
+          log(`killed   ${invariant} — ${killSummary(result)}`);
         }
       } finally {
         rmSync(dir, { recursive: true, force: true });
