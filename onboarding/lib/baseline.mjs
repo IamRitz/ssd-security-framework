@@ -12,11 +12,12 @@
 // Only Semgrep findings can ever be baselined: the framework's baseline format
 // has no place for secret, dependency or image findings.
 import { createHash } from 'node:crypto';
-import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { readFile, stat } from 'node:fs/promises';
+import { join } from 'node:path';
 
 import { PROVENANCE_KIND, PROVENANCE_SCHEMA_VERSION, provenanceDigest } from '../../security/scripts/baseline-provenance.mjs';
 import { semgrepScopeDigest } from './coverage.mjs';
+import { assertSafeRepoPath, safeRemove, safeWriteFile } from './safe-path.mjs';
 
 export const CANDIDATE_DIR = '.ssd/candidates';
 export const CANDIDATE_FILE = `${CANDIDATE_DIR}/semgrep-baseline.candidate.json`;
@@ -399,11 +400,13 @@ export async function installCandidate({ root, config, artifactDir, run }) {
   if (problems.length > 0) {
     throw new Error(`refusing the candidate:\n${[...new Set(problems)].map((p) => `  - ${p}`).join('\n')}`);
   }
-  await mkdir(join(root, CANDIDATE_DIR), { recursive: true });
+  // Every candidate write is confined to the consumer repository (see
+  // safe-path.mjs): .ssd/candidates may itself be a symbolic link in an
+  // untrusted checkout.
   // A self-ignoring directory: a candidate is never meant to be committed.
-  await writeFile(join(root, CANDIDATE_DIR, '.gitignore'), '*\n');
-  await writeFile(join(root, CANDIDATE_FILE), candidateText);
-  await writeFile(join(root, CANDIDATE_PROVENANCE), provenanceText);
+  await safeWriteFile(root, `${CANDIDATE_DIR}/.gitignore`, '*\n');
+  await safeWriteFile(root, CANDIDATE_FILE, candidateText);
+  await safeWriteFile(root, CANDIDATE_PROVENANCE, provenanceText);
   return { candidate, provenance, run };
 }
 
@@ -457,13 +460,15 @@ export async function loadCandidateForAcceptance({ root, config, consumer }) {
 // Writes the baseline (exact candidate bytes) and returns the updated config.
 // The caller has already obtained explicit confirmation.
 export async function installBaseline({ root, config, text, semgrepignoreText }) {
-  const target = join(root, config.semgrep.baseline.path);
+  // The baseline path comes from the config and its ancestors come from the
+  // checkout: both are untrusted, so confinement is proven BEFORE the
+  // already-exists check, and again by the write itself (see safe-path.mjs).
+  const target = await assertSafeRepoPath(root, config.semgrep.baseline.path);
   if (await exists(target)) {
     throw new Error(`${config.semgrep.baseline.path} appeared while accepting; refusing to overwrite it`);
   }
-  await mkdir(dirname(target), { recursive: true });
-  await writeFile(target, text, { flag: 'wx' });
-  await rm(join(root, CANDIDATE_DIR), { recursive: true, force: true });
+  await safeWriteFile(root, config.semgrep.baseline.path, text, { flag: 'wx' });
+  await safeRemove(root, CANDIDATE_DIR, { recursive: true, force: true });
   return {
     ...config,
     semgrep: {
