@@ -19,6 +19,7 @@ const TESTS = [
   'test/onboarding-coverage.test.js',
   'test/onboarding-render.test.js',
   'test/onboarding-cli.test.js',
+  'test/onboarding-path-confinement.test.js',
   'test/baseline-provenance.test.js',
   'test/framework-contracts.test.js'
 ];
@@ -69,6 +70,9 @@ const MUTATIONS = [
   ['caller permissions equal the callee requirement', 'onboarding/lib/contract.mjs', '          if (want !== have) {', '          if (false) {'],
   ['break-glass stays unsupported', 'onboarding/lib/config.mjs', "  if (breakGlass.mode !== 'disabled') {", '  if (false) {'],
   ['an unreadable contract is an error', 'onboarding/lib/analyze.mjs', "      errors.push({ area: 'framework', message: `${file} could not be read", "      warnings.push({ area: 'framework', message: `${file} could not be read"],
+  ['consumer writes never traverse a symbolic link', 'onboarding/lib/safe-path.mjs', '    if (info.isSymbolicLink()) {', '    if (false) {'],
+  ['a repository-relative path cannot escape with ..', 'onboarding/lib/safe-path.mjs', "  if (parts.includes('..')) {", '  if (false) {'],
+  ['an absolute path is not a repository-relative path', 'onboarding/lib/safe-path.mjs', "  if (isAbsolute(relativePath) || /^[a-zA-Z]:/.test(relativePath) || relativePath.startsWith('\\\\')) {", '  if (false) {'],
   ['the gh wrapper is read-only', 'onboarding/cli.mjs', 'if (!isGetApi && !isDownload) {', 'if (false) {'],
   ['non-interactive accept needs the exact count', 'onboarding/cli.mjs', "if (options['expect-findings'] === undefined || Number(options['expect-findings']) !== count) {", 'if (false) {'],
   ['promotion has no yes-default', 'onboarding/cli.mjs', "question: 'Write these changes?', default: false", "question: 'Write these changes?', default: true"],

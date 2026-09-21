@@ -6,7 +6,7 @@
 // are `git` (read-only) and, for `baseline prepare --run`, `gh api` (GET) and
 // `gh run download` — enforced by the allowlist in ghReadOnly().
 import { execFile } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -28,6 +28,7 @@ import { CONFIG_PATH, loadConfig, serializeConfig, validateConfig } from './lib/
 import { contractProblems } from './lib/contract.mjs';
 import { applyWrites, planWrites, removeFile } from './lib/files.mjs';
 import { detectFramework } from './lib/framework.mjs';
+import { safeWriteFile } from './lib/safe-path.mjs';
 import { buildConfig, interview } from './lib/init.mjs';
 import { semgrepScope } from './lib/coverage.mjs';
 import { consumerGitState, inspectRepository } from './lib/inspect.mjs';
@@ -102,8 +103,8 @@ async function loadAnalysis(root, io, { adopt = [], force = [] } = {}) {
 }
 
 async function writeConfig(root, config) {
-  await mkdir(join(root, '.ssd'), { recursive: true });
-  await writeFile(join(root, CONFIG_PATH), serializeConfig(config));
+  // Confined to the consumer repository; .ssd/ is created by safeWriteFile.
+  await safeWriteFile(root, CONFIG_PATH, serializeConfig(config));
 }
 
 async function readPartial(path) {
