@@ -37,14 +37,19 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
+    # The webhook URL is a credential: pass it as a declared SECRET (never a
+    # repository variable, never `secrets: inherit`). Only the notifier step reads it.
+    secrets:
+      slack_notify_webhook: ${{ secrets.SECURITY_NOTIFY_SLACK_URL }}
     with:
       toolkit_ref: v1
       gate_mode: ${{ vars.GATE_MODE || 'enforce' }}
       semgrep_configs: |
         p/owasp-top-ten
         p/python
-      semgrep_paths: src
-      slack_notify_url: ${{ vars.SECURITY_NOTIFY_SLACK_URL }}
+      # `.` = the whole repository. Narrowing puts everything else OUTSIDE SAST, and
+      # without a .semgrepignore Semgrep silently skips tests/, build/, vendor/ … too.
+      semgrep_paths: .
 
   container-build:
     name: Container build
@@ -103,7 +108,7 @@ jobs:
           IMAGE_RESULT: ${{ needs.image-security.result }}
           SOURCE_VERDICT: ${{ needs.source-security.outputs.verdict }}
           IMAGE_VERDICT: ${{ needs.image-security.outputs.verdict }}
-          MODE: ${{ needs.source-security.outputs.gate_mode }}
+          SOURCE_MODE: ${{ needs.source-security.outputs.gate_mode }}
           IMAGE_MODE: ${{ needs.image-security.outputs.gate_mode }}
         run: |
           set -euo pipefail
@@ -144,7 +149,7 @@ jobs:
               echo "::warning::$control verdict is unavailable, and gate_mode is log-only so nothing is enforced. Treat it as UNKNOWN, not clean."
             fi
           }
-          report_log_only "source" "$MODE" "$SOURCE_VERDICT" BLOCK
+          report_log_only "source" "$SOURCE_MODE" "$SOURCE_VERDICT" BLOCK
           if [ "$IMAGE_RESULT" != "skipped" ]; then
             report_log_only "image" "$IMAGE_MODE" "$IMAGE_VERDICT" BLOCK_DEPLOY
           fi

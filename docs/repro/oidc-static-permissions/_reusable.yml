@@ -1,0 +1,25 @@
+name: reusable (repro)
+on:
+  workflow_call:
+    inputs:
+      enabled:
+        type: boolean
+        default: false
+permissions:
+  contents: read
+jobs:
+  always:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - run: echo "runs with no OIDC permission"
+  needs-oidc:
+    # Never runs in this repro, yet its permission is validated when the run starts.
+    if: ${{ inputs.enabled }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - run: echo "would request an OIDC token"

@@ -21,6 +21,15 @@ on:
       - main
   schedule:
     - cron: '0 6 * * 1'
+  # ONE-TIME onboarding: dispatch with the box ticked to produce the first
+  # baseline. A dispatched run scans the FULL tree; a pull_request scan is
+  # diff-aware and the framework refuses to bootstrap from it.
+  workflow_dispatch:
+    inputs:
+      bootstrap_baseline:
+        description: ONE-TIME onboarding - full Semgrep scan against an empty accepted set, uploading a candidate baseline.
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -34,20 +43,25 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
+    # The webhook URL is a credential: pass it as a declared SECRET (never a
+    # repository variable, never `secrets: inherit`). Only the notifier step reads it.
+    secrets:
+      slack_notify_webhook: ${{ secrets.SECURITY_NOTIFY_SLACK_URL }}
     with:
       toolkit_ref: v1
       # START HERE on a new repo. Move to `enforce` only after you have generated
       # and committed a Semgrep baseline — see docs/onboarding.md § rollout.
       gate_mode: ${{ vars.GATE_MODE || 'log-only' }}
-      # ONE-TIME: set this repository variable to `true` for a single run to
-      # produce the first baseline, then unset it. It refuses to run unless
-      # gate_mode is log-only, and refuses outright if a baseline already exists.
-      bootstrap_baseline: ${{ vars.BOOTSTRAP_BASELINE == 'true' }}
+      # ONE-TIME: true only on a dispatched run with the box ticked. It refuses to
+      # run unless gate_mode is log-only, and refuses outright if a baseline
+      # already exists. Remove the dispatch input once the baseline is committed.
+      bootstrap_baseline: ${{ github.event_name == 'workflow_dispatch' && inputs.bootstrap_baseline == true }}
       semgrep_configs: |
         p/owasp-top-ten
         p/javascript
-      semgrep_paths: src
-      slack_notify_url: ${{ vars.SECURITY_NOTIFY_SLACK_URL }}
+      # `.` = the whole repository. Narrowing puts everything else OUTSIDE SAST, and
+      # without a .semgrepignore Semgrep silently skips tests/, build/, vendor/ … too.
+      semgrep_paths: .
 
   security-gate:
     # THE stable required check for branch protection.

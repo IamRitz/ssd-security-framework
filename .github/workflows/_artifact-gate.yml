@@ -8,7 +8,8 @@ name: Artifact gate (reusable)
 # `severityCounts`) that a collector workflow produces. Swapping registries
 # changes the collector only.
 #
-# CREDENTIAL BOUNDARY: assumes NO cloud role, accepts NO secrets.
+# CREDENTIAL BOUNDARY: assumes NO cloud role. The only secret it accepts is the
+# optional Slack webhook, read by the notifier step alone.
 # Callers must never use `secrets: inherit`.
 #
 # Fail-closed: a missing, empty, or malformed report makes image-gate.mjs exit
@@ -58,9 +59,17 @@ on:
         type: string
         default: ''
       slack_notify_url:
-        description: Slack incoming-webhook URL for BLOCK_DEPLOY alerts. Empty disables Slack.
+        description: 'DEPRECATED — use the slack_notify_webhook secret. A webhook URL is a credential; an input is printed unmasked in run logs. Slack incoming-webhook URL for BLOCK_DEPLOY alerts. Empty disables Slack.'
         type: string
         default: ''
+    secrets:
+      slack_notify_webhook:
+        description: >-
+          Slack incoming-webhook URL for BLOCK_DEPLOY alerts, passed as a SECRET: the URL is itself a
+          credential (anyone holding it can post to the channel). It reaches the notifier step
+          ONLY. Takes precedence over the deprecated `slack_notify_url` input, whose value is
+          printed unmasked in run logs.
+        required: false
     outputs:
       verdict:
         description: DEPLOY | DEPLOY-WITH-EXCEPTIONS | BLOCK_DEPLOY
@@ -182,6 +191,13 @@ jobs:
           echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
           echo "ARTIFACT GATE: $verdict"
 
+      - name: Warn that the Slack webhook was passed as a plain input
+        # The URL is a credential. A workflow input is not masked, and a step's
+        # env is printed in the run log, so the value is readable by anyone with
+        # read access to Actions. The value itself is never echoed here.
+        if: ${{ always() && inputs.slack_notify_url != '' }}
+        run: echo "::warning::slack_notify_url is deprecated and unsafe — a webhook URL is a credential, and an input is printed unmasked in this run's log. Store it as a repository secret and pass it as the slack_notify_webhook secret (which takes precedence when both are set)."
+
       - name: Post developer-readable artifact-gate findings (Slack + summary)
         # Post-push — no PR to comment on (the notifier reports the PR comment as
         # not applicable, not as a failure), so this surfaces the job summary and
@@ -192,7 +208,8 @@ jobs:
         env:
           GATE_MODE: ${{ inputs.gate_mode }}
           GITHUB_TOKEN: ${{ github.token }}
-          SECURITY_NOTIFY_SLACK_URL: ${{ inputs.slack_notify_url }}
+          # The declared secret first; the legacy input only when no secret is passed.
+          SECURITY_NOTIFY_SLACK_URL: ${{ secrets.slack_notify_webhook || inputs.slack_notify_url }}
           SECURITY_REPRODUCE_COMMANDS: ${{ inputs.reproduce_commands }}
         run: node "$SSD_TOOLKIT/scripts/notify.mjs" --gate reports/image-gate.json
 

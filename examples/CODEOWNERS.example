@@ -19,6 +19,18 @@
 /.github/workflows/          @your-org/security-engineering
 /.github/CODEOWNERS          @your-org/security-engineering
 
+# ssd-onboard's source of truth: gate mode, scan scope, framework ref, and every
+# identifier the generated workflows use.
+/.ssd/                       @your-org/security-engineering
+
+# Scanner configuration. Each of these can narrow a scan without touching a
+# workflow: a .semgrepignore line removes code from SAST, a .gitleaks.toml
+# without `[extend] useDefault = true` replaces every built-in secret rule, and
+# an exclude line hides paths from TruffleHog.
+/.semgrepignore              @your-org/security-engineering
+/.gitleaks.toml              @your-org/security-engineering
+/.trufflehog-exclude-paths.txt @your-org/security-engineering
+
 # The accepted-findings baseline. Whoever can rewrite this can accept any
 # finding permanently and silently.
 /security/baseline/          @your-org/security-engineering

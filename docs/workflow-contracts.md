@@ -50,14 +50,14 @@ are accepted for interface parity and ignored — Lambda configuration goes to
 | `gitleaks_config` | string | `.gitleaks.toml` | Omitted automatically when absent — the scan still runs with the default ruleset. |
 | `trufflehog_exclude_paths` | string | `.trufflehog-exclude-paths.txt` | Omitted automatically when absent. |
 | `reproduce_commands` | string (JSON) | `''` | Maps finding source → the local command a developer runs. Empty uses portable direct scanner invocations. |
-| `slack_notify_url` | string | `''` | Incoming webhook for BLOCK alerts. Empty disables Slack. |
+| `slack_notify_url` | string | `''` | **Deprecated** — pass the `slack_notify_webhook` secret instead. A webhook URL is a credential and an input is printed unmasked in run logs; a non-empty value now emits a warning. Still honoured within v1 when no secret is passed. |
 | `pr_number` | string | `''` | PR receiving the findings comment. Defaults to the PR of a `pull_request` run. |
 | `break_glass_enabled` | boolean | `false` | Whether an eligible BLOCK may enter the approval flow. |
 | `break_glass_transport` | string | `http` | `lambda` (OIDC, no secret) or `http` (legacy webhook + HMAC). |
 | `break_glass_lambda_role_arn` / `_function` / `_aws_region` | string | `''` | Required together when transport is `lambda`. |
 | `break_glass_notify_url` / `_status_url` | string | `''` | Legacy HTTP transport endpoints. |
 | `break_glass_timeout_seconds` | string | `''` | How long to wait for a verified decision. |
-| `bootstrap_baseline` | boolean | `false` | **Onboarding only.** Evaluate SAST against an empty accepted set because no baseline exists yet, then generate and upload a candidate. Requires `gate_mode: log-only`, and **refuses if a baseline already exists**. See [onboarding §1.1](onboarding.md#11-bootstrap-the-first-semgrep-baseline). |
+| `bootstrap_baseline` | boolean | `false` | **Onboarding only.** Evaluate SAST against an empty accepted set because no baseline exists yet, then generate and upload a candidate. Requires `gate_mode: log-only`, **refuses if a baseline already exists**, and (since v1.1.x) **refuses on `pull_request` and `push` runs**, whose Semgrep scan is diff-aware and would omit the existing backlog — dispatch it. See [onboarding §1.1](onboarding.md#11-bootstrap-the-first-semgrep-baseline). |
 | `synthetic_block_fixture` | string | `none` | Demo only. Requires an **isolated** break-glass configuration and can never fall through to production — dev URLs for `http`, the `synthetic_break_glass_*` inputs for `lambda`. |
 | `synthetic_break_glass_lambda_function` | string | `''` | Test broker used only for a synthetic `lambda` run. **Must differ from** `break_glass_lambda_function`. |
 | `synthetic_break_glass_lambda_role_arn` | string | `''` | Test invoker role for a synthetic `lambda` run. **Must differ from** `break_glass_lambda_role_arn`, so a fabricated BLOCK cannot assume the production role. |
@@ -68,12 +68,30 @@ are accepted for interface parity and ignored — Lambda configuration goes to
 | Secret | Required | Meaning |
 | --- | --- | --- |
 | `break_glass_shared_secret` | no | HMAC key for the legacy HTTP break-glass channel. |
+| `slack_notify_webhook` | no | Slack incoming-webhook URL for BLOCK alerts (since v1.1.x). Takes precedence over the deprecated `slack_notify_url` input. |
 
-This is the **only** secret any reusable workflow accepts, it is declared
-explicitly, and it is not a cloud credential. The `lambda` transport needs no
-secret at all. `_image-scan-prepush.yml`, `_artifact-gate.yml` and
-`_conformance.yml` declare no `secrets:` block whatsoever — they cannot receive
-one. **Callers must never use `secrets: inherit`.**
+These are the only secrets `_source-security.yml` accepts; each is declared
+explicitly and neither is a cloud credential. The `lambda` transport needs no
+secret at all. `slack_notify_webhook` is referenced **only** by a notifier step's
+environment. Every other kind of step is outside its reach: no scanner, build,
+policy-gate, preflight, credential-assumption, break-glass request or polling
+step can read it. (A notifier step in `_break-glass-lambda.yml` reads it too —
+that workflow alerts when its approval request was not delivered — so the rule is
+"notifier steps only", not "not in the break-glass workflow".) The framework's
+tests assert this structurally: exactly one step per accepting workflow may
+reference the secret, it is never read at job level, and it is never interpolated
+into `run:` script content. `_image-scan-prepush.yml` and
+`_artifact-gate.yml` declare `slack_notify_webhook` and nothing else, as does
+`_break-glass-lambda.yml` (its Lambda transport needs no secret of its own);
+`_ecr-collect.yml` and `_conformance.yml` declare no `secrets:` block whatsoever.
+The generated twin `_source-scan.yml` declares the same pair as the workflow it
+is rendered from.
+**Callers must never use `secrets: inherit`**; pass the webhook explicitly:
+
+```yaml
+secrets:
+  slack_notify_webhook: ${{ secrets.SECURITY_NOTIFY_SLACK_URL }}
+```
 
 ### Outputs
 
@@ -212,7 +230,8 @@ break-glass:
     lambda_function: ${{ vars.BREAK_GLASS_LAMBDA_FUNCTION }}
     lambda_role_arn: ${{ vars.BREAK_GLASS_LAMBDA_ROLE_ARN }}
     aws_region: ${{ vars.AWS_REGION }}
-    slack_notify_url: ${{ vars.SECURITY_NOTIFY_SLACK_URL }}
+  secrets:
+    slack_notify_webhook: ${{ secrets.SECURITY_NOTIFY_SLACK_URL }}
 ```
 
 | Input | Default | Meaning |
@@ -223,10 +242,12 @@ break-glass:
 | `lambda_function` / `lambda_role_arn` / `aws_region` | `''` | Production broker and invoker role. |
 | `synthetic_lambda_function` / `synthetic_lambda_role_arn` / `synthetic_aws_region` | `''` | Isolated test broker, used **only** when the gate evidence records a synthetic fixture. There is no input that turns synthetic routing on or off. |
 | `timeout_seconds` | `900` | How long to wait for a verified decision. |
-| `slack_notify_url` | `''` | An additional alert when the request is **not** delivered. The source workflow always sends its own BLOCK alert. |
+| `slack_notify_url` | `''` | **Deprecated** — pass the `slack_notify_webhook` secret instead. An additional alert when the request is **not** delivered; the source workflow always sends its own BLOCK alert. A webhook URL is a credential and an input is printed unmasked in run logs, so a non-empty value now emits a warning. Still honoured within v1 when no secret is passed. |
 | `pr_number` | `''` | Recorded in the request. |
 
-It declares **no secrets**.
+Secret: `slack_notify_webhook` (optional), read by the notifier step **only**, and
+taking precedence over the deprecated `slack_notify_url` input. It is not a cloud
+credential: the Lambda transport authenticates through OIDC, not a secret.
 
 Step order — asserted by `test/break-glass-oidc-boundary.test.js`, including
 mutation cases that reorder it:
@@ -279,13 +300,16 @@ aggregate red.
 ## `_image-scan-prepush.yml`
 
 Trivy plus the pre-push gate, over an image tarball the caller already built.
-Assumes no cloud role, accepts no secrets, touches no registry.
+Assumes no cloud role, touches no registry, and accepts no secret except the optional Slack notification webhook.
 
 | Input | Type | Default |
 | --- | --- | --- |
 | `image_artifact` | string | **required** |
 | `image_tarball` | string | `application-image.tar` |
-| `reproduce_commands`, `slack_notify_url`, `pr_number` | string | `''` |
+| `reproduce_commands`, `pr_number` | string | `''` |
+| `slack_notify_url` | string | `''` — deprecated; use the `slack_notify_webhook` secret |
+
+Secret: `slack_notify_webhook` (optional), notifier step only. `_artifact-gate.yml` has the same input and secret.
 
 | Output | Values |
 | --- | --- |
@@ -297,7 +321,7 @@ Assumes no cloud role, accepts no secrets, touches no registry.
 ## `_artifact-gate.yml`
 
 Policy over a **normalized** registry scan report. Registry-neutral: it names no
-registry and calls no registry API. Assumes no cloud role, accepts no secrets.
+registry and calls no registry API. Assumes no cloud role; accepts no secret except the optional Slack notification webhook.
 
 | Input | Type | Default |
 | --- | --- | --- |

@@ -219,6 +219,18 @@ SLACK_APPROVER_IDS_BY_REPO={"org/repo-a":["U123"],"org/repo-b":["U456","U789"]}
 
 Changing the map is an environment change and needs the handler restarted.
 
+> **Known gap: the stored repository is caller-asserted.** The pending
+> request's repository comes from the CI broker's invoke **payload**, and Lambda
+> direct invocation does not tell the function which IAM principal called it.
+> So any principal allowed to invoke the broker can file a request labelled as
+> a *different* repository, and that repository's approvers are the ones asked.
+> With one shared invoker role, only the role's holders can do this. With
+> per-repository invoker roles, any onboarded repository could forge requests
+> for another. The fix is for the broker to verify a GitHub OIDC token and
+> derive the repository from it. That is the first item of the Phase 3 design
+> ([onboarding-architecture.md § E.2](onboarding-architecture.md#e2-concrete-defect-to-fix-first-caller-asserted-repository)).
+> Do not onboard a second repository onto a shared broker until it lands.
+
 ## A repository with no Slack
 
 **Break-glass is unavailable, and that is a supported, recorded configuration.**

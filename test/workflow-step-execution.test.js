@@ -222,7 +222,7 @@ describe('example aggregate checks distinguish PASS from BLOCK in log-only', () 
         IMAGE_RESULT: 'success',
         SOURCE_VERDICT: 'PASS',
         IMAGE_VERDICT: 'DEPLOY',
-        MODE: 'log-only',
+        SOURCE_MODE: 'log-only',
         IMAGE_MODE: 'log-only'
       });
       assert.equal(code, 0);
@@ -239,7 +239,7 @@ describe('example aggregate checks distinguish PASS from BLOCK in log-only', () 
         IMAGE_RESULT: 'success',
         SOURCE_VERDICT: 'PASS',
         IMAGE_VERDICT: 'BLOCK_DEPLOY',
-        MODE: 'log-only',
+        SOURCE_MODE: 'log-only',
         IMAGE_MODE: 'log-only'
       });
       assert.equal(code, 0);
@@ -254,7 +254,7 @@ describe('example aggregate checks distinguish PASS from BLOCK in log-only', () 
         IMAGE_RESULT: 'success',
         SOURCE_VERDICT: 'BLOCK',
         IMAGE_VERDICT: 'DEPLOY',
-        MODE: 'enforce',
+        SOURCE_MODE: 'enforce',
         IMAGE_MODE: 'enforce'
       });
       assert.equal(code, 1);
@@ -609,5 +609,79 @@ describe('Semgrep step: acquire (bounded retry) -> run once -> complete', () => 
     const block = source.slice(start, source.indexOf('\n      - name:', start + 1));
     assert.match(block, /if: always\(\)/);
     assert.match(block, /reports\/scanner-execution-semgrep\.json/);
+  });
+});
+
+// ---- 3. the dependency-free import check (ci.yml) --------------------------------
+//
+// This is a security control, and it FALSE-PASSED: the step passed both -E and
+// -P to GNU grep, which refuses ("conflicting matchers specified") and exits 2,
+// and the `if grep ...; then` around it read that error as "no match" and
+// printed the success line. The three grep outcomes are therefore exercised
+// here against the REAL step script: a match (exit 0) fails, no match (exit 1)
+// passes, and a checker error (exit > 1) fails closed.
+describe('ci.yml: the dependency-free import check fails closed', () => {
+  const FILE = '.github/workflows/ci.yml';
+  const STEP = 'The toolkit must stay dependency-free';
+  const SCRIPT = stepScript(FILE, STEP);
+
+  // A tree shaped like the repository's, holding only the given .mjs files.
+  function tree(files) {
+    const root = mkdtempSync(join(WORK, 'import-check-'));
+    for (const dir of ['security/scripts', 'onboarding/lib']) {
+      mkdirSync(join(root, dir), { recursive: true });
+    }
+    for (const [path, content] of Object.entries(files)) {
+      writeFileSync(join(root, path), content);
+    }
+    return root;
+  }
+
+  const BUILTINS = "import { readFileSync } from 'node:fs';\nimport { local } from './local.mjs';\n";
+  const THIRD_PARTY = "import lodash from 'lodash';\n";
+  const check = (root, { path } = {}) => runStep(FILE, STEP, {}, { cwd: root, path });
+
+  it('the pattern is PCRE only: -E and -P are never combined (that is the bug that made it pass on error)', () => {
+    assert.match(SCRIPT, /grep -rnP\b/, 'the negative lookahead needs -P');
+    assert.doesNotMatch(SCRIPT, /grep[^\n|]*-[a-zA-Z]*E/, 'no -E anywhere in the grep invocation');
+    assert.doesNotMatch(SCRIPT, /2>\s*\/dev\/null|2>&-/, 'stderr from the checker is never suppressed');
+    assert.ok(SCRIPT.includes('security/scripts') && SCRIPT.includes('onboarding'), 'both trees stay in scope');
+  });
+
+  it('no forbidden import (grep exit 1): the control PASSES', () => {
+    const root = tree({ 'security/scripts/a.mjs': BUILTINS, 'onboarding/lib/b.mjs': BUILTINS });
+    const { code, out } = check(root);
+    assert.equal(code, 0, out);
+    assert.match(out, /Toolkit and onboarding imports are Node builtins and relative paths only/);
+  });
+
+  for (const [where, files] of [
+    ['security/scripts', { 'security/scripts/a.mjs': THIRD_PARTY, 'onboarding/lib/b.mjs': BUILTINS }],
+    ['onboarding', { 'security/scripts/a.mjs': BUILTINS, 'onboarding/lib/b.mjs': THIRD_PARTY }]
+  ]) {
+    it(`a third-party import under ${where} (grep exit 0): the control FAILS`, () => {
+      const { code, out } = check(tree(files));
+      assert.equal(code, 1, out);
+      assert.match(out, /imports a third-party module; they must use Node builtins only/);
+      assert.doesNotMatch(out, /builtins and relative paths only\./);
+    });
+  }
+
+  // The regression itself: the checker cannot run. UNKNOWN must never be PASS.
+  it('the checker itself failing (grep exit 2): the control FAILS, and says so', () => {
+    const root = tree({ 'security/scripts/a.mjs': BUILTINS, 'onboarding/lib/b.mjs': BUILTINS });
+    const stubBin = mkdtempSync(join(WORK, 'broken-grep-'));
+    writeFileSync(join(stubBin, 'grep'), '#!/usr/bin/env bash\necho "grep: conflicting matchers specified" >&2\nexit 2\n');
+    chmodSync(join(stubBin, 'grep'), 0o755);
+    const { code, out } = check(root, { path: `${stubBin}:${process.env.PATH}` });
+    assert.equal(code, 2, out);
+    assert.match(out, /Dependency-free import check itself failed \(grep exit 2\)/);
+    assert.doesNotMatch(out, /builtins and relative paths only\./, 'an error is never reported as a pass');
+  });
+
+  it('the real repository satisfies the control', () => {
+    const { code, out } = runStep(FILE, STEP, {}, { cwd: FRAMEWORK });
+    assert.equal(code, 0, out);
+    assert.match(out, /Toolkit and onboarding imports are Node builtins and relative paths only/);
   });
 });

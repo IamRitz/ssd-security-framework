@@ -363,11 +363,23 @@ describe('Lambda break-glass: the credential boundary', () => {
     assert.ok(!/inputs\.synthetic\b|synthetic_block_fixture/.test(bg));
   });
 
-  it('keeps the Slack URL scoped to the notifier step only', () => {
+  it('keeps the Slack webhook scoped to the notifier step only', () => {
     const body = executable(bg);
-    assert.equal((body.match(/inputs\.slack_notify_url/g) ?? []).length, 1);
-    const at = body.indexOf('inputs.slack_notify_url');
-    assert.ok(body.lastIndexOf('- name: Post developer-readable findings', at) > body.lastIndexOf('- name: Record the break-glass result', at));
+    // The declared SECRET is the supported transport, and only the notifier reads it.
+    assert.equal((body.match(/secrets\.slack_notify_webhook/g) ?? []).length, 1);
+    const secretAt = body.indexOf('secrets.slack_notify_webhook');
+    assert.ok(body.lastIndexOf('- name: Post developer-readable findings', secretAt) > body.lastIndexOf('- name: Record the break-glass result', secretAt));
+    // The deprecated v1 input survives in exactly two places: the notifier's
+    // fallback and the step that warns it was used. Neither is a role-bearing step.
+    const inputUses = [...body.matchAll(/inputs\.slack_notify_url/g)].map((m) => m.index);
+    assert.equal(inputUses.length, 2);
+    for (const at of inputUses) {
+      const step = body.lastIndexOf('- name: ', at);
+      assert.match(
+        body.slice(step, body.indexOf('\n', step)),
+        /- name: (Post developer-readable findings|Warn that the Slack webhook was passed as a plain input)/
+      );
+    }
   });
 
   describe('mutations of the workflow that the boundary check must reject', () => {
@@ -421,7 +433,11 @@ describe('Lambda break-glass callers: only the break-glass job holds OIDC', () =
     assert.match(job, /if: \$\{\{ always\(\) && needs\.source-security\.outputs\.break_glass_delegated == 'true' \}\}/);
     assert.match(job, /expected_gate_digest: \$\{\{ needs\.source-security\.outputs\.gate_digest \}\}/);
     assert.match(job, /_break-glass-lambda\.yml@v1/);
-    assert.ok(!/secrets:/.test(job));
+    // The only secret a break-glass caller may hand over is the notification
+    // webhook. No cloud credential, and never `secrets: inherit`.
+    assert.ok(!/secrets\s*:\s*inherit/.test(job), 'must not pass every repo secret');
+    const passed = [...job.matchAll(/^ {6}([a-z0-9_]+): \$\{\{ secrets\./gm)].map((m) => m[1]);
+    assert.deepEqual(passed, ['slack_notify_webhook']);
   });
 });
 
@@ -866,6 +882,7 @@ describe('final security-gate decision (source leg)', () => {
       SOURCE_RESULT: source.sourceResult,
       SOURCE_VERDICT: source.verdict,
       MODE: source.gateMode,
+      SOURCE_MODE: source.gateMode,
       SOURCE_GATE_MODE: source.gateMode,
       SOURCE_INTEGRITY_TRUSTED: source.integrityTrusted,
       SOURCE_BREAK_GLASS_ELIGIBLE: source.breakGlassEligible,
@@ -1549,7 +1566,11 @@ describe('developer notification handoff', () => {
       const text = read(file);
       const at = text.indexOf('- name: Post developer-readable findings (Slack + PR comment + job summary)');
       const step = text.slice(at, text.indexOf('\n      - name:', at + 1));
-      assert.match(step, /\n {10}SECURITY_NOTIFY_SLACK_URL: \$\{\{ inputs\.slack_notify_url \}\}\n/, file);
+      assert.match(
+        step,
+        /\n {10}SECURITY_NOTIFY_SLACK_URL: \$\{\{ secrets\.slack_notify_webhook \|\| inputs\.slack_notify_url \}\}\n/,
+        `${file}: the notifier takes the declared secret, falling back to the deprecated v1 input`
+      );
       assert.match(step, /\n\s+if: always\(\)\n/, `${file}: the notifier must run on every outcome`);
     }
   });
