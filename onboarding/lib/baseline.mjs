@@ -309,6 +309,15 @@ export async function prepareCandidate({ root, config, runId, gh, tmpDir, replac
   if (run.status !== 'completed') {
     problems.push(`run ${runId} has not completed (status ${run.status})`);
   }
+  // A completed run is not a successful one. `failure`, `cancelled`,
+  // `timed_out`, `action_required`, `stale`, `skipped` — and any conclusion a
+  // future GitHub adds — mean the scan did not finish as the workflow defines
+  // it, so its artifact is not a baseline of this repository. Checked BEFORE the
+  // download, alongside the other run facts; every artifact-side provenance
+  // check still runs afterwards.
+  else if (run.conclusion !== 'success') {
+    problems.push(`run ${runId} completed with conclusion '${run.conclusion}', not 'success'; only a scan that ran to completion may supply a baseline`);
+  }
   if (run.head_branch !== config.repository.defaultBranch) {
     problems.push(`run ${runId} ran on '${run.head_branch}', not the default branch '${config.repository.defaultBranch}'`);
   }

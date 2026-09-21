@@ -83,6 +83,16 @@ export async function contractProblems(rendered, config, readPinned) {
             problems.push(`${where} does not pass required input '${name}' of ${called}`);
           }
         }
+        // A required secret is the same contract as a required input: GitHub
+        // refuses to start the callee when one is missing. No secret the
+        // framework declares today is required, so this is future-proofing —
+        // the day one becomes required, a caller that does not pass it is
+        // blocked here rather than at the first run.
+        for (const [name, spec] of Object.entries(contract.secrets ?? {})) {
+          if (spec?.required === true && !Object.hasOwn(job.secrets ?? {}, name)) {
+            problems.push(`${where} does not pass required secret '${name}' of ${called}`);
+          }
+        }
         // Least privilege: grant exactly what the callee statically requires —
         // less and it cannot start, more and the caller over-grants.
         const granted = job.permissions ?? {};

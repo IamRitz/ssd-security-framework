@@ -487,7 +487,7 @@ export function renderDeliveryWorkflow(config) {
   const lines = [];
   header(config, lines, [
     `DELIVERY phase for ${config.repository.slug}. Each stage holds the least it can:`,
-    '  source-security  no cloud credentials (break-glass invoker only, after eligibility)',
+    '  source-security  no cloud credentials at all: it calls the OIDC-free _source-scan.yml and break-glass is disabled',
     '  container-build  no cloud credentials, no build arguments',
     '  image-security   no cloud credentials; records the image config digest Trivy scanned',
     '  ecr-collect      the push+scan role ONLY; asserts loaded image == scanned image, pushes',

@@ -64,11 +64,24 @@ export async function analyze({ root, config, configErrors = [], configWarnings 
   const dirSet = new Set(files.flatMap((file) => file.split('/').slice(0, -1).map((_, i, parts) => parts.slice(0, i + 1).join('/'))));
 
   // --- repository identity -------------------------------------------------------
+  // Identity is FAIL-CLOSED against the repository's own git facts, because the
+  // configured values decide what the generated workflows gate: `render` filters
+  // `pull_request` on repository.defaultBranch and conditions delivery on it, so
+  // a config naming `develop` in a repository whose default branch is `main`
+  // generates a gate that never runs on the branch that ships. A mismatch is an
+  // error, not a warning a `render` can be run straight past.
+  //
+  // Only a KNOWN fact blocks: when origin or origin/HEAD is absent, git says
+  // nothing about identity and no identity is invented here — the config stands
+  // on its own (config.mjs still validates the values themselves).
   if (facts.git.slug && config.repository.slug && facts.git.slug.toLowerCase() !== config.repository.slug.toLowerCase()) {
-    warnings.push({ area: 'repository', message: `repository.slug is ${config.repository.slug} but origin points at ${facts.git.slug}` });
+    errors.push({
+      area: 'repository',
+      message: `repository.slug is ${config.repository.slug} but origin points at ${facts.git.slug}; the generated workflows would be built for another repository`
+    });
   }
   if (facts.git.defaultBranch && config.repository.defaultBranch && facts.git.defaultBranch !== config.repository.defaultBranch) {
-    warnings.push({
+    errors.push({
       area: 'repository',
       message: `repository.defaultBranch is ${config.repository.defaultBranch} but origin/HEAD is ${facts.git.defaultBranch}; pull requests into the real default branch would not be scanned`
     });

@@ -14,6 +14,7 @@ import { detectFramework } from '../onboarding/lib/framework.mjs';
 import { parseConfig, serializeConfig } from '../onboarding/lib/config.mjs';
 import { planWrites, readMarker, withMarker } from '../onboarding/lib/files.mjs';
 import { scriptedPrompter } from '../onboarding/lib/prompt.mjs';
+import { renderSecurityWorkflow } from '../onboarding/lib/render.mjs';
 import { parseYaml } from '../onboarding/lib/yaml.mjs';
 import { inspectRepository } from '../onboarding/lib/inspect.mjs';
 import { FRAMEWORK, REF, SAMPLE_BASELINE, bootstrapArtifact, capture, commitAll, config, head, makeRepo, read, readWorkingTreeWorkflow, tempDir, write } from './support/onboarding-fixtures.mjs';
@@ -288,6 +289,52 @@ describe('validation blocks generation on real coverage gaps', () => {
     writeConfig(root, 'source-only', { semgrep: { roots: ['app'] } });
     assert.match((await cli(root, ['validate'])).out, /semgrep\.roots entry 'app' does not exist/);
   });
+
+  // Repository identity is fail-closed: what the config claims must match what
+  // git says, because render turns those two values into the branch filter and
+  // the delivery condition. The fixture repository is github.com/acme/app with
+  // origin/HEAD -> main.
+  it('a configured default branch that is not the real one BLOCKS generation, so the branch that ships is never left ungated', async (t) => {
+    const root = makeRepo(t, PY_REPO);
+    writeConfig(root, 'source-only', { repository: { defaultBranch: 'develop' } });
+
+    const validate = await cli(root, ['validate']);
+    assert.equal(validate.code, 1);
+    assert.match(validate.out, /✗ \[repository\] repository\.defaultBranch is develop but origin\/HEAD is main/);
+    assert.match(validate.out, /pull requests into the real default branch would not be scanned/);
+
+    const render = await cli(root, ['render']);
+    assert.equal(render.code, 1);
+    assert.ok(!existsSync(join(root, '.github/workflows/security.yml')), 'no workflow is written');
+
+    // The danger this blocks, stated exactly: the workflow this config WOULD
+    // produce gates `develop` only, so every pull request into the real default
+    // branch `main` would run no security checks at all.
+    const wouldBe = parseYaml(renderSecurityWorkflow(config('source-only', { repository: { defaultBranch: 'develop' } })));
+    assert.deepEqual(wouldBe.on.pull_request.branches, ['develop']);
+    assert.ok(!wouldBe.on.pull_request.branches.includes('main'));
+  });
+
+  it('a configured slug that is not the origin BLOCKS generation', async (t) => {
+    const root = makeRepo(t, PY_REPO);
+    writeConfig(root, 'source-only', { repository: { slug: 'acme/other' } });
+    const validate = await cli(root, ['validate']);
+    assert.equal(validate.code, 1);
+    assert.match(validate.out, /✗ \[repository\] repository\.slug is acme\/other but origin points at acme\/app/);
+    assert.equal((await cli(root, ['render'])).code, 1);
+    assert.ok(!existsSync(join(root, '.github/workflows/security.yml')));
+  });
+
+  // Fail-closed, not fact-inventing: with no GitHub origin git knows nothing
+  // about identity, and an unknown fact must not block or overrule the config.
+  it('an unknown git fact does not block: identity is never invented', async (t) => {
+    const root = makeRepo(t, PY_REPO);
+    writeConfig(root, 'source-only', { repository: { slug: 'acme/other', defaultBranch: 'develop' } });
+    const facts = await inspectRepository(root);
+    const blind = { ...facts, git: { ...facts.git, slug: null, defaultBranch: null } };
+    const result = await analyze({ root, config: config('source-only', { repository: { slug: 'acme/other', defaultBranch: 'develop' } }), facts: blind, framework: FRAMEWORK });
+    assert.deepEqual(result.errors.filter((e) => e.area === 'repository'), []);
+  });
 });
 
 describe('the baseline state machine', () => {
@@ -307,6 +354,7 @@ describe('the baseline state machine', () => {
     delete files.provenance;
     const run = {
       id: 4242, html_url: 'https://github.com/acme/app/actions/runs/4242', event: 'workflow_dispatch', status: 'completed',
+      conclusion: 'success',
       head_branch: 'main', head_sha: head(root), path: '.github/workflows/security.yml', ...runOverrides
     };
     const calls = [];
@@ -398,7 +446,6 @@ describe('the baseline state machine', () => {
       },
       /\.semgrepignore differs from the scan/
     ],
-    ['the repository identity', async (root) => { writeConfig(root, 'source-only', { repository: { slug: 'acme/other' } }); commitAll(root); }, /scanned in acme\/app, not acme\/other/],
     [
       'the framework ref',
       async (root) => { writeConfig(root, 'source-only', { framework: { ref: 'f'.repeat(40) } }); commitAll(root); },
@@ -431,6 +478,27 @@ describe('the baseline state machine', () => {
     assert.equal(read(root2, 'security/baseline/semgrep-baseline.json'), '{"schemaVersion":1,"findings":[]}');
   });
 
+  // The repository identity binding, in both places it now holds. A configured
+  // slug that disagrees with origin is a blocking analysis error since identity
+  // is fail-closed, so the CLI never reaches acceptance with one — which is why
+  // the binding itself is asserted directly, on the code path `accept` uses.
+  it('accept refuses when the repository identity changed after the scan', async (t) => {
+    const root = await candidateRepo(t);
+    const cfg = parseConfig(read(root, '.ssd/onboarding.yml')).config;
+    const elsewhere = { ...cfg, repository: { ...cfg.repository, slug: 'acme/other' } };
+    await assert.rejects(
+      loadCandidateForAcceptance({ root, config: elsewhere, consumer: { head: head(root), clean: true, slug: 'acme/other', semgrepignoreSha256: null } }),
+      /scanned in acme\/app, not acme\/other/
+    );
+
+    writeConfig(root, 'source-only', { repository: { slug: 'acme/other' } });
+    commitAll(root);
+    const result = await accept(root);
+    assert.equal(result.code, 1, result.out);
+    assert.match(result.out, /repository\.slug is acme\/other but origin points at acme\/app/);
+    assert.ok(!existsSync(join(root, 'security/baseline/semgrep-baseline.json')));
+  });
+
   it('loadCandidateForAcceptance itself refuses when the baseline path exists (independently of other checks)', async (t) => {
     const root = await candidateRepo(t);
     write(root, 'security/baseline/semgrep-baseline.json', '{}');
@@ -449,6 +517,10 @@ describe('the baseline state machine', () => {
     ['a run of another workflow', { runOverrides: { path: '.github/workflows/other.yml' } }, /not \.github\/workflows\/security\.yml/],
     ['a run on another branch', { runOverrides: { head_branch: 'feature' } }, /not the default branch/],
     ['an unfinished run', { runOverrides: { status: 'in_progress' } }, /has not completed/],
+    ['a completed run that failed', { runOverrides: { conclusion: 'failure' } }, /completed with conclusion 'failure', not 'success'/],
+    ['a cancelled run', { runOverrides: { conclusion: 'cancelled' } }, /completed with conclusion 'cancelled', not 'success'/],
+    ['a timed-out run', { runOverrides: { conclusion: 'timed_out' } }, /completed with conclusion 'timed_out', not 'success'/],
+    ['a run whose conclusion GitHub does not report', { runOverrides: { conclusion: undefined } }, /completed with conclusion 'undefined', not 'success'/],
     ['a run whose commit differs from the provenance', { runOverrides: { head_sha: 'd'.repeat(40) } }, /but the provenance records/],
     ['a run flagged DO-NOT-BASELINE', { artifact: { 'DO-NOT-BASELINE.txt': 'untrusted' } }, /DO-NOT-BASELINE/],
     ['an untrusted scan', { artifact: { 'security-gate.json': JSON.stringify({ integrity: { trusted: false }, bootstrap: { active: true } }) } }, /integrity\.trusted/],
@@ -473,6 +545,29 @@ describe('the baseline state machine', () => {
       assert.ok(!existsSync(join(root, CANDIDATE_FILE)));
     });
   }
+
+  // The conclusion is a run fact, so it is judged before anything is fetched:
+  // an artifact from a failed scan is never downloaded, let alone installed.
+  for (const conclusion of ['failure', 'cancelled']) {
+    it(`prepare refuses a completed/${conclusion} run BEFORE \`gh run download\``, async (t) => {
+      const root = await onboardingRepo(t);
+      const fake = fakeGh(root, { runOverrides: { conclusion } });
+      const result = await cli(root, ['baseline', 'prepare', '--run', '4242'], { gh: fake.gh });
+      assert.equal(result.code, 1, result.out);
+      assert.match(result.err, new RegExp(`completed with conclusion '${conclusion}', not 'success'`));
+      assert.deepEqual(fake.calls.map((c) => c.slice(0, 2)), [['api', 'repos/acme/app/actions/runs/4242']], 'the run was never downloaded');
+      assert.ok(!existsSync(join(root, CANDIDATE_FILE)));
+    });
+  }
+
+  it('prepare accepts completed/success and goes on to validate the artifact', async (t) => {
+    const root = await onboardingRepo(t);
+    const fake = fakeGh(root, { runOverrides: { conclusion: 'success' } });
+    const result = await cli(root, ['baseline', 'prepare', '--run', '4242'], { gh: fake.gh });
+    assert.equal(result.code, 0, result.err);
+    assert.deepEqual(fake.calls.map((c) => c.slice(0, 2)), [['api', 'repos/acme/app/actions/runs/4242'], ['run', 'download']]);
+    assert.ok(existsSync(join(root, CANDIDATE_FILE)));
+  });
 
   it('accept refuses a candidate placed by hand, without verified provenance', async (t) => {
     const root = await onboardingRepo(t);

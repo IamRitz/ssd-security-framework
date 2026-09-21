@@ -86,6 +86,34 @@ describe('the exact framework ref, everywhere', () => {
     assert.ok(problems.some((p) => /secret 'slack_notify_webhook'.*would fail to start/.test(p)), problems.join('\n'));
   });
 
+  // Future-proofing, symmetric with required inputs: GitHub refuses to start a
+  // callee whose required secret the caller does not pass. No secret the
+  // framework declares today is required — this pins the check down against the
+  // day one becomes required, by making `slack_notify_webhook` required only in
+  // the pinned text this test reads.
+  it('detects a pinned ref that REQUIRES a secret the render does not pass', async () => {
+    const requiringWebhook = async (file) =>
+      (await readWorkingTreeWorkflow(file))?.replace(
+        /(\n      slack_notify_webhook:\n(?: {8}.*\n)*? {8}required: )false\n/,
+        '$1true\n'
+      ) ?? null;
+    // Sanity: the substitution really did make it required at the pinned ref.
+    assert.match(await requiringWebhook('_source-scan.yml'), /slack_notify_webhook:[\s\S]*?required: true/);
+
+    const silent = config('source-only'); // notifications off: no secrets are passed
+    const { problems } = await contractProblems(renderAll(silent), silent, requiringWebhook);
+    assert.ok(
+      problems.some((p) => /does not pass required secret 'slack_notify_webhook' of _source-scan\.yml/.test(p)),
+      problems.join('\n')
+    );
+
+    // A caller that does pass it has no problem — the check is about the
+    // contract, not about Slack being enabled.
+    const notifying = config('source-only', { notifications: SLACK });
+    const passing = await contractProblems(renderAll(notifying), notifying, requiringWebhook);
+    assert.deepEqual(passing.problems.filter((p) => /required secret/.test(p)), []);
+  });
+
   it('uses the same third-party action pins as the framework examples', async () => {
     const { readFileSync } = await import('node:fs');
     const examples = readFileSync('examples/container-ecr/deploy.yml', 'utf8') + readFileSync('examples/container-ecr/security.yml', 'utf8');
