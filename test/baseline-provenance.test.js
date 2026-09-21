@@ -1,7 +1,7 @@
 // The provenance record that binds a Semgrep baseline candidate to its scan.
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -70,8 +70,15 @@ describe('baseline candidate provenance', () => {
     assert.throws(() => buildProvenance({ env: { ...ENV, CI_SHA: '' }, candidateBytes: CANDIDATE, gate: GATE, semgrepignoreBytes: null }), /CI_SHA/);
   });
 
-  it('the script writes the record from the environment the workflow passes', () => {
+  // The one temp root in this file. It belongs to this test alone, so the test
+  // owns it: `t.after` runs on a pass, on an assertion failure and on a thrown
+  // exception, and is registered on the line after mkdtemp so that nothing
+  // between creation and registration can strand the root. Only the exact path
+  // mkdtemp returned is removed — this never globs `prov-*` and never touches a
+  // root another process created, so a concurrent run is unaffected.
+  it('the script writes the record from the environment the workflow passes', (t) => {
     const dir = mkdtempSync(join(tmpdir(), 'prov-'));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
     writeFileSync(join(dir, 'candidate.json'), CANDIDATE);
     writeFileSync(join(dir, 'gate.json'), JSON.stringify(GATE));
     const result = spawnSync(

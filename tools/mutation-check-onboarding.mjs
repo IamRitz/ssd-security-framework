@@ -78,44 +78,86 @@ const MUTATIONS = [
   ['the image notifier reads the webhook secret', '.github/workflows/_image-scan-prepush.yml', 'secrets.slack_notify_webhook || inputs.slack_notify_url', 'inputs.slack_notify_url']
 ];
 
-function copyRepo() {
-  const dir = mkdtempSync(join(tmpdir(), 'ssd-mutant-'));
-  cpSync(ROOT, dir, { recursive: true, filter: (src) => !/[\\/](\.git|node_modules|reports)([\\/]|$)/.test(src.slice(ROOT.length)) });
-  return dir;
-}
+// Temp-workspace lifecycle
+// ------------------------
+// Every directory this script creates is owned by the scope that created it and
+// is removed by that scope's `finally`, on every exit path. Nothing here globs,
+// sweeps a temp parent, or deletes a path it did not itself create: only exact
+// paths returned by mkdtempSync are removed. `tmpdir()` is read on each call, so
+// TMPDIR keeps working:
+//
+//   TMPDIR="$HOME/.cache/ssd-verify-tmp" node tools/mutation-check-onboarding.mjs
+export const TEMP_PREFIX = 'ssd-mutant-';
 
-const pristine = copyRepo();
-const baseline = spawnSync(process.execPath, ['--test', ...TESTS], { cwd: pristine, encoding: 'utf8' });
-if (baseline.status !== 0) {
-  console.error('The unmutated suite fails; fix it before checking mutations.\n' + baseline.stdout.slice(-2000));
-  process.exit(1);
-}
-rmSync(pristine, { recursive: true, force: true });
-
-let survivors = 0;
-for (const [invariant, file, search, replace] of MUTATIONS) {
-  const dir = copyRepo();
+// A half-built copy is still a leak: if cpSync fails after mkdtempSync has
+// created the root, this removes the root before rethrowing, so no caller has to
+// clean up a directory it never received.
+export function copyRepo(source = ROOT, parent = tmpdir()) {
+  const dir = mkdtempSync(join(parent, TEMP_PREFIX));
   try {
-    const path = join(dir, file);
-    const source = readFileSync(path, 'utf8');
-    const count = source.split(search).length - 1;
-    if (count !== 1) {
-      console.log(`STALE   ${invariant}: the mutation target occurs ${count} time(s) in ${file}; update this script`);
-      survivors += 1;
-      continue;
-    }
-    writeFileSync(path, source.replace(search, replace));
-    const result = spawnSync(process.execPath, ['--test', ...TESTS], { cwd: dir, encoding: 'utf8' });
-    if (result.status === 0) {
-      console.log(`SURVIVED ${invariant} (${file})`);
-      survivors += 1;
-    } else {
-      const failed = (/# fail (\d+)/.exec(result.stdout) ?? [])[1];
-      console.log(`killed   ${invariant} — ${failed} test(s) failed`);
-    }
-  } finally {
+    cpSync(source, dir, {
+      recursive: true,
+      filter: (src) => !/[\\/](\.git|node_modules|reports)([\\/]|$)/.test(src.slice(source.length))
+    });
+    return dir;
+  } catch (error) {
     rmSync(dir, { recursive: true, force: true });
+    throw error;
   }
 }
-console.log(`\n${MUTATIONS.length - survivors}/${MUTATIONS.length} mutations killed.`);
-process.exitCode = survivors === 0 ? 0 : 1;
+
+// Returns an exit code rather than calling process.exit, so that every failure
+// path — a failing pristine suite included — unwinds through the `finally` that
+// owns the pristine copy. A process.exit here would skip it, which is exactly
+// how an aborted run used to leave a full repository copy behind.
+export function runMutationCheck({
+  source = ROOT,
+  tests = TESTS,
+  mutations = MUTATIONS,
+  parent = tmpdir(),
+  log = console.log,
+  logError = console.error
+} = {}) {
+  const pristine = copyRepo(source, parent);
+  try {
+    const baseline = spawnSync(process.execPath, ['--test', ...tests], { cwd: pristine, encoding: 'utf8' });
+    if (baseline.status !== 0) {
+      logError('The unmutated suite fails; fix it before checking mutations.\n' + (baseline.stdout ?? '').slice(-2000));
+      return 1;
+    }
+
+    let survivors = 0;
+    for (const [invariant, file, search, replace] of mutations) {
+      const dir = copyRepo(source, parent);
+      try {
+        const path = join(dir, file);
+        const sourceText = readFileSync(path, 'utf8');
+        const count = sourceText.split(search).length - 1;
+        if (count !== 1) {
+          log(`STALE   ${invariant}: the mutation target occurs ${count} time(s) in ${file}; update this script`);
+          survivors += 1;
+          continue;
+        }
+        writeFileSync(path, sourceText.replace(search, replace));
+        const result = spawnSync(process.execPath, ['--test', ...tests], { cwd: dir, encoding: 'utf8' });
+        if (result.status === 0) {
+          log(`SURVIVED ${invariant} (${file})`);
+          survivors += 1;
+        } else {
+          const failed = (/# fail (\d+)/.exec(result.stdout ?? '') ?? [])[1];
+          log(`killed   ${invariant} — ${failed} test(s) failed`);
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+    log(`\n${mutations.length - survivors}/${mutations.length} mutations killed.`);
+    return survivors === 0 ? 0 : 1;
+  } finally {
+    rmSync(pristine, { recursive: true, force: true });
+  }
+}
+
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  process.exitCode = runMutationCheck();
+}
