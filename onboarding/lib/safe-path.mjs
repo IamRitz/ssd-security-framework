@@ -55,7 +55,7 @@
 // is outside the model.
 import { constants as FS } from 'node:fs';
 import { lstat, mkdir, open, realpath, rm } from 'node:fs/promises';
-import { isAbsolute, join, normalize, relative, resolve } from 'node:path';
+import { isAbsolute, join, normalize, relative, resolve, sep } from 'node:path';
 
 export class PathConfinementError extends Error {
   constructor(message) {
@@ -91,12 +91,17 @@ function components(relativePath) {
 
 // True when `child` is `root` itself or lies beneath it, compared on already
 // canonical (realpath'd) absolute paths.
+//
+// Only an ACTUAL parent traversal disqualifies a child. A leading '..' in the
+// relative path is not enough: `relative(root, root + '/..cache')` is
+// '..cache', a perfectly ordinary name for a directory inside the repository.
+// The traversal cases are exactly '..' itself and anything under `..<sep>`.
 function within(root, child) {
   if (child === root) {
     return true;
   }
   const rel = relative(root, child);
-  return rel !== '' && !rel.startsWith('..') && !isAbsolute(rel);
+  return rel !== '' && rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
 }
 
 async function canonicalRoot(root, relativePath) {

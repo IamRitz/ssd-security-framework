@@ -11,7 +11,7 @@
 // and removed when that test finishes, so the suite is safe to run concurrently
 // and makes no assumption about a shared /tmp layout.
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
@@ -112,6 +112,41 @@ describe('safe-path: repository-relative paths', () => {
     const { root } = sandbox(t);
     assert.match(await refused(() => safeWriteFile(root, '', 'x')), /a repository-relative path is required$/);
     assert.match(await refused(() => safeWriteFile(root, '.', 'x')), /a repository-relative path is required$/);
+  });
+
+  // A name that merely BEGINS with '..' is an ordinary name, not a traversal:
+  // relative(root, root + '/..cache') is '..cache'. Rejecting it would refuse
+  // legitimate in-repo paths (see within() in safe-path.mjs).
+  it("a path component that starts with '..' but does not traverse is inside the root", async (t) => {
+    const { root, outside } = sandbox(t);
+    await safeWriteFile(root, '..cache/file.json', '{}\n');
+    assert.equal(readFileSync(join(root, '..cache/file.json'), 'utf8'), '{}\n');
+
+    await safeWriteFile(root, '..generated', 'x\n');
+    assert.equal(readFileSync(join(root, '..generated'), 'utf8'), 'x\n');
+
+    // Deeper, and with the odd name as a non-first component.
+    await safeWriteFile(root, 'a/..b/...c/d.txt', 'y\n');
+    assert.equal(readFileSync(join(root, 'a/..b/...c/d.txt'), 'utf8'), 'y\n');
+
+    // The existing-ancestor walk agrees once these really exist on disk.
+    assert.equal(await assertSafeRepoPath(root, '..cache/file.json'), join(root, '..cache/file.json'));
+    assert.equal(await assertSafeRepoPath(root, '..generated'), join(root, '..generated'));
+
+    await safeRemove(root, '..cache', { recursive: true });
+    assert.ok(!existsSync(join(root, '..cache')));
+    assert.deepEqual(readdirSync(outside), [], 'nothing was written outside the repository');
+  });
+
+  it("a real '..' traversal is still rejected alongside the '..'-prefixed names", async (t) => {
+    const { root, outside } = sandbox(t);
+    writeFileSync(join(outside, 'victim.txt'), 'keep\n');
+    for (const path of ['../outside/victim.txt', '..', '../', 'a/../../outside/victim.txt', '..cache/../../outside/victim.txt']) {
+      const message = await refused(() => safeWriteFile(root, path, 'attacker\n'));
+      assert.match(message, /the path escapes the repository root$|a repository-relative path is required$/, path);
+    }
+    assert.equal(readFileSync(join(outside, 'victim.txt'), 'utf8'), 'keep\n');
+    assert.deepEqual(readdirSync(outside), ['victim.txt']);
   });
 
   it('an unresolvable repository root is refused (fail closed)', async (t) => {
@@ -286,20 +321,36 @@ describe('ssd-onboard write paths are confined', () => {
     assert.ok(!readFileSync(smuggled, 'utf8').includes('p/secrets'), 'the outside file is unchanged');
   });
 
-  it('applyWrites refuses a symlinked leaf and leaves no partial write', async (t) => {
+  // applyWrites is sequential and has no rollback: an entry written before the
+  // refusal stays written. That is existing, deliberate behaviour and is not
+  // what this test is about. The invariant here is narrower and is the security
+  // one: the symbolic link is not followed, so the file OUTSIDE the repository
+  // is neither written to nor replaced.
+  it('applyWrites refuses a symlinked leaf and does not modify the symlink target', async (t) => {
     const root = makeRepo(t, PY_REPO);
     const outside = outsideOf(t);
     const victim = join(outside, 'target.yml');
     const original = withMarker('name: original\n');
     writeFileSync(victim, original);
+    const victimStat = lstatSync(victim);
     symlinkSync(victim, join(root, 'generated.yml'));
     const plan = await planWrites(root, [
       { path: 'clean.yml', kind: 'workflow', content: withMarker('name: clean\n') },
       { path: 'generated.yml', kind: 'workflow', content: withMarker('name: attacker\n') }
     ]);
     assert.deepEqual(plan.map((e) => e.action), ['create', 'update'], 'the symlinked leaf looks like a routine update');
-    await assert.rejects(() => applyWrites(root, plan), /'generated\.yml' is a symbolic link/);
+
+    await assert.rejects(() => applyWrites(root, plan), (error) => {
+      assert.equal(error.name, 'PathConfinementError');
+      assert.match(error.message, /'generated\.yml' is a symbolic link/);
+      return true;
+    });
+
+    const after = lstatSync(victim);
     assert.equal(readFileSync(victim, 'utf8'), original, 'the outside file is unchanged');
+    assert.equal(after.ino, victimStat.ino, 'the outside file was not replaced');
+    assert.equal(after.mtimeMs, victimStat.mtimeMs, 'the outside file was not rewritten');
+    assert.ok(lstatSync(join(root, 'generated.yml')).isSymbolicLink(), 'the link was not followed or replaced');
   });
 
   it('prune removal refuses a stale path whose ancestor is a symlink', async (t) => {
