@@ -396,6 +396,9 @@ describe('the baseline state machine', () => {
     assert.ok(!existsSync(join(root, 'security/baseline/semgrep-baseline.json')), 'prepare never writes the baseline');
     assert.match((await cli(root, ['baseline', 'status'])).out, /candidate-downloaded/);
 
+    const lifecycle = () => parseYaml(read(root, '.github/workflows/security.yml')).jobs['source-security'].with.semgrep_baseline_state;
+    assert.equal(lifecycle(), 'absent', 'before accept, the runtime is told no baseline exists yet');
+
     const wrongCount = await cli(root, ['baseline', 'accept'], { prompter: scriptedPrompter({ confirmFindings: '3' }) });
     assert.equal(wrongCount.code, 1, 'a mistyped count accepts nothing');
     assert.ok(!existsSync(join(root, 'security/baseline/semgrep-baseline.json')));
@@ -411,6 +414,7 @@ describe('the baseline state machine', () => {
     assert.match(afterAccept.semgrep.baseline.acceptedScope, /^[0-9a-f]{64}$/);
     assert.equal(afterAccept.rollout.gateMode, 'log-only', 'accepting a baseline does not silently enforce');
     assert.ok(!('workflow_dispatch' in parseYaml(read(root, '.github/workflows/security.yml')).on), 'the bootstrap input is removed once accepted');
+    assert.equal(lifecycle(), 'accepted', 'after accept, the re-rendered caller makes a missing baseline fail closed');
     assert.equal((await cli(root, ['render', '--check'])).code, 0);
 
     // No answer at all must mean "no": there is no yes-default.

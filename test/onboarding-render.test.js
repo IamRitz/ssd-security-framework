@@ -570,6 +570,31 @@ describe('baseline bootstrap in the generated workflow', () => {
     }
   });
 
+  // The runtime cannot tell "not accepted yet" from "deleted" by looking at the
+  // file, so the caller declares which one it is, from the reviewed config.
+  it('the caller declares the baseline lifecycle: absent while onboarding', () => {
+    for (const profile of PROFILES) {
+      assert.equal(security(profile).jobs['source-security'].with.semgrep_baseline_state, 'absent', profile);
+    }
+  });
+
+  it('the caller declares the baseline lifecycle: accepted once a baseline is accepted, in every phase', () => {
+    for (const profile of PROFILES) {
+      for (const overrides of [{ semgrep: { baseline: { state: 'accepted' } } }, ENFORCING]) {
+        assert.equal(security(profile, overrides).jobs['source-security'].with.semgrep_baseline_state, 'accepted', profile);
+      }
+    }
+    assert.equal(delivery().jobs['source-security'].with.semgrep_baseline_state, 'accepted');
+  });
+
+  it('detects a pinned ref that predates semgrep_baseline_state (the caller would fail to start)', async () => {
+    const rendered = renderAll(config('source-only'));
+    const legacy = async (file) => (await readWorkingTreeWorkflow(file))?.replace(/\n      semgrep_baseline_state:\n(?: {8}.*\n)+/, '\n') ?? null;
+    assert.ok(!('semgrep_baseline_state' in parseYaml(await legacy('_source-scan.yml')).on.workflow_call.inputs));
+    const { problems } = await contractProblems(rendered, config('source-only'), legacy);
+    assert.ok(problems.some((p) => /input 'semgrep_baseline_state'.*would fail to start/.test(p)), problems.join('\n'));
+  });
+
   it('the gate mode is a literal from the config, never a repository variable', () => {
     for (const { label, text } of everyWorkflow()) {
       assert.ok(!/gate_mode: \$\{\{/.test(text), label);

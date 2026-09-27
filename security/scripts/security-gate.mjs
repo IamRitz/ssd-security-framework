@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -199,54 +199,115 @@ async function readOptionalJson(path, label) {
   return readJson(path, label);
 }
 
-// THE BASELINE BOOTSTRAP, and why it is an explicit mode rather than a fallback.
+// THE BASELINE LIFECYCLE, and why "absent" is declared rather than inferred.
 //
-// A brand-new repository has no Semgrep baseline. In normal operation a missing
-// baseline is a report-integrity BLOCK (`integrity.trusted: false`), and
-// generate-semgrep-baseline.mjs correctly refuses to baseline from an untrusted
-// run — so a new repo could never produce its first baseline. That is the
-// bootstrap deadlock.
+// A brand-new repository has no Semgrep baseline. Two situations look identical
+// from the filesystem:
 //
-// The fix must NOT be "a missing baseline is fine", because two situations look
-// identical from the filesystem:
-//
-//   A. a first onboarding, where no baseline exists yet, and
+//   A. an onboarding repository, where no baseline has been accepted yet, and
 //   B. an onboarded repository whose baseline was deleted or lost.
 //
 // B must keep failing closed — otherwise deleting a file silently re-accepts
 // every finding it used to gate. Nothing observable distinguishes A from B, so
-// the discriminator is OPERATOR INTENT: bootstrap is requested explicitly, is
-// visible in the workflow run, and refuses to touch a repo that already has a
-// baseline.
+// the discriminator is a DECLARATION from the consumer's reviewed config
+// (`semgrep.baseline.state`, rendered into the caller as `semgrep_baseline_state`):
 //
-// Scanner integrity is unaffected: evaluateSemgrep still schema-validates the
-// report and still rejects one carrying scan errors, so a malformed, errored or
-// missing Semgrep report produces `trusted: false` in bootstrap exactly as it
-// does normally, and the generator still refuses.
-async function readBaseline(path, bootstrap) {
-  if (!bootstrap) {
-    return readJson(path, 'Semgrep baseline');
-  }
+//   absent       no baseline has been accepted yet. The file must NOT exist; SAST
+//                is evaluated against an empty accepted set, so every finding is
+//                new — nothing is waved through, it is simply not yet accepted.
+//                A file that exists anyway is an inconsistent lifecycle and fails
+//                closed rather than being silently used.
+//   accepted     the file must exist and be valid; missing or malformed is a
+//                report-integrity BLOCK. Bootstrap is refused.
+//   unspecified  a caller that predates the declaration. Exactly the legacy
+//                contract: missing is a report-integrity BLOCK unless this run
+//                is an explicit bootstrap.
+//
+// "absent" is NOT bootstrap. Absent says what the repository's state is;
+// bootstrap says this particular run is authorized to produce a candidate
+// baseline (a dispatched, full-tree, log-only run). An absent-state pull request
+// is trusted but produces no candidate: provenance still requires
+// `bootstrap.active`.
+//
+// Scanner integrity is unaffected in every state: evaluateSemgrep still
+// schema-validates the report and still rejects one carrying scan errors, so a
+// malformed, errored or missing Semgrep report produces `trusted: false` exactly
+// as it does normally, and the generator still refuses.
+export const BASELINE_STATES = ['absent', 'accepted'];
 
-  try {
-    await readFile(path, 'utf8');
-  } catch (error) {
-    if (error.code === 'ENOENT') {
-      // Case A: the expected state for a first onboarding. An empty accepted
-      // set means every finding is reported as new/unbaselined — nothing is
-      // waved through, it is simply not yet accepted.
-      return { schemaVersion: 1, findings: [], bootstrap: true };
-    }
-    throw new Error(`Semgrep baseline: cannot read ${path}: ${error.message}`, { cause: error });
+// Resolved INSIDE the gate's try: an unknown value is a report-integrity BLOCK
+// attributed to the source gate, so the run still writes a structured,
+// untrusted result that names the bad value. Unlike an unsupported synthetic
+// fixture (resolved outside, see below), nothing about an untrusted BLOCK can be
+// misread as permissive — and the result is what the notifier, the
+// untrusted-scan flag and the uploaded evidence explain the failure from.
+export function baselineLifecycle(state) {
+  if (state === undefined || state === null || state === '') {
+    return 'unspecified';
   }
+  assert(
+    BASELINE_STATES.includes(state),
+    `unsupported Semgrep baseline state '${state}'; expected one of ${BASELINE_STATES.join(', ')}`
+  );
+  return state;
+}
 
-  // Case B, or a second bootstrap of an already-onboarded repo. Refuse: this
-  // mode exists to create a FIRST baseline, never to silently replace one.
-  throw new Error(
+const EMPTY_ACCEPTED_SET = () => ({ schemaVersion: 1, findings: [] });
+
+function bootstrapRefusedExisting(path) {
+  return new Error(
     `bootstrap refused: a Semgrep baseline already exists at ${path}. Baseline bootstrap is for ` +
       'first onboarding only. A repository whose baseline has disappeared must restore it, not ' +
       're-accept its current findings.'
   );
+}
+
+async function readBaseline(path, { bootstrap, lifecycle }) {
+  if (lifecycle === 'accepted' && bootstrap) {
+    throw new Error(
+      "bootstrap refused: semgrep baseline state is 'accepted'. Baseline bootstrap is for first " +
+        'onboarding only and a candidate can never replace an accepted baseline.'
+    );
+  }
+
+  if (lifecycle === 'absent') {
+    // lstat, not readFile: ANY entry at the path — a file, a directory, a
+    // dangling symbolic link — contradicts the declaration.
+    try {
+      await lstat(path);
+    } catch (error) {
+      if (error.code === 'ENOENT') {
+        return EMPTY_ACCEPTED_SET();
+      }
+      throw new Error(`Semgrep baseline: cannot read ${path}: ${error.message}`, { cause: error });
+    }
+    if (bootstrap) {
+      throw bootstrapRefusedExisting(path);
+    }
+    throw new Error(
+      `Semgrep baseline: inconsistent lifecycle: semgrep baseline state is 'absent' but ${path} ` +
+        "exists. If it is this repository's reviewed baseline, declare state 'accepted'; if not, " +
+        'remove it in a reviewed pull request. It is not used while the state says absent.'
+    );
+  }
+
+  if (!bootstrap) {
+    return readJson(path, 'Semgrep baseline');
+  }
+
+  // Legacy (unspecified) bootstrap: unchanged.
+  try {
+    await readFile(path, 'utf8');
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      return EMPTY_ACCEPTED_SET();
+    }
+    throw new Error(`Semgrep baseline: cannot read ${path}: ${error.message}`, { cause: error });
+  }
+
+  // A second bootstrap of an already-onboarded repo. Refuse: this mode exists to
+  // create a FIRST baseline, never to silently replace one.
+  throw bootstrapRefusedExisting(path);
 }
 
 function normalizeSeverity(value) {
@@ -947,13 +1008,22 @@ async function writeResults(paths, result) {
 }
 
 export async function runSecurityGate(options = {}) {
-  const { bootstrap = false, syntheticFixture = null, provenance = null, ...customPaths } = options;
+  const {
+    bootstrap = false,
+    baselineState = null,
+    syntheticFixture = null,
+    provenance = null,
+    ...customPaths
+  } = options;
   const paths = { ...DEFAULT_PATHS, ...customPaths };
   let result;
   // Resolved OUTSIDE the try: an unsupported fixture name is a caller error that
   // must fail the run, never be folded into a report-integrity BLOCK that a
   // reader could mistake for "not synthetic".
   const synthetic = syntheticState(syntheticFixture);
+  // Set by the first statement of the try; still undefined in the catch only
+  // when the declared state itself was unsupported.
+  let lifecycle;
   // Read BEFORE any report and outside the try: execution evidence must be
   // present on a report-integrity result — that is exactly when it explains
   // something — and reading it never throws, so it cannot create or clear an
@@ -964,6 +1034,7 @@ export async function runSecurityGate(options = {}) {
   };
 
   try {
+    lifecycle = await attributed('source-gate', async () => baselineLifecycle(baselineState));
     const policy = await attributed('source-gate', async () => {
       const parsed = parseSimplePolicy(await readFile(paths.policy, 'utf8'));
       validatePolicy(parsed);
@@ -981,7 +1052,7 @@ export async function runSecurityGate(options = {}) {
       attributed('secret-scan', () => readJson(paths.trufflehog, 'TruffleHog')),
       attributed('dependency-scan', () => readJson(paths.osv, 'OSV-Scanner')),
       attributed('sast', () => readJson(paths.semgrep, 'Semgrep')),
-      attributed('source-gate', () => readBaseline(paths.baseline, bootstrap)),
+      attributed('source-gate', () => readBaseline(paths.baseline, { bootstrap, lifecycle })),
       attributed('dependency-scan', () =>
         ecosystems.packageLock
           ? readJson(paths.npmAudit, 'npm audit')
@@ -1027,6 +1098,10 @@ export async function runSecurityGate(options = {}) {
       summary,
       integrity: summarizeIntegrity(findings),
       bootstrap: bootstrapState(bootstrap),
+      // The declared baseline lifecycle and the size of the accepted set SAST was
+      // evaluated against (additive), so an `absent`-state run is auditable: it
+      // was trusted because nothing was accepted yet, not because a check was off.
+      semgrepBaseline: { state: lifecycle, acceptedFindings: baseline.findings.length },
       findings,
       // Developer-facing grouping of `findings` (additive). `summary` above stays
       // the raw per-record count; `correlation.summary` counts unique issues.
@@ -1059,6 +1134,10 @@ export async function runSecurityGate(options = {}) {
       summary: { block: 1, exception: 0, log: 0 },
       integrity: summarizeIntegrity([finding]),
       bootstrap: bootstrapState(bootstrap),
+      semgrepBaseline:
+        lifecycle === undefined
+          ? { state: 'invalid', declared: String(baselineState) }
+          : { state: lifecycle },
       findings: [finding],
       correlation: correlationRecord([finding]),
       scannerExecution,
@@ -1088,7 +1167,8 @@ function parseArguments(arguments_) {
     '--baseline': 'baseline',
     '--output': 'output',
     '--exceptions': 'exceptions',
-    '--synthetic-fixture': 'syntheticFixture'
+    '--synthetic-fixture': 'syntheticFixture',
+    '--baseline-state': 'baselineState'
   };
   const options = {};
 

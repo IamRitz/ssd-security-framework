@@ -555,6 +555,27 @@ describe('baseline bootstrap is explicit and refuses to run unverified', () => {
     );
   });
 
+  it('declares the baseline lifecycle as an optional input whose default keeps the legacy contract', () => {
+    for (const file of ['_source-security.yml', '_source-scan.yml']) {
+      const input = workflowCall(file).inputs.semgrep_baseline_state;
+      assert.ok(input, `${file} must declare semgrep_baseline_state`);
+      assert.equal(input.type, 'string', file);
+      assert.equal(input.default, '', `${file}: an omitted state must mean "unspecified", never absent`);
+      assert.notEqual(input.required, true, `${file}: a v1 caller that omits it must still start`);
+    }
+  });
+
+  it('passes the lifecycle to the gate only when declared, and never lets it imply bootstrap', () => {
+    assert.match(source, /BASELINE_STATE: \$\{\{ inputs\.semgrep_baseline_state \}\}/);
+    assert.match(
+      source,
+      /if \[ -n "\$BASELINE_STATE" \]; then[\s\S]*?args\+=\(--baseline-state "\$BASELINE_STATE"\)/,
+      'an empty state must reach the gate as no flag at all'
+    );
+    // Candidate generation stays keyed to bootstrap_baseline alone.
+    assert.doesNotMatch(source, /if: \$\{\{[^}]*semgrep_baseline_state/);
+  });
+
   it('generates the candidate only from a trusted run', () => {
     assert.match(
       source,

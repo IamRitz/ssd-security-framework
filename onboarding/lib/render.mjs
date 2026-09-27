@@ -94,6 +94,15 @@ function sourceSecurityJob(config, { phase }) {
   block(lines, 8, config.semgrep.rulesets.join('\n'));
   lines.push(`      semgrep_paths: ${q(config.semgrep.roots.join(' '))}`);
   lines.push(`      semgrep_baseline_path: ${q(config.semgrep.baseline.path)}`);
+  block(
+    lines,
+    6,
+    [
+      '# The declared lifecycle, never inferred from the file: `absent` expects no file and',
+      '# evaluates against an empty accepted set; `accepted` fails closed without one.',
+      `semgrep_baseline_state: ${config.semgrep.baseline.state}`
+    ].join('\n')
+  );
   const gitleaksConfig = config.gitleaks.mode === 'default' ? '' : config.gitleaks.path;
   block(
     lines,
