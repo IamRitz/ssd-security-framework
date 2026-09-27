@@ -61,6 +61,23 @@ node "$GATE" --policy "$POLICY" --baseline "$BASELINE" >/dev/null 2>&1 || true
 [ "$(field "$RPT/security-gate.json" verdict)" = "BLOCK" ] || fail "expected BLOCK"
 [ "$(field "$RPT/security-gate.json" integrity.trusted)" = "false" ] || fail "expected untrusted"
 pass "missing baseline is a report-integrity BLOCK (case B stays closed)"
+node "$GATE" --policy "$POLICY" --baseline "$BASELINE" --baseline-state accepted >/dev/null 2>&1 || true
+[ "$(field "$RPT/security-gate.json" integrity.trusted)" = "false" ] || fail "accepted + missing must be untrusted"
+pass "declared 'accepted' + missing baseline is a report-integrity BLOCK"
+
+echo "-- 1a'. the SAME state DECLARED absent (an onboarding PR) is trusted, with no bootstrap"
+node "$GATE" --policy "$POLICY" --baseline "$BASELINE" --baseline-state absent >/dev/null 2>&1 || true
+[ "$(field "$RPT/security-gate.json" integrity.trusted)" = "true" ] || fail "absent-state run not trusted"
+[ "$(field "$RPT/security-gate.json" bootstrap.active)" = "false" ] || fail "absent must not imply bootstrap"
+[ "$(field "$RPT/security-gate.json" semgrepBaseline.acceptedFindings)" = "0" ] || fail "expected an empty accepted set"
+if node "$GEN" --report reports/semgrep.json --gate reports/security-gate.json --rulesets "$RULESETS" \
+     --output reports/semgrep-baseline.candidate.json >/dev/null 2>&1 &&
+   node "$TOOLKIT/security/scripts/baseline-provenance.mjs" --candidate reports/semgrep-baseline.candidate.json \
+     --gate reports/security-gate.json --semgrepignore .semgrepignore --output reports/p.json >/dev/null 2>&1; then
+  fail "a non-bootstrap absent-state run must not yield a provenance-bound candidate"
+fi
+rm -f reports/semgrep-baseline.candidate.json reports/p.json
+pass "absent-state run is trusted against an empty accepted set, and yields no candidate"
 
 echo "-- 1b. the SAME state WITH bootstrap is trusted and auditable"
 node "$GATE" --policy "$POLICY" --baseline "$BASELINE" --bootstrap >/dev/null 2>&1 || true

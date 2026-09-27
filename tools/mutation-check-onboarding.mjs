@@ -21,7 +21,8 @@ const TESTS = [
   'test/onboarding-cli.test.js',
   'test/onboarding-path-confinement.test.js',
   'test/baseline-provenance.test.js',
-  'test/framework-contracts.test.js'
+  'test/framework-contracts.test.js',
+  'test/baseline-lifecycle.test.js'
 ];
 
 // [invariant, file, search, replace]
@@ -79,6 +80,13 @@ const MUTATIONS = [
   ['contract problems block generation', 'onboarding/lib/analyze.mjs', "contract.problems.forEach((message) => errors.push({ area: 'framework', message }));", ''],
   ["an absent owner-managed .semgrepignore is an error", 'onboarding/lib/analyze.mjs', "    ignorePatterns = null;\n    errors.push({", "    ignorePatterns = null;\n    warnings.push({"],
   ['bootstrap is refused on a diff-aware scan', '.github/workflows/_source-security.yml', "(github.event_name == 'pull_request' || github.event_name == 'push')", "(github.event_name == 'never')"],
+  ['baseline state absent is not treated as accepted', 'security/scripts/security-gate.mjs', "  if (lifecycle === 'absent') {", '  if (false) {'],
+  ['an accepted baseline that is missing still fails closed', 'security/scripts/security-gate.mjs', "  if (lifecycle === 'absent') {", "  if (lifecycle === 'absent' || lifecycle === 'accepted') {"],
+  ['a caller that declares no baseline state stays fail-closed', 'security/scripts/security-gate.mjs', "    return 'unspecified';", "    return 'absent';"],
+  ['state absent refuses a baseline that exists anyway', 'security/scripts/security-gate.mjs', '    throw new Error(\n      `Semgrep baseline: inconsistent lifecycle', "    return readJson(path, 'Semgrep baseline');\n    throw new Error(\n      `Semgrep baseline: inconsistent lifecycle"],
+  ['an unsupported baseline state is a written report-integrity BLOCK', 'security/scripts/security-gate.mjs', "  } catch (error) {\n    const finding = {\n      source: 'security-gate',", "  } catch (error) {\n    if (lifecycle === undefined) throw error;\n    const finding = {\n      source: 'security-gate',"],
+  ['the workflow hands the declared baseline state to the gate', '.github/workflows/_source-security.yml', 'args+=(--baseline-state "$BASELINE_STATE")', ':'],
+  ['the generated caller declares the configured baseline state', 'onboarding/lib/render.mjs', 'semgrep_baseline_state: ${config.semgrep.baseline.state}', 'semgrep_baseline_state: absent'],
   ['the image notifier reads the webhook secret', '.github/workflows/_image-scan-prepush.yml', 'secrets.slack_notify_webhook || inputs.slack_notify_url', 'inputs.slack_notify_url']
 ];
 

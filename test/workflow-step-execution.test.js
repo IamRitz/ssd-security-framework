@@ -18,6 +18,8 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { after, describe, it } from 'node:test';
 
+import { stepScript as workflowStepScript } from './support/workflow-steps.mjs';
+
 const FRAMEWORK = resolve('.');
 const LIVE = join(FRAMEWORK, 'security/scripts/__fixtures__/live-python-source-only');
 const PIP_FIXTURES = join(FRAMEWORK, 'security/scripts/__fixtures__/pip-audit');
@@ -26,37 +28,7 @@ const OSV_CLEAN = join(FRAMEWORK, 'security/scripts/__fixtures__/clean/osv-scann
 const WORK = mkdtempSync(join(tmpdir(), 'workflow-step-execution-'));
 after(() => rmSync(WORK, { recursive: true, force: true }));
 
-// The `run:` body of the step named `name` in `file`, dedented.
-function stepScript(file, name) {
-  const source = readFileSync(join(FRAMEWORK, file), 'utf8');
-  const start = source.indexOf(`- name: ${name}\n`);
-  assert.ok(start >= 0, `${file}: step "${name}" not found`);
-  const stepIndent = source.lastIndexOf('\n', start) + 1;
-  const indent = start - stepIndent;
-  const lines = source.slice(start).split('\n').slice(1);
-  const body = [];
-  let runIndent = null;
-  for (const line of lines) {
-    if (runIndent === null) {
-      // Stop at the next step or the end of the job.
-      if (line.trim() !== '' && line.length - line.trimStart().length <= indent) {
-        break;
-      }
-      const match = /^(\s*)run: \|\s*$/.exec(line);
-      if (match) {
-        runIndent = match[1].length;
-      }
-      continue;
-    }
-    if (line.trim() !== '' && line.length - line.trimStart().length <= runIndent) {
-      break;
-    }
-    body.push(line);
-  }
-  assert.ok(body.length > 0, `${file}: step "${name}" has no multi-line run script`);
-  const dedent = Math.min(...body.filter((line) => line.trim() !== '').map((line) => line.length - line.trimStart().length));
-  return body.map((line) => line.slice(dedent)).join('\n');
-}
+const stepScript = (file, name) => workflowStepScript(join(FRAMEWORK, file), name);
 
 function runStep(file, name, env = {}, { cwd = WORK, path } = {}) {
   const script = stepScript(file, name);

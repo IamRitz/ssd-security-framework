@@ -148,6 +148,25 @@ that is visible in the workflow run and in the gate result
 If you genuinely need to rebuild a baseline, delete the old one in a reviewed
 pull request — where a CODEOWNER can see it (§1.4) — and then bootstrap.
 
+#### Pull requests before the first baseline: `semgrep_baseline_state`
+
+Bootstrap is one dispatched run. The pull requests and scheduled runs around it
+also have no baseline, and without more information the gate cannot tell them
+from case **B** either. So a caller **declares** the lifecycle, from the
+reviewed `semgrep.baseline.state` in `.ssd/onboarding.yml` (ssd-onboard renders
+it; it is never inferred from the file):
+
+| `semgrep_baseline_state` | Baseline file | Result |
+| --- | --- | --- |
+| `absent` | missing | trusted; SAST evaluated against an empty accepted set, every finding `new` (log-only reports a real BLOCK without enforcing it); **no candidate** unless this run is also a `bootstrap_baseline` dispatch |
+| `absent` | present | BLOCK, untrusted: an inconsistent lifecycle. Declare `accepted` if it is the reviewed baseline, or remove it in a reviewed PR |
+| `accepted` | missing or malformed | BLOCK, untrusted, as always; bootstrap is refused |
+| empty (callers that predate the input) | missing | BLOCK, untrusted — the old contract, unchanged |
+
+The gate result records it as `semgrepBaseline: { state, acceptedFindings }`.
+`ssd-onboard baseline accept` switches the state to `accepted`, and the
+re-rendered caller then fails closed on a missing baseline.
+
 #### Generating locally instead
 
 The CI route above is the supported one, because it uses the same scanners and
