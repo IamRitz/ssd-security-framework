@@ -69,6 +69,22 @@ export function parseGithubSlug(url) {
   return match ? `${match[1]}/${match[2]}` : null;
 }
 
+// The exact host of a remote URL (https://, ssh://, git://, or scp-like
+// user@host:path), lowercased; null when it cannot be parsed. Unlike
+// parseGithubSlug this never matches a host that merely CONTAINS github.com.
+export function parseRemoteHost(url) {
+  const text = url?.trim() ?? '';
+  const scp = /^[^@/\s]+@([^:/\s]+):/.exec(text);
+  if (scp) {
+    return scp[1].toLowerCase();
+  }
+  try {
+    return new URL(text).hostname.toLowerCase() || null;
+  } catch {
+    return null;
+  }
+}
+
 export async function gitFacts(root) {
   const remote = await git(root, ['remote', 'get-url', 'origin']);
   const originHead = await git(root, ['symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD']);
@@ -76,6 +92,7 @@ export async function gitFacts(root) {
   return {
     isGit: (await git(root, ['rev-parse', '--is-inside-work-tree']))?.trim() === 'true',
     slug: parseGithubSlug(remote),
+    host: parseRemoteHost(remote),
     defaultBranch: originHead?.trim().replace(/^origin\//, '') || null,
     currentBranch: current?.trim() || null
   };

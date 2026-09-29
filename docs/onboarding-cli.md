@@ -51,6 +51,7 @@ new SHA, set `framework.ref` to it, `render`, and review the diff. Design:
 | `init` | `.ssd/onboarding.yml` | interactive: derives what it can prove, asks only owner decisions, shows the **effective Semgrep scope** before writing |
 | `init --non-interactive --from <partial.yml\|.json>` | `.ssd/onboarding.yml` | automation: a partial config merged over derived defaults; refuses to default an owner decision |
 | `validate [--json]` | nothing | config + repository + generated files; exit 1 on any blocking error **or drift** (CI-friendly) |
+| `doctor [--json]` | nothing | operational readiness: lifecycle stage, drift, governance gaps; exit 1 on any FAIL (§ Readiness: doctor) |
 | `render` / `update` | generated files | regenerate from the config; refuses conflicts |
 | `render --dry-run` | nothing | show every diff |
 | `render --check` | nothing | exit 1 if any generated file differs from a fresh render, or a stale one exists |
@@ -168,6 +169,53 @@ Python projects live below the root, root `yarn.lock` / `pnpm-lock.yaml` /
 Python project declared only in `pyproject.toml` / `setup.py` / `setup.cfg` /
 `Pipfile` without a lockfile. The fix for the first group is a framework
 change (architecture doc C.3); for the last, commit a lockfile.
+
+## Readiness: doctor
+
+`validate` answers *is the configuration valid?*; `doctor` answers *is this
+repository operationally ready to use the framework safely?* It is a read-only
+view of the **same** analysis `validate` and `render --check` decide from —
+it re-implements none of it — reported as one check per concern:
+
+| Check | FAIL when | Otherwise |
+| --- | --- | --- |
+| Configuration | the config does not validate (then no other check is claimed) | WARN for config warnings |
+| Repository identity | origin or origin/HEAD contradicts the config | WARN: identity not established (non-git, no GitHub origin, no origin/HEAD) |
+| Framework pin | the CLI checkout is not a clean checkout of `framework.repository` at `framework.ref` | |
+| Workflow contract | a generated call disagrees with the pinned reusable workflow | NOT VERIFIED while the pin fails |
+| Generated workflow | `render --check` would fail (drift, conflict, stale file) | |
+| Semgrep baseline | the lifecycle is inconsistent (e.g. `accepted` with no file) | WARN while onboarding (`absent`, a valid state) |
+| Gate mode | | WARN in `log-only` |
+| Bootstrap wiring | | NOT VERIFIED while the workflow is not the verified render |
+| Source workflow OIDC boundary | the pinned contract rejects a `source-security` job, or a drifted workflow grants `id-token: write` / passes `secrets: inherit` there | NOT VERIFIED while unproven |
+| Semgrep / secret scanning / dependency coverage / container | the corresponding `validate` errors | WARN for its warnings |
+| CODEOWNERS coverage | | WARN on a missing file or path; otherwise **NOT VERIFIED** |
+| GitHub merge governance | | always **NOT VERIFIED** |
+| AWS delivery prerequisites (ECR profile), Slack secret (if enabled) | | always **NOT VERIFIED** |
+
+Every `validate` error appears as a FAIL of some check (an unknown one in
+"Other validation problems"), and doctor adds no FAIL of its own. **NOT
+VERIFIED** means *cannot be proven from this checkout*, not *passed*: doctor
+makes no GitHub or AWS calls, and a job named `security-gate` in a workflow
+says nothing about whether the default branch **requires** it. The CODEOWNERS
+matcher is a local heuristic (it can over-claim for `/*` and ownerless rules),
+so doctor never reports that coverage as PASS.
+
+Exit codes: `0` no FAIL (WARN and NOT VERIFIED do not fail — they are normal
+during rollout); `1` one or more FAILs, or a config/repository state that
+prevents a diagnosis (missing or malformed config), as for every other
+command; `2` a command-line usage error.
+
+With `--json`, a diagnosis that cannot be built (exit 1) is still one JSON
+document: `{"schemaVersion": 1, "command": "doctor", "outcome": "ERROR",
+"error": {"kind": "config-missing" | "config-malformed" | "runtime",
+"message": …}}`. Usage errors are rejected by the shared argument parser
+before doctor runs, so they stay plain text on stderr (exit 2).
+
+Remediation links to GitHub settings are shown only when origin is exactly
+`github.com` and names `repository.slug`; for any other host (GitHub
+Enterprise included) doctor gives the host-neutral steps (*repository
+settings → Rules → Rulesets*) without a link.
 
 ## The rollout, end to end
 
