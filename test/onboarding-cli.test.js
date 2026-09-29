@@ -386,7 +386,11 @@ describe('the baseline state machine', () => {
   it('walks onboarding -> candidate -> accepted -> enforcing, explicitly at each step', async (t) => {
     const root = await onboardingRepo(t);
     assert.match((await cli(root, ['baseline', 'status'])).out, /Rollout state: onboarding/);
-    assert.match((await cli(root, ['baseline', 'prepare'])).out, /gh workflow run security\.yml --repo acme\/app --ref main -f bootstrap_baseline=true/);
+    const dispatch = (await cli(root, ['baseline', 'prepare'])).out;
+    assert.match(dispatch, /gh workflow run security\.yml --repo acme\/app --ref main -f bootstrap_baseline=true/);
+    // The UI alternative is a link, not "find the Actions tab".
+    assert.ok(dispatch.includes('https://github.com/acme/app/actions/workflows/security.yml'), dispatch);
+    assert.match(dispatch, /ssd-onboard baseline prepare --run <run-id>/);
 
     const { gh, calls } = fakeGh(root);
     const prepared = await cli(root, ['baseline', 'prepare', '--run', '4242'], { gh });
