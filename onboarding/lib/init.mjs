@@ -117,11 +117,13 @@ export async function buildConfig(partial, facts) {
 const nonEmpty = (value) => (value.trim() === '' ? 'required' : null);
 const splitList = (value) => value.split(/[\s,]+/).map((item) => item.trim()).filter(Boolean);
 
-export async function interview(prompter, facts, { cliRef = null } = {}) {
+// commandName labels the transcript only (`init` or `onboard`); the questions
+// and every decision are identical for both.
+export async function interview(prompter, facts, { cliRef = null, commandName = 'init' } = {}) {
   const partial = { repository: {}, framework: {}, semgrep: { ignore: {}, baseline: {} } };
   const say = (text) => prompter.say(text);
 
-  say('ssd-onboard init — answers are recorded in .ssd/onboarding.yml (non-secret).');
+  say(`ssd-onboard ${commandName} — answers are recorded in .ssd/onboarding.yml (non-secret).`);
   say('Only identifiers and decisions are asked for. Never paste a credential here.\n');
 
   partial.repository.slug = await prompter.ask({ id: 'slug', question: 'GitHub repository (owner/name)', default: facts.git.slug ?? '', validate: nonEmpty });
@@ -138,11 +140,16 @@ export async function interview(prompter, facts, { cliRef = null } = {}) {
     validate: nonEmpty
   });
 
-  const suggestedProfile = facts.dockerfiles.length > 0 ? 'container-self-managed' : 'source-only';
+  // The profile is the owner's decision, so it has NO default: an empty answer
+  // re-asks. A Dockerfile is not proof that this repository ships an image (it
+  // may be dev-only, test tooling or legacy), and a guessed profile is either an
+  // unscanned image or a pipeline built for a container that does not exist.
+  if (facts.dockerfiles.length > 0) {
+    say(`\nDockerfiles found: ${facts.dockerfiles.join(', ')}. That alone does not mean this repository ships an image.`);
+  }
   partial.profile = await prompter.choose({
     id: 'profile',
-    question: 'Profile',
-    default: suggestedProfile,
+    question: 'Profile (required: choose one explicitly)',
     choices: [
       { value: 'source-only', help: 'no container: source scanning only, no cloud access' },
       { value: 'container-self-managed', help: 'builds a container; scanned before it leaves CI; you deploy it' },

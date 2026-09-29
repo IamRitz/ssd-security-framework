@@ -55,9 +55,14 @@ The supported path is [`ssd-onboard`](docs/onboarding-cli.md), which generates
 and maintains the callers below from a reviewed `.ssd/onboarding.yml`:
 
 ```sh
-node <framework-checkout>/onboarding/cli.mjs init     # then: render, and open a PR
+node <framework-checkout>/onboarding/cli.mjs onboard  # guided: config + workflows, validated; then open a PR
 node <framework-checkout>/onboarding/cli.mjs doctor   # read-only readiness report
 ```
+
+`onboard` creates the initial **log-only** state for review: it does not accept
+a baseline, enable enforcement, or configure GitHub branch protection. Those
+stay explicit later steps. `init`, `render`, `validate` and `doctor` remain
+available as the low-level building blocks.
 
 By hand, the minimal caller is:
 

@@ -43,10 +43,62 @@ working tree. To move a consumer to a newer framework, check the CLI out at the
 new SHA, set `framework.ref` to it, `render`, and review the diff. Design:
 [onboarding-architecture.md § B.10](onboarding-architecture.md#b10-generator--framework-ref-binding-and-how-teams-obtain-the-cli).
 
+## First-time onboarding: `onboard`
+
+The recommended first step is one guided command:
+
+```sh
+node ssd-framework/onboarding/cli.mjs onboard --repo <consumer-repo>
+```
+
+`onboard` runs `init`'s interview (or reads `--non-interactive --from
+<partial.yml|.json>`, exactly as `init` does), then shows the complete plan: the
+effective coverage, the security model, and every file it would create, with a
+diff for any file it would adopt or overwrite. Only after an explicit **yes**
+(the default is no) does it write `.ssd/onboarding.yml` and the generated files,
+then re-reads the repository and requires `validate` and `render --check` to
+pass, and shows the `doctor` readiness report.
+
+**One command is not one step to production.** `onboard` creates the initial,
+reviewable integration state and nothing more:
+
+- it does **not** accept a Semgrep baseline (the state stays `absent`);
+- it does **not** enable enforcement (the gate stays `log-only`);
+- it does **not** configure GitHub branch protection, rulesets or CODEOWNERS,
+  contact AWS, commit, push, or open a pull request.
+
+A fresh repository therefore ends in the `onboarding` rollout state, where
+doctor reports WARN (baseline, gate mode) and NOT VERIFIED (GitHub governance)
+by design. The rest of the rollout (below) stays explicit, one reviewed step at
+a time.
+
+`onboard` is **stricter than `init`** about writing: if anything would block
+generation (a missing owner decision, a schema error, an unbound or dirty
+framework checkout, a repository identity that is not the origin, an
+unsupported dependency layout, a conflicting file) it writes **nothing**. Every
+target path is proven confined before the first write. An existing
+human-written or hand-edited file is a CONFLICT unless you name exactly that
+path with `--adopt <path>` or `--force <path>`; nothing is adopted or forced
+automatically. If `.ssd/onboarding.yml` already exists, `onboard` exits 1 and
+points to `validate`, `doctor` and `render`; reinitializing is the deliberate
+`init --overwrite`. The profile is always an explicit choice: a Dockerfile is
+not taken as proof that the repository ships an image.
+
+If a write fails part-way (a genuine I/O error), `onboard` exits 1, lists
+exactly the files it wrote and the one that failed, and rolls nothing back;
+once the cause is fixed, `ssd-onboard render` completes the generated files.
+
+Exit codes: `0` onboarding written and validated (WARN / NOT VERIFIED allowed),
+`1` refused, declined or failed, `2` command-line usage error.
+
 ## Commands
+
+The low-level commands below remain the building blocks `onboard` composes, and
+the tools for everything after first onboarding.
 
 | Command | Writes | Purpose |
 | --- | --- | --- |
+| `onboard [--non-interactive --from <file>] [--adopt <path>]… [--force <path>]…` | config + generated files | **recommended first step**: init + render + validate + doctor, writing only a state that validates, after confirmation (above) |
 | `inspect [--json]` | nothing | languages, manifests and their real coverage, Dockerfiles, existing workflows and scanner configs; with a config, the full report |
 | `init` | `.ssd/onboarding.yml` | interactive: derives what it can prove, asks only owner decisions, shows the **effective Semgrep scope** before writing |
 | `init --non-interactive --from <partial.yml\|.json>` | `.ssd/onboarding.yml` | automation: a partial config merged over derived defaults; refuses to default an owner decision |
@@ -220,6 +272,7 @@ settings → Rules → Rulesets*) without a link.
 ## The rollout, end to end
 
 ```
+onboard                   (= init + render + validate + doctor)
 init                      gate log-only, scope '.', baseline absent
 render                    PR: security workflow with a bootstrap dispatch checkbox
                           (merge it)

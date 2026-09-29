@@ -163,7 +163,14 @@ export async function applyWrites(root, plan) {
     if (['create', 'update', 'forced', 'adopted'].includes(entry.action)) {
       // Confined: entry.path is rendered, but the checkout it lands in is not
       // trusted (see safe-path.mjs).
-      await safeWriteFile(root, entry.path, entry.content);
+      try {
+        await safeWriteFile(root, entry.path, entry.content);
+      } catch (error) {
+        // Nothing is rolled back; the caller reports exactly what landed.
+        error.written = [...written];
+        error.failedPath = entry.path;
+        throw error;
+      }
       written.push(entry.path);
     }
   }
