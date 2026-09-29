@@ -1062,10 +1062,13 @@ jobs:
         if: ${{ inputs.bootstrap_baseline && (github.event_name == 'pull_request' || github.event_name == 'push') }}
         env:
           EVENT_NAME: ${{ github.event_name }}
+          TOOLKIT_REPOSITORY: ${{ inputs.toolkit_repository }}
+          TOOLKIT_REF: ${{ inputs.toolkit_ref }}
         run: |
           echo "bootstrap_baseline refused on a '$EVENT_NAME' run: that SAST scan is diff-aware (--baseline-commit)" >&2
           echo "and would produce a baseline missing the existing backlog. Dispatch the workflow instead" >&2
-          echo "(workflow_dispatch runs a full-tree scan). See docs/onboarding.md § bootstrap." >&2
+          echo "(workflow_dispatch runs a full-tree scan). See docs/onboarding.md § bootstrap:" >&2
+          echo "${GITHUB_SERVER_URL}/${TOOLKIT_REPOSITORY}/blob/${TOOLKIT_REF}/docs/onboarding.md#11-bootstrap-the-first-semgrep-baseline" >&2
           exit 1
 
       - name: Evaluate security policy
@@ -1173,11 +1176,14 @@ jobs:
         # cannot accept findings from a scan that never really happened. The
         # generator re-checks the same flag itself; this condition only avoids
         # running it pointlessly.
+        #
+        # Guidance for the developer is written by a later step, after the upload,
+        # so it can link the artifact that actually carries the candidate.
+        id: bootstrap-candidate
         if: ${{ inputs.bootstrap_baseline && steps.verdict.outputs.integrity_trusted == 'true' }}
         env:
           SEMGREP_CONFIGS: ${{ inputs.semgrep_configs }}
           SEMGREP_PATHS: ${{ inputs.semgrep_paths }}
-          BASELINE_PATH: ${{ inputs.semgrep_baseline_path }}
           # Provenance: binds the candidate to exactly this scan (repository,
           # commit, ref, event, run, framework ref, Semgrep image/configs/paths,
           # .semgrepignore hash). ssd-onboard refuses a candidate whose
@@ -1207,18 +1213,6 @@ jobs:
             --gate reports/security-gate.json \
             --semgrepignore .semgrepignore \
             --output reports/semgrep-baseline.candidate.provenance.json
-          {
-            echo "## Semgrep baseline candidate generated"
-            echo
-            echo "Download the \`security-gate-results\` artifact, then commit the candidate as:"
-            echo
-            echo '```'
-            echo "$BASELINE_PATH"
-            echo '```'
-            echo
-            echo "Review it first — it is the set of findings this repository formally accepts."
-            echo "Then remove \`bootstrap_baseline\` from the caller and move to \`enforce\`."
-          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Fail a bootstrap run whose scans could not be trusted
         # Loud rather than silent. In log-only nothing else fails, so without this
@@ -1401,6 +1395,8 @@ jobs:
             || echo "::error title=Untrusted scan — do not baseline::the gate result could not be read"
 
       - name: Upload security gate decision
+        # `id` is read by the bootstrap guidance below (the `artifact-url` output).
+        id: gate-artifact
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -1416,6 +1412,69 @@ jobs:
             reports/DO-NOT-BASELINE.txt
           if-no-files-found: error
           retention-days: 14
+
+      - name: Explain the next baseline step (bootstrap only)
+        # Wording only: no trust decision rests on this step. It runs after the
+        # upload so it can link the artifact via upload-artifact's documented
+        # `artifact-url` output; when that is empty (the upload did not complete)
+        # it says so and links the run instead. Every URL here is built from
+        # GitHub's default environment or that output — never a token.
+        #
+        # The supported path is `ssd-onboard baseline prepare --run <id>`, then
+        # `baseline accept`: both verify the candidate's provenance against the
+        # run and the checkout. Copying the file by hand skips those checks, so
+        # this never suggests it.
+        if: ${{ always() && inputs.bootstrap_baseline && steps.bootstrap-candidate.outcome == 'success' }}
+        env:
+          ARTIFACT_URL: ${{ steps.gate-artifact.outputs.artifact-url }}
+          BASELINE_PATH: ${{ inputs.semgrep_baseline_path }}
+          # Empty for a caller that predates ssd-onboard (it renders this input).
+          BASELINE_STATE: ${{ inputs.semgrep_baseline_state }}
+          TOOLKIT_REPOSITORY: ${{ inputs.toolkit_repository }}
+          TOOLKIT_REF: ${{ inputs.toolkit_ref }}
+        run: |
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          docs_url="${GITHUB_SERVER_URL}/${TOOLKIT_REPOSITORY}/blob/${TOOLKIT_REF}/docs/onboarding-cli.md#from-a-hand-copied-example"
+          # A single https URL or nothing: an unexpected value is never rendered.
+          case "$ARTIFACT_URL" in
+            https://*[[:space:]]*|'') ARTIFACT_URL= ;;
+            https://*) ;;
+            *) ARTIFACT_URL= ;;
+          esac
+          {
+            echo "## Semgrep baseline candidate generated"
+            echo
+            echo "Bootstrap run:"
+            echo "$run_url"
+            echo
+            echo "Candidate evidence: the \`security-gate-results\` artifact of that run"
+            echo "(\`semgrep-baseline.candidate.json\` and \`semgrep-baseline.candidate.provenance.json\`)."
+            if [ -n "$ARTIFACT_URL" ]; then
+              echo "$ARTIFACT_URL"
+            else
+              echo
+              echo "**The artifact upload did not report an artifact.** Check the upload step in the run above;"
+              echo "\`baseline prepare\` needs that artifact, so re-run the bootstrap if it is missing."
+            fi
+            echo
+            echo "Next step, from this repository's checkout:"
+            echo
+            echo '```'
+            echo "ssd-onboard baseline prepare --run ${GITHUB_RUN_ID}"
+            echo '```'
+            echo
+            echo "\`baseline prepare\` downloads and verifies the candidate and its provenance. It does not accept it:"
+            echo "review the candidate before running \`ssd-onboard baseline accept\`, which writes \`$BASELINE_PATH\`."
+            echo "Do not copy the candidate into place by hand — that skips the provenance checks."
+            if [ -z "$BASELINE_STATE" ]; then
+              echo
+              echo "This caller does not pass \`semgrep_baseline_state\`, so it is not managed by ssd-onboard yet and"
+              echo "\`baseline prepare\` has no \`.ssd/onboarding.yml\` to verify against. Adopt it first:"
+              echo "$docs_url"
+              echo "If the adopted scan settings differ from this run's, prepare/accept refuse this candidate:"
+              echo "dispatch a new bootstrap run from the adopted workflow."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Enforce the gate verdict
         # The single place this job's pass/fail is decided.
