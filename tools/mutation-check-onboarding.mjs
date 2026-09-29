@@ -23,7 +23,8 @@ const TESTS = [
   'test/baseline-provenance.test.js',
   'test/framework-contracts.test.js',
   'test/baseline-lifecycle.test.js',
-  'test/doctor.test.js'
+  'test/doctor.test.js',
+  'test/onboard.test.js'
 ];
 
 // [invariant, file, search, replace]
@@ -78,6 +79,19 @@ const MUTATIONS = [
   ['the gh wrapper is read-only', 'onboarding/cli.mjs', 'if (!isGetApi && !isDownload) {', 'if (false) {'],
   ['non-interactive accept needs the exact count', 'onboarding/cli.mjs', "if (options['expect-findings'] === undefined || Number(options['expect-findings']) !== count) {", 'if (false) {'],
   ['promotion has no yes-default', 'onboarding/cli.mjs', "question: 'Write these changes?', default: false", "question: 'Write these changes?', default: true"],
+  ['onboard: the final confirmation defaults to no', 'onboarding/cli.mjs', "question: 'Write these onboarding files?', default: false", "question: 'Write these onboarding files?', default: true"],
+  ['onboard writes nothing while the plan blocks', 'onboarding/cli.mjs', '    if (isBlocking(planned)) {', '    if (false) {'],
+  ['onboard succeeds only when the written state validates', 'onboarding/cli.mjs', '  if (validationFails(fresh.result)) {', '  if (false) {'],
+  ['onboard adopts only the paths the operator named', 'onboarding/cli.mjs', 'const explicit = { adopt: options.adopt ?? [], force: options.force ?? [] };', "const explicit = { adopt: options.adopt ?? ['.github/workflows/security.yml', '.semgrepignore'], force: options.force ?? [] };"],
+  ['onboard proves every path confined before the first write', 'onboarding/cli.mjs', '    await assertSafeRepoPath(root, path);', '    void path;'],
+  ['validate fails on drift as well as on errors', 'onboarding/lib/analyze.mjs', 'export const validationFails = (result) => isBlocking(result) || hasDrift(result);', 'export const validationFails = (result) => isBlocking(result);'],
+  ['a failed write reports what was written before it', 'onboarding/lib/files.mjs', '        error.written = [...written];', '        error.written = [];'],
+  ['a failed write names the path that failed', 'onboarding/lib/files.mjs', '        error.failedPath = entry.path;', '        error.failedPath = undefined;'],
+  ['onboard presents itself as onboard', 'onboarding/cli.mjs', "obtainPartial(options, facts, io, prompter, 'onboard')", "obtainPartial(options, facts, io, prompter, 'init')"],
+  ['a new config starts with the baseline absent', 'onboarding/lib/init.mjs', "baseline: { path: DEFAULT_BASELINE, state: 'absent' }", "baseline: { path: DEFAULT_BASELINE, state: 'accepted' }"],
+  ['a new config starts log-only', 'onboarding/lib/init.mjs', "    rollout: { gateMode: 'log-only' },", "    rollout: { gateMode: 'enforce' },"],
+  ['the interview never defaults the profile', 'onboarding/lib/init.mjs', "    question: 'Profile (required: choose one explicitly)',", "    question: 'Profile (required: choose one explicitly)',\n    default: facts.dockerfiles.length > 0 ? 'container-self-managed' : 'source-only',"],
+  ['the source caller holds no id-token', 'onboarding/lib/render.mjs', "    [\n      'permissions:',\n      '  contents: read',\n      '  pull-requests: write'\n    ].join('\\n')", "    [\n      'permissions:',\n      '  contents: read',\n      '  pull-requests: write',\n      '  id-token: write'\n    ].join('\\n')"],
   ['doctor: an analyze error always makes its check FAIL', 'onboarding/lib/doctor.mjs', "target.status = atLeast(target.status, severity === 'error' ? FAIL : WARN);", "target.status = atLeast(target.status, WARN);"],
   ['doctor: an unknown area routes to the catch-all', 'onboarding/lib/doctor.mjs', "  return AREA_CHECK[entry.area] ?? 'other';", "  return AREA_CHECK[entry.area] ?? 'configuration';"],
   ['doctor: generated-file drift is a FAIL', 'onboarding/lib/doctor.mjs', '  if (hasDrift(result)) {', '  if (false) {'],

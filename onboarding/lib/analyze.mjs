@@ -311,3 +311,6 @@ export async function analyze({ root, config, configErrors = [], configWarnings 
 
 export const isBlocking = (result) => result.errors.length > 0;
 export const hasDrift = (result) => result.plan.some((entry) => entry.action !== 'unchanged') || result.stale.length > 0;
+// `validate` fails exactly when this is true (and `render --check` fails on the
+// drift half). The one definition of "the generated state validates".
+export const validationFails = (result) => isBlocking(result) || hasDrift(result);

@@ -12,7 +12,7 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs, promisify } from 'node:util';
 
-import { analyze, hasDrift, isBlocking } from './lib/analyze.mjs';
+import { analyze, hasDrift, isBlocking, validationFails } from './lib/analyze.mjs';
 import {
   CANDIDATE_FILE,
   NEXT_STEP,
@@ -24,12 +24,12 @@ import {
   rolloutState,
   summarizeFindings
 } from './lib/baseline.mjs';
-import { CONFIG_PATH, loadConfig, serializeConfig, validateConfig } from './lib/config.mjs';
+import { CONFIG_PATH, isContainerProfile, isEcrProfile, loadConfig, serializeConfig, validateConfig } from './lib/config.mjs';
 import { contractProblems } from './lib/contract.mjs';
 import { applyWrites, planWrites, removeFile } from './lib/files.mjs';
 import { diagnose, doctorErrorReport, doctorExitCode, renderDoctor } from './lib/doctor.mjs';
 import { detectFramework } from './lib/framework.mjs';
-import { safeWriteFile } from './lib/safe-path.mjs';
+import { assertSafeRepoPath, safeWriteFile } from './lib/safe-path.mjs';
 import { buildConfig, interview } from './lib/init.mjs';
 import { semgrepScope } from './lib/coverage.mjs';
 import { consumerGitState, inspectRepository } from './lib/inspect.mjs';
@@ -47,6 +47,10 @@ const USAGE = `ssd-onboard — configuration-driven onboarding for ssd-security-
 Usage: node <framework>/onboarding/cli.mjs <command> [options]
 
 Repository commands (edit files in the consumer repository only; no AWS, no GitHub writes):
+  onboard [--non-interactive --from <file>] [--adopt <path>]... [--force <path>]...
+                          RECOMMENDED FIRST STEP: init + render + validate + doctor in one
+                          guided run. Creates the initial log-only state; it never accepts a
+                          baseline, enables enforcement, or changes GitHub settings
   init [--non-interactive --from <file>] [--overwrite]
                           derive facts, ask the owner's decisions, write ${CONFIG_PATH}
   inspect [--json]        report what the scanners would and would not cover
@@ -117,44 +121,77 @@ async function readPartial(path) {
 
 // --- commands -----------------------------------------------------------------------------
 
-async function cmdInit(root, options, io) {
-  const configPath = join(root, CONFIG_PATH);
-  let existing = false;
-  try {
-    await readFile(configPath);
-    existing = true;
-  } catch {
-    // absent: expected
+// The owner's answers: a partial config from --from, or the interview.
+// `init` and `onboard` both take them from here, and both merge them through
+// buildConfig — there is one partial-config path.
+async function obtainPartial(options, facts, io, prompter, commandName) {
+  if (options['non-interactive']) {
+    if (!options.from) {
+      throw new UsageError('--non-interactive requires --from <partial-config.yml|.json>');
+    }
+    return readPartial(resolve(options.from));
   }
-  if (existing && !options.overwrite) {
+  return interview(prompter, facts, { cliRef: (await frameworkFor(io))?.sha ?? null, commandName });
+}
+
+// partial + facts -> the config and the analysis of writing it. Nothing is
+// written. `decisions` / `errors` non-empty means there is no config to analyze.
+async function planInit(root, partial, facts, io, { adopt = [], force = [] } = {}) {
+  const { config: candidate, decisions } = await buildConfig(partial, facts);
+  if (decisions.length > 0) {
+    return { decisions, errors: [], config: null, result: null };
+  }
+  const { config, errors, warnings } = validateConfig(candidate);
+  if (errors.length > 0) {
+    return { decisions, errors, config: null, result: null };
+  }
+  const result = await analyze({ root, config, configWarnings: warnings, facts, adopt, force, framework: await frameworkFor(io) });
+  return { decisions, errors, config, result };
+}
+
+// Prints why planInit produced no config. True when it did not.
+function refusedPlan(plan, io) {
+  if (plan.decisions.length > 0) {
+    io.err(`These decisions belong to the repository owner and were not made:\n${plan.decisions.map((d) => `  - ${d}`).join('\n')}`);
+    return true;
+  }
+  if (plan.errors.length > 0) {
+    io.err(`Refusing to write ${CONFIG_PATH}:\n${plan.errors.map((e) => `  - ${e.path}: ${e.message}`).join('\n')}`);
+    return true;
+  }
+  return false;
+}
+
+async function configExists(root) {
+  try {
+    await readFile(join(root, CONFIG_PATH));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function cmdInit(root, options, io) {
+  if ((await configExists(root)) && !options.overwrite) {
     throw new UsageError(`${CONFIG_PATH} already exists. Edit it and run \`ssd-onboard render\`, or pass --overwrite to start over.`);
   }
   const facts = await inspectRepository(root);
   let partial;
   if (options['non-interactive']) {
-    if (!options.from) {
-      throw new UsageError('--non-interactive requires --from <partial-config.yml|.json>');
-    }
-    partial = await readPartial(resolve(options.from));
+    partial = await obtainPartial(options, facts, io, null, 'init');
   } else {
     const prompter = io.prompter ?? terminalPrompter();
     try {
-      partial = await interview(prompter, facts, { cliRef: (await frameworkFor(io))?.sha ?? null });
+      partial = await obtainPartial(options, facts, io, prompter, 'init');
     } finally {
       prompter.close();
     }
   }
-  const { config: candidate, decisions } = await buildConfig(partial, facts);
-  if (decisions.length > 0) {
-    io.err(`These decisions belong to the repository owner and were not made:\n${decisions.map((d) => `  - ${d}`).join('\n')}`);
+  const plan = await planInit(root, partial, facts, io);
+  if (refusedPlan(plan, io)) {
     return 1;
   }
-  const { config, errors, warnings } = validateConfig(candidate);
-  if (errors.length > 0) {
-    io.err(`Refusing to write ${CONFIG_PATH}:\n${errors.map((e) => `  - ${e.path}: ${e.message}`).join('\n')}`);
-    return 1;
-  }
-  const result = await analyze({ root, config, configWarnings: warnings, facts, framework: await frameworkFor(io) });
+  const { config, result } = plan;
   io.out(renderReport(result, { title: 'Effective configuration (not yet written)' }));
   if (!options['non-interactive']) {
     const prompter = io.prompter ?? terminalPrompter();
@@ -175,6 +212,166 @@ async function cmdInit(root, options, io) {
       ? 'Generation is BLOCKED until the errors above are resolved (edit the config, then `ssd-onboard validate`).'
       : 'Next: `ssd-onboard render`, review the diff, and open a pull request.'
   );
+  return 0;
+}
+
+// `onboard`: the first-time path — init, render, validate and doctor composed in
+// process from the same functions those commands use. It adds no rule of its
+// own except being STRICTER about when it writes: nothing is written unless the
+// complete result (config plus every generated file) would validate, and the
+// operator has seen it and said yes. It never accepts a baseline, promotes to
+// enforce, adopts or forces a path the operator did not name, or contacts
+// GitHub or AWS.
+const ALREADY_ONBOARDED = `This repository already has ${CONFIG_PATH}. Nothing was written.
+
+Use:
+  ssd-onboard validate    check the config, the repository and the generated files
+  ssd-onboard doctor      read-only readiness report
+  ssd-onboard render      regenerate the generated files from the config (alias: update)
+
+Use the low-level \`ssd-onboard init --overwrite\` only for a deliberate reinitialization.`;
+
+const PLAN_LABEL = { create: 'CREATE', update: 'UPDATE', unchanged: 'unchanged', forced: 'OVERWRITE', adopted: 'ADOPT', conflict: 'CONFLICT' };
+
+function securityModel(config) {
+  const cloud = isEcrProfile(config.profile)
+    ? `identifiers recorded for ${config.delivery.aws.accountId}/${config.delivery.aws.region}; NOT contacted or verified; no delivery workflow until promote --enforce`
+    : 'not used';
+  return [
+    'Security model:',
+    '  source scanning:   enabled, through the OIDC-free _source-scan.yml (no cloud identity, declared secrets only)',
+    `  image scanning:    ${isContainerProfile(config.profile) ? `enabled (${config.container.dockerfile}, built without credentials)` : 'none (source-only)'}`,
+    `  Semgrep baseline:  ${config.semgrep.baseline.state}`,
+    `  gate mode:         ${config.rollout.gateMode}`,
+    `  break-glass:       ${config.breakGlass.mode}`,
+    `  AWS/OIDC:          ${cloud}`
+  ].join('\n');
+}
+
+async function cmdOnboard(root, options, io) {
+  const interactive = !options['non-interactive'];
+  if (interactive && options.from) {
+    throw new UsageError('--from is only read with --non-interactive');
+  }
+  if (!interactive && !options.from) {
+    throw new UsageError('--non-interactive requires --from <partial-config.yml|.json>');
+  }
+  if (options.overwrite) {
+    throw new UsageError('onboard never reinitializes; use `ssd-onboard init --overwrite` deliberately');
+  }
+  if (await configExists(root)) {
+    io.err(ALREADY_ONBOARDED);
+    return 1;
+  }
+  // Only the paths the operator named; never widened, never retried with more.
+  const explicit = { adopt: options.adopt ?? [], force: options.force ?? [] };
+
+  io.out('SSD Onboard — creates the initial, log-only integration state for review.\nIt does not accept a baseline, enable enforcement, or configure GitHub; nothing is committed.\n');
+  const facts = await inspectRepository(root);
+  const prompter = interactive ? io.prompter ?? terminalPrompter() : null;
+  let plan;
+  try {
+    const partial = await obtainPartial(options, facts, io, prompter, 'onboard');
+    plan = await planInit(root, partial, facts, io, explicit);
+    if (refusedPlan(plan, io)) {
+      io.err('Nothing written.');
+      return 1;
+    }
+    const planned = plan.result;
+    io.out(renderReport(planned, { title: 'Onboarding plan (nothing written yet)' }));
+    if (isBlocking(planned)) {
+      io.err('Nothing written: onboarding writes only a state that validates. Resolve the errors above and run `ssd-onboard onboard` again.');
+      if (planned.plan.some((entry) => entry.action === 'conflict')) {
+        io.err('A CONFLICT is an existing file ssd-onboard will not overwrite on its own. Review it, then re-run with --adopt <path> (human-owned file) or --force <path> (hand-edited generated file) for exactly that path, or move it aside.');
+      }
+      return 1;
+    }
+    io.out(securityModel(plan.config));
+    io.out(['', 'Planned files:', `  ${'CREATE'.padEnd(9)} ${CONFIG_PATH}`, ...planned.plan.map((entry) => `  ${PLAN_LABEL[entry.action].padEnd(9)} ${entry.path}`)].join('\n'));
+    for (const entry of planned.plan.filter((e) => !['create', 'unchanged'].includes(e.action))) {
+      io.out(`\n${PLAN_LABEL[entry.action]} ${entry.path}\n${entry.diff}`);
+    }
+    const consumer = await consumerGitState(root);
+    if (facts.git.isGit && !consumer.clean) {
+      io.err('Note: the working tree already has uncommitted changes; review `git status` so they are not mixed into the onboarding pull request.');
+    }
+    if (interactive) {
+      const write = await prompter.confirm({ id: 'writeOnboarding', question: 'Write these onboarding files?', default: false });
+      if (!write) {
+        io.err('Nothing written.');
+        return 1;
+      }
+    }
+  } finally {
+    prompter?.close();
+  }
+
+  // Every path is proven confined BEFORE the first write, so a symbolic link or
+  // escaping path refuses the whole onboarding instead of half of it.
+  const { config, result } = plan;
+  for (const path of [CONFIG_PATH, ...result.plan.map((entry) => entry.path)]) {
+    await assertSafeRepoPath(root, path);
+  }
+  const written = [];
+  try {
+    try {
+      await safeWriteFile(root, CONFIG_PATH, serializeConfig(config), { flag: 'wx' });
+    } catch (error) {
+      error.failedPath = CONFIG_PATH;
+      error.written = [];
+      throw error;
+    }
+    written.push(CONFIG_PATH);
+    written.push(...(await applyWrites(root, result.plan)));
+  } catch (error) {
+    written.push(...(error.written ?? []));
+    io.err(`ssd-onboard: writing ${error.failedPath ?? '(unknown path)'} failed: ${error.message}`);
+    io.err(
+      written.length === 0
+        ? 'Onboarding did NOT complete. No file was written.'
+        : `Onboarding did NOT complete. Written (nothing was rolled back):\n${written.map((p) => `  ${p}`).join('\n')}\n` +
+            `Once the cause is fixed, \`ssd-onboard render\` completes the generated files from ${CONFIG_PATH}; then run \`ssd-onboard validate\`.`
+    );
+    return 1;
+  }
+
+  // What was written is re-read from disk and judged exactly as `validate`
+  // judges it — never the pre-write analysis.
+  const fresh = await loadAnalysis(root, io);
+  const listWritten = `Written (nothing was committed):\n${written.map((p) => `  ${p}`).join('\n')}`;
+  if (validationFails(fresh.result)) {
+    io.out(renderReport(fresh.result, { title: 'ssd-onboard validate' }));
+    io.err(`Onboarding did NOT complete: the written state does not validate.\n${listWritten}\nResolve the errors above, then \`ssd-onboard render\` and \`ssd-onboard validate\`.`);
+    return 1;
+  }
+  const report = diagnose({ result: fresh.result, facts: fresh.facts });
+  io.out(`\nReadiness:\n${renderDoctor(report)}`);
+  if (doctorExitCode(report) !== 0) {
+    io.err(`Onboarding did NOT complete: doctor reports a FAIL.\n${listWritten}`);
+    return 1;
+  }
+  const rollout = fresh.result.rollout.name;
+  const lines = [
+    'Onboarding generated successfully.',
+    'Local validation passed (validate and render --check).',
+    listWritten,
+    '',
+    `Rollout state: ${rollout}`,
+    rollout === 'enforcing'
+      ? 'Items marked NOT VERIFIED above must still be verified before this repository is relied on.'
+      : 'This repository is NOT production-ready yet: WARN and NOT VERIFIED items above are expected at this stage.',
+    '',
+    'Next:',
+    '  1. Review the changes:  git status && git diff',
+    '  2. Commit the onboarding files and open a pull request.'
+  ];
+  if (rollout === 'onboarding') {
+    lines.push('  3. After that pull request is merged, run the baseline bootstrap:', '', ...dispatchInstructions(fresh.config).map((line) => (line ? `     ${line}` : '')));
+    lines.push('', '     Do not copy a candidate baseline into place by hand.');
+  } else {
+    lines.push(`  3. After it is merged: ${NEXT_STEP[rollout]}`);
+  }
+  io.out(`\n${lines.join('\n')}`);
   return 0;
 }
 
@@ -251,7 +448,7 @@ async function cmdValidate(root, options, io) {
       io.out('Generated files are NOT up to date with the config (see "Files that will change"). Run `ssd-onboard render`.');
     }
   }
-  return isBlocking(result) || drift ? 1 : 0;
+  return validationFails(result) ? 1 : 0;
 }
 
 // Read-only: the same analysis `validate` decides from, projected into
@@ -513,6 +710,8 @@ export async function main(argv, io = {}) {
     }
     const root = resolve(values.repo ?? process.cwd());
     switch (command) {
+      case 'onboard':
+        return await cmdOnboard(root, values, context);
       case 'init':
         return await cmdInit(root, values, context);
       case 'inspect':
