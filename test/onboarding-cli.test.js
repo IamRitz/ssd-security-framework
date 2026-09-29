@@ -686,11 +686,11 @@ describe('the generator is bound to the framework commit it generates for', () =
 });
 
 describe('Phase 1 makes no AWS calls and no GitHub mutations', () => {
-  it('init, inspect, validate, render and baseline status never run aws or gh', async (t) => {
+  it('init, inspect, validate, doctor, render and baseline status never run aws or gh', async (t) => {
     const before = shimCalls().length;
     const root = makeRepo(t, { ...PY_REPO, Dockerfile: 'FROM scratch\n' });
     await cli(root, ['init', '--non-interactive', '--from', partial('container.yml', `profile: container-self-managed\nframework:\n  ref: ${REF}\n`)]);
-    for (const args of [['inspect'], ['inspect', '--json'], ['validate'], ['render'], ['render', '--check'], ['baseline', 'status'], ['baseline', 'prepare']]) {
+    for (const args of [['inspect'], ['inspect', '--json'], ['validate'], ['doctor'], ['doctor', '--json'], ['render'], ['render', '--check'], ['baseline', 'status'], ['baseline', 'prepare']]) {
       await cli(root, args);
     }
     assert.deepEqual(shimCalls().slice(before), []);

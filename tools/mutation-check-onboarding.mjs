@@ -22,7 +22,8 @@ const TESTS = [
   'test/onboarding-path-confinement.test.js',
   'test/baseline-provenance.test.js',
   'test/framework-contracts.test.js',
-  'test/baseline-lifecycle.test.js'
+  'test/baseline-lifecycle.test.js',
+  'test/doctor.test.js'
 ];
 
 // [invariant, file, search, replace]
@@ -70,13 +71,23 @@ const MUTATIONS = [
   ['an unknown CLI commit cannot generate', 'onboarding/lib/analyze.mjs', '  const bindingProblems = frameworkProblems(framework, config);', '  const bindingProblems = framework ? frameworkProblems(framework, config) : [];'],
   ['caller permissions equal the callee requirement', 'onboarding/lib/contract.mjs', '          if (want !== have) {', '          if (false) {'],
   ['break-glass stays unsupported', 'onboarding/lib/config.mjs', "  if (breakGlass.mode !== 'disabled') {", '  if (false) {'],
-  ['an unreadable contract is an error', 'onboarding/lib/analyze.mjs', "      errors.push({ area: 'framework', message: `${file} could not be read", "      warnings.push({ area: 'framework', message: `${file} could not be read"],
+  ['an unreadable contract is an error', 'onboarding/lib/analyze.mjs', "    for (const message of unverified) {\n      errors.push({ area: 'framework', message });", "    for (const message of unverified) {\n      warnings.push({ area: 'framework', message });"],
   ['consumer writes never traverse a symbolic link', 'onboarding/lib/safe-path.mjs', '    if (info.isSymbolicLink()) {', '    if (false) {'],
   ['a repository-relative path cannot escape with ..', 'onboarding/lib/safe-path.mjs', "  if (parts.includes('..')) {", '  if (false) {'],
   ['an absolute path is not a repository-relative path', 'onboarding/lib/safe-path.mjs', "  if (isAbsolute(relativePath) || /^[a-zA-Z]:/.test(relativePath) || relativePath.startsWith('\\\\')) {", '  if (false) {'],
   ['the gh wrapper is read-only', 'onboarding/cli.mjs', 'if (!isGetApi && !isDownload) {', 'if (false) {'],
   ['non-interactive accept needs the exact count', 'onboarding/cli.mjs', "if (options['expect-findings'] === undefined || Number(options['expect-findings']) !== count) {", 'if (false) {'],
   ['promotion has no yes-default', 'onboarding/cli.mjs', "question: 'Write these changes?', default: false", "question: 'Write these changes?', default: true"],
+  ['doctor: an analyze error always makes its check FAIL', 'onboarding/lib/doctor.mjs', "target.status = atLeast(target.status, severity === 'error' ? FAIL : WARN);", "target.status = atLeast(target.status, WARN);"],
+  ['doctor: an unknown area routes to the catch-all', 'onboarding/lib/doctor.mjs', "  return AREA_CHECK[entry.area] ?? 'other';", "  return AREA_CHECK[entry.area] ?? 'configuration';"],
+  ['doctor: generated-file drift is a FAIL', 'onboarding/lib/doctor.mjs', '  if (hasDrift(result)) {', '  if (false) {'],
+  ['doctor: an absent baseline is a valid onboarding state, not corruption', 'onboarding/lib/doctor.mjs', "    // treats every Semgrep finding as new. Only production readiness is missing.\n    c.status = WARN;", "    // treats every Semgrep finding as new. Only production readiness is missing.\n    c.status = FAIL;"],
+  ['doctor: an unbound contract is NOT VERIFIED, never PASS', 'onboarding/lib/doctor.mjs', "    c.status = NOT_VERIFIED;\n    c.observed.push('not checked: the generator", "    c.observed.push('not checked: the generator"],
+  ['doctor: an unestablished identity is not a PASS', 'onboarding/lib/doctor.mjs', "    c.status = WARN;\n    c.observed.push(`identity not established", "    c.observed.push(`identity not established"],
+  ['doctor: GitHub merge governance is never PASS', 'onboarding/lib/doctor.mjs', "  return check('github-governance', 'GitHub merge governance', {\n    status: NOT_VERIFIED,", "  return check('github-governance', 'GitHub merge governance', {\n    status: PASS,"],
+  ['doctor: CODEOWNERS coverage is never claimed', 'onboarding/lib/doctor.mjs', "  return check('codeowners', 'CODEOWNERS coverage', {\n    status: NOT_VERIFIED,", "  return check('codeowners', 'CODEOWNERS coverage', {\n    status: PASS,"],
+  ['doctor: a settings link only for an exact github.com origin', 'onboarding/lib/doctor.mjs', "  if (git.host !== 'github.com' || !git.slug", "  if (!git.slug"],
+  ['doctor writes nothing', 'onboarding/cli.mjs', '  const report = diagnose({ result, facts });', "  await applyWrites(root, result.plan.filter((entry) => entry.action !== 'conflict'));\n  const report = diagnose({ result, facts });"],
   ['contract problems block generation', 'onboarding/lib/analyze.mjs', "contract.problems.forEach((message) => errors.push({ area: 'framework', message }));", ''],
   ["an absent owner-managed .semgrepignore is an error", 'onboarding/lib/analyze.mjs', "    ignorePatterns = null;\n    errors.push({", "    ignorePatterns = null;\n    warnings.push({"],
   ['bootstrap is refused on a diff-aware scan', '.github/workflows/_source-security.yml', "(github.event_name == 'pull_request' || github.event_name == 'push')", "(github.event_name == 'never')"],

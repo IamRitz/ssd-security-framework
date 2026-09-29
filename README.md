@@ -56,6 +56,7 @@ and maintains the callers below from a reviewed `.ssd/onboarding.yml`:
 
 ```sh
 node <framework-checkout>/onboarding/cli.mjs init     # then: render, and open a PR
+node <framework-checkout>/onboarding/cli.mjs doctor   # read-only readiness report
 ```
 
 By hand, the minimal caller is:

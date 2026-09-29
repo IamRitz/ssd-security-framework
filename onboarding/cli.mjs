@@ -27,6 +27,7 @@ import {
 import { CONFIG_PATH, loadConfig, serializeConfig, validateConfig } from './lib/config.mjs';
 import { contractProblems } from './lib/contract.mjs';
 import { applyWrites, planWrites, removeFile } from './lib/files.mjs';
+import { diagnose, doctorErrorReport, doctorExitCode, renderDoctor } from './lib/doctor.mjs';
 import { detectFramework } from './lib/framework.mjs';
 import { safeWriteFile } from './lib/safe-path.mjs';
 import { buildConfig, interview } from './lib/init.mjs';
@@ -50,6 +51,8 @@ Repository commands (edit files in the consumer repository only; no AWS, no GitH
                           derive facts, ask the owner's decisions, write ${CONFIG_PATH}
   inspect [--json]        report what the scanners would and would not cover
   validate [--json]       check config + repository + generated files (CI-friendly)
+  doctor [--json]         READ-ONLY operational readiness: lifecycle, drift, governance gaps;
+                          exit 1 on any FAIL (WARN / NOT VERIFIED do not fail)
   render [--dry-run] [--adopt <path>]... [--force <path>]... [--prune]
                           regenerate workflows and scanner configs from the config
   render --check          fail if any generated file differs from a fresh render
@@ -249,6 +252,25 @@ async function cmdValidate(root, options, io) {
     }
   }
   return isBlocking(result) || drift ? 1 : 0;
+}
+
+// Read-only: the same analysis `validate` decides from, projected into
+// readiness checks (lib/doctor.mjs). Writes nothing, contacts nothing.
+async function cmdDoctor(root, options, io) {
+  let analysis;
+  try {
+    analysis = await loadAnalysis(root, io);
+  } catch (error) {
+    if (!options.json) {
+      throw error; // the shared `ssd-onboard: <message>` path, exit 1
+    }
+    io.out(`${JSON.stringify(doctorErrorReport(error), null, 2)}\n`);
+    return 1;
+  }
+  const { facts, result } = analysis;
+  const report = diagnose({ result, facts });
+  io.out(options.json ? `${JSON.stringify(report, null, 2)}\n` : renderDoctor(report));
+  return doctorExitCode(report);
 }
 
 async function cmdRender(root, options, io) {
@@ -497,6 +519,8 @@ export async function main(argv, io = {}) {
         return await cmdInspect(root, values, context);
       case 'validate':
         return await cmdValidate(root, values, context);
+      case 'doctor':
+        return await cmdDoctor(root, values, context);
       case 'render':
       case 'update':
         return await cmdRender(root, values, context);

@@ -55,7 +55,10 @@ function codeownersCovers(text, path) {
 export async function analyze({ root, config, configErrors = [], configWarnings = [], facts, adopt = [], force = [], framework = null }) {
   const errors = configErrors.map((e) => ({ area: 'config', message: `${e.path}: ${e.message}` }));
   const warnings = configWarnings.map((w) => ({ area: 'config', message: `${w.path}: ${w.message}` }));
-  const result = { config, errors, warnings, coverage: {}, rollout: null, plan: [], stale: [] };
+  // `framework` records WHICH `framework`-area errors came from the generator
+  // binding and which from the contract check (null until checked), so a
+  // reader such as `doctor` can attribute them without re-deriving either.
+  const result = { config, errors, warnings, coverage: {}, rollout: null, plan: [], stale: [], framework: null };
   if (!config || configErrors.some((e) => ['profile', 'semgrep.rulesets', 'framework.ref'].includes(e.path))) {
     return result;
   }
@@ -90,6 +93,7 @@ export async function analyze({ root, config, configErrors = [], configWarnings 
   // must be the same immutable commit (framework.mjs).
   const bindingProblems = frameworkProblems(framework, config);
   bindingProblems.forEach((message) => errors.push({ area: 'framework', message }));
+  result.framework = { binding: bindingProblems, contract: null };
 
   // --- Semgrep -------------------------------------------------------------------------
   for (const root of config.semgrep.roots) {
@@ -269,12 +273,14 @@ export async function analyze({ root, config, configErrors = [], configWarnings 
   if (bindingProblems.length === 0) {
     const contract = await contractProblems(rendered, config, framework.readWorkflow);
     contract.problems.forEach((message) => errors.push({ area: 'framework', message }));
-    for (const file of contract.unverified) {
-      errors.push({ area: 'framework', message: `${file} could not be read at ${config.framework.ref}; the generated call cannot be verified` });
+    const unverified = contract.unverified.map((file) => `${file} could not be read at ${config.framework.ref}; the generated call cannot be verified`);
+    for (const message of unverified) {
+      errors.push({ area: 'framework', message });
     }
     for (const note of contract.staticGrants) {
       warnings.push({ area: 'permissions', message: note });
     }
+    result.framework.contract = { problems: contract.problems, unverified, staticGrants: contract.staticGrants };
   }
   result.plan = await planWrites(root, rendered, { adopt, force });
   const renderedPaths = new Set(rendered.map((file) => file.path));
