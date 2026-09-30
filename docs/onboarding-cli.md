@@ -250,8 +250,10 @@ Every `validate` error appears as a FAIL of some check (an unknown one in
 VERIFIED** means *cannot be proven from this checkout*, not *passed*: doctor
 makes no GitHub or AWS calls, and a job named `security-gate` in a workflow
 says nothing about whether the default branch **requires** it. The CODEOWNERS
-matcher is a local heuristic (it can over-claim for `/*` and ownerless rules),
-so doctor never reports that coverage as PASS.
+matcher is a conservative local heuristic (last matching rule wins, an
+ownerless rule removes ownership, `/*` is top-level only, and a pattern it
+cannot evaluate counts as not covered); it cannot see whether GitHub requires
+code-owner review, so doctor never reports that coverage as PASS.
 
 Exit codes: `0` no FAIL (WARN and NOT VERIFIED do not fail — they are normal
 during rollout); `1` one or more FAILs, or a config/repository state that

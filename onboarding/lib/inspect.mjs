@@ -64,25 +64,39 @@ export async function listRepositoryFiles(root) {
   return { files: (await walk(root)).sort(), source: 'filesystem (not a git repository; .git and node_modules skipped)' };
 }
 
-export function parseGithubSlug(url) {
-  const match = /github\.com[:/]+([A-Za-z0-9-]+)\/([A-Za-z0-9._-]+?)(?:\.git)?\/?$/.exec(url?.trim() ?? '');
-  return match ? `${match[1]}/${match[2]}` : null;
-}
-
-// The exact host of a remote URL (https://, ssh://, git://, or scp-like
-// user@host:path), lowercased; null when it cannot be parsed. Unlike
-// parseGithubSlug this never matches a host that merely CONTAINS github.com.
-export function parseRemoteHost(url) {
+// { protocol, host, path } of a remote URL (https://, ssh://, git://, or
+// scp-like user@host:path), host lowercased; null when it cannot be parsed.
+function parseRemote(url) {
   const text = url?.trim() ?? '';
-  const scp = /^[^@/\s]+@([^:/\s]+):/.exec(text);
+  const scp = /^[^@/\s]+@([^:/\s]+):(.*)$/.exec(text);
   if (scp) {
-    return scp[1].toLowerCase();
+    return { protocol: 'scp', host: scp[1].toLowerCase(), path: scp[2] };
   }
   try {
-    return new URL(text).hostname.toLowerCase() || null;
+    const parsed = new URL(text);
+    return parsed.hostname ? { protocol: parsed.protocol, host: parsed.hostname.toLowerCase(), path: parsed.pathname } : null;
   } catch {
     return null;
   }
+}
+
+// The exact host of a remote URL, lowercased; null when it cannot be parsed.
+// Never matches a host that merely CONTAINS github.com.
+export function parseRemoteHost(url) {
+  return parseRemote(url)?.host ?? null;
+}
+
+// owner/name of a github.com remote. The host must be EXACTLY github.com (any
+// case); a look-alike host, a github.com path segment on another host, or any
+// other host (GitHub Enterprise included) is not a GitHub.com identity: null.
+const GITHUB_PROTOCOLS = new Set(['scp', 'https:', 'http:', 'ssh:', 'git:']);
+export function parseGithubSlug(url) {
+  const remote = parseRemote(url);
+  if (!remote || remote.host !== 'github.com' || !GITHUB_PROTOCOLS.has(remote.protocol)) {
+    return null;
+  }
+  const match = /^\/?([A-Za-z0-9-]+)\/([A-Za-z0-9._-]+?)(?:\.git)?\/?$/.exec(remote.path);
+  return match ? `${match[1]}/${match[2]}` : null;
 }
 
 export async function gitFacts(root) {

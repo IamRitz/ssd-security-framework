@@ -29,25 +29,123 @@ export function securityOwnedPaths(config) {
   return paths;
 }
 
-function codeownersCovers(text, path) {
-  const rules = text
+// --- CODEOWNERS ----------------------------------------------------------------
+// A deliberately conservative subset of GitHub's CODEOWNERS semantics, for one
+// question: does every file under a security-owned path have an owner? GitHub
+// applies the LAST matching rule, and a rule without owners un-owns what it
+// matches. Coverage is claimed only when it can be proven; anything uncertain
+// is reported as not covered.
+const OWNER = /^@[A-Za-z0-9][A-Za-z0-9-]*(?:\/[A-Za-z0-9._-]+)?$|^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const hasWildcard = (segment) => /[*?]/.test(segment);
+
+function parseCodeownersRule(line) {
+  const [pattern, ...owners] = line.split(/\s+/);
+  // A line with any malformed owner proves no ownership.
+  const rule = { owned: owners.length > 0 && owners.every((owner) => OWNER.test(owner)), supported: false };
+  // Escapes, negation and character ranges are not GitHub CODEOWNERS syntax.
+  if (/[[\]\\!]/.test(pattern)) {
+    return rule;
+  }
+  const body = pattern.replace(/^\//, '').replace(/\/$/, '');
+  const segments = body.split('/');
+  if (body === '' || segments.some((s) => s === '' || s === '.' || s === '..' || (s.includes('**') && s !== '**'))) {
+    return rule;
+  }
+  // A leading or middle slash anchors to the root; otherwise any depth.
+  const anchored = pattern.startsWith('/') || body.includes('/');
+  return { ...rule, supported: true, dirOnly: pattern.endsWith('/'), segments: anchored ? segments : ['**', ...segments] };
+}
+
+export function parseCodeowners(text) {
+  return text
     .split('\n')
     .map((line) => line.replace(/#.*$/, '').trim())
     .filter(Boolean)
-    .map((line) => line.split(/\s+/))
-    .filter((parts) => parts.length >= 2)
-    .map(([pattern]) => pattern);
-  const target = `/${path}`;
-  return rules.some((pattern) => {
-    if (pattern === '*' || pattern === '/*' || pattern === '**') {
+    .map(parseCodeownersRule);
+}
+
+function segmentMatches(glob, name) {
+  const source = glob.replace(/[.+^${}()|]/g, '\\$&').replace(/\*/g, '[^/]*').replace(/\?/g, '[^/]');
+  return new RegExp(`^${source}$`).test(name);
+}
+
+// Does the pattern match exactly this path (`**` spans zero or more segments)?
+function matchesPath(pattern, path, i = 0, j = 0) {
+  if (i === pattern.length) {
+    return j === path.length;
+  }
+  if (pattern[i] === '**') {
+    return matchesPath(pattern, path, i + 1, j) || (j < path.length && matchesPath(pattern, path, i, j + 1));
+  }
+  return j < path.length && segmentMatches(pattern[i], path[j]) && matchesPath(pattern, path, i + 1, j + 1);
+}
+
+// Could the pattern match some path strictly below `dir`?
+function matchesBelow(pattern, dir, i = 0, j = 0) {
+  if (j === dir.length) {
+    return i < pattern.length;
+  }
+  if (i === pattern.length) {
+    return false;
+  }
+  if (pattern[i] === '**') {
+    return matchesBelow(pattern, dir, i + 1, j) || matchesBelow(pattern, dir, i, j + 1);
+  }
+  return segmentMatches(pattern[i], dir[j]) && matchesBelow(pattern, dir, i + 1, j + 1);
+}
+
+const prefixes = (segments) => segments.map((_, k) => segments.slice(0, k + 1));
+
+// PROVEN ownership of everything at `target` (a file, or a directory ending in
+// `/`). A rule owns a directory's contents only through a literal final
+// segment (`/.ssd/`, `/apps/github`) or a trailing `**`: GitHub matches `/*`
+// and `docs/*` against files at that level only, never recursively.
+function ruleCovers(rule, target) {
+  const { segments: p, dirOnly } = rule;
+  const isDir = target.endsWith('/');
+  const t = target.replace(/\/$/, '').split('/');
+  const literalLast = !hasWildcard(p[p.length - 1]);
+  if (!isDir && !dirOnly && matchesPath(p, t)) {
+    return true;
+  }
+  if (literalLast && prefixes(t).slice(0, isDir ? t.length : t.length - 1).some((dir) => matchesPath(p, dir))) {
+    return true;
+  }
+  // `**`, `/**`, `dir/**` and `*`/`dir/**/*` match every file below their prefix.
+  const everything = p[p.length - 1] === '**' ? p.slice(0, -1) : p.length >= 2 && p[p.length - 2] === '**' && p[p.length - 1] === '*' ? p.slice(0, -2) : null;
+  return isDir && everything !== null && [[], ...prefixes(t)].some((dir) => matchesPath(everything, dir));
+}
+
+// Could the rule match ANY file at `target`? Generous on purpose: an ownerless
+// rule that might match is assumed to, so it can only remove coverage.
+function ruleMayMatch(rule, target) {
+  if (!rule.supported) {
+    return true;
+  }
+  const t = target.replace(/\/$/, '').split('/');
+  const isDir = target.endsWith('/');
+  return (
+    (!isDir && !rule.dirOnly && matchesPath(rule.segments, t)) ||
+    prefixes(t).slice(0, isDir ? t.length : t.length - 1).some((dir) => matchesPath(rule.segments, dir)) ||
+    (isDir && matchesBelow(rule.segments, t))
+  );
+}
+
+// Last matching rule wins: walking back from the end, an ownerless rule that
+// may match anything at `path` un-owns it before an earlier owner can count.
+// An owned rule that does not provably cover `path` proves nothing either way.
+export function codeownersCovers(text, path) {
+  const rules = parseCodeowners(text);
+  for (let i = rules.length - 1; i >= 0; i -= 1) {
+    const rule = rules[i];
+    if (!rule.owned && ruleMayMatch(rule, path)) {
+      return false;
+    }
+    if (rule.owned && rule.supported && ruleCovers(rule, path)) {
       return true;
     }
-    const anchored = pattern.startsWith('/') ? pattern : `/${pattern}`;
-    if (anchored.endsWith('/')) {
-      return target.startsWith(anchored) || `${target}/`.startsWith(anchored);
-    }
-    return target === anchored || target.startsWith(`${anchored}/`);
-  });
+  }
+  return false;
 }
 
 // framework: the revision this CLI belongs to (framework.mjs detectFramework),

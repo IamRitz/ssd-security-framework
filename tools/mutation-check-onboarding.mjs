@@ -24,7 +24,8 @@ const TESTS = [
   'test/framework-contracts.test.js',
   'test/baseline-lifecycle.test.js',
   'test/doctor.test.js',
-  'test/onboard.test.js'
+  'test/onboard.test.js',
+  'test/onboarding-codeowners.test.js'
 ];
 
 // [invariant, file, search, replace]
@@ -102,6 +103,15 @@ const MUTATIONS = [
   ['doctor: CODEOWNERS coverage is never claimed', 'onboarding/lib/doctor.mjs', "  return check('codeowners', 'CODEOWNERS coverage', {\n    status: NOT_VERIFIED,", "  return check('codeowners', 'CODEOWNERS coverage', {\n    status: PASS,"],
   ['doctor: a settings link only for an exact github.com origin', 'onboarding/lib/doctor.mjs', "  if (git.host !== 'github.com' || !git.slug", "  if (!git.slug"],
   ['doctor writes nothing', 'onboarding/cli.mjs', '  const report = diagnose({ result, facts });', "  await applyWrites(root, result.plan.filter((entry) => entry.action !== 'conflict'));\n  const report = diagnose({ result, facts });"],
+  ['CODEOWNERS: `/*` is not a recursive wildcard', 'onboarding/lib/analyze.mjs', '  if (literalLast && prefixes(t).slice(', '  if (prefixes(t).slice('],
+  ['CODEOWNERS: the last matching rule wins', 'onboarding/lib/analyze.mjs', '  for (let i = rules.length - 1; i >= 0; i -= 1) {', '  for (let i = 0; i < rules.length; i += 1) {'],
+  ['CODEOWNERS: a later ownerless rule removes ownership', 'onboarding/lib/analyze.mjs', '    if (!rule.owned && ruleMayMatch(rule, path)) {', '    if (false) {'],
+  ['CODEOWNERS: a rule without owners owns nothing', 'onboarding/lib/analyze.mjs', 'owned: owners.length > 0 && owners.every(', 'owned: owners.every('],
+  ['CODEOWNERS: an unsupported pattern proves nothing', 'onboarding/lib/analyze.mjs', '    if (rule.owned && rule.supported && ruleCovers(rule, path)) {', '    if (rule.owned && ruleCovers({ segments: [\'**\'], ...rule }, path)) {'],
+  ['GitHub remote: the exact github.com host is required', 'onboarding/lib/inspect.mjs', "remote.host !== 'github.com' || ", ''],
+  ['GitHub remote: github.com.evil.example is not github.com', 'onboarding/lib/inspect.mjs', "remote.host !== 'github.com'", "!remote.host.startsWith('github.com')"],
+  ['GitHub remote: notgithub.com is not github.com', 'onboarding/lib/inspect.mjs', "remote.host !== 'github.com'", "!remote.host.endsWith('github.com')"],
+  ['GitHub remote: the slug is read from the path, not searched for', 'onboarding/lib/inspect.mjs', '.exec(remote.path);', '.exec(url.trim().replace(/^.*github\\.com[:/]+/i, \'\'));'],
   ['contract problems block generation', 'onboarding/lib/analyze.mjs', "contract.problems.forEach((message) => errors.push({ area: 'framework', message }));", ''],
   ["an absent owner-managed .semgrepignore is an error", 'onboarding/lib/analyze.mjs', "    ignorePatterns = null;\n    errors.push({", "    ignorePatterns = null;\n    warnings.push({"],
   ['bootstrap is refused on a diff-aware scan', '.github/workflows/_source-security.yml', "(github.event_name == 'pull_request' || github.event_name == 'push')", "(github.event_name == 'never')"],
