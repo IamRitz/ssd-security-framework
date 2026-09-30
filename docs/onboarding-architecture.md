@@ -67,12 +67,19 @@ files, so `.gitignore` does not change CI scope.
 ### A.3 Dependency scanning: what is and is not covered
 
 Pinned OSV-Scanner `ghcr.io/google/osv-scanner@sha256:5116601d…` (v2.4.0), run
-exactly as the workflow runs it (`scan source --recursive --allow-no-lockfiles`):
+exactly as the workflow runs it (`scan source --recursive --allow-no-lockfiles`).
+That recursive walk skips every path `.gitignore` lists **even when it is
+tracked** (verified), so a force-added, gitignored lockfile — OWASP Juice Shop's
+layout — is not read by it. npm dependency-root lockfiles are therefore also
+scanned by a second, explicit run that names each one (C.3,
+`tools/verify-scanner-behaviour.mjs` § 3):
 
 | File | OSV-Scanner | Language-native (as wired today) |
 | --- | --- | --- |
-| `package-lock.json` at root | scanned | `npm audit --package-lock-only` |
-| `package-lock.json` nested (`svc/api/`) | **scanned** | **not run** — detection is root-only |
+| `package-lock.json` / `npm-shrinkwrap.json` at root | scanned | `npm audit --package-lock-only --prefix .` |
+| `package-lock.json` / `npm-shrinkwrap.json` nested (`svc/api/`) | scanned | `npm audit --package-lock-only --prefix svc/api` — one run per npm dependency root |
+| npm root lockfile that `.gitignore` lists (tracked) | **skipped by the recursive walk**; scanned by the explicit npm-root run | as for its location |
+| any other tracked lockfile that `.gitignore` lists | **not scanned** — classified `osv-skipped`, which blocks (B.6) | as for its location |
 | `requirements.txt` at root | scanned | `pip-audit -r requirements.txt` |
 | `requirements.txt` nested | **scanned** | **not run** |
 | `requirements-dev.txt` | scanned | not run |
@@ -82,8 +89,17 @@ exactly as the workflow runs it (`scan source --recursive --allow-no-lockfiles`)
 | `package.json` with dependencies, no lockfile | **not scanned** | not run |
 | `poetry.lock`, `Pipfile.lock`, `uv.lock`, `yarn.lock`, `go.mod`, `Cargo.lock`, `Gemfile.lock` | scanned | none exists |
 
-`detect-ecosystems.mjs` checks only the repository root, and the pip-audit step
-hard-codes `--requirement requirements.txt`. OSV-Scanner is a genuine recursive
+npm audit runs once per **npm dependency root**: every directory holding a
+tracked `package-lock.json` or `npm-shrinkwrap.json` outside `node_modules/`
+(`security/scripts/dependency-roots.mjs`; see C.3). `--prefix` is not cosmetic:
+without it npm walks up from the working directory and, for a lockfile with no
+sibling `package.json` or for an npm workspace member, silently audits the
+ancestor project instead (verified with npm 10). The pinned OSV-Scanner reads
+nested `package-lock.json` and `npm-shrinkwrap.json` files and reports each
+under its own `source.path` (verified against the pinned digest).
+
+The pip-audit step still hard-codes `--requirement requirements.txt` at the
+root, so nested Python projects remain OSV-only. OSV-Scanner is a genuine recursive
 backstop for lockfiles, but **a manifest with no lockfile is scanned by nothing**,
 and the `dependency_scan_result: success` output does not distinguish "every
 manifest scanned" from "no manifest understood".
@@ -254,17 +270,20 @@ on the schedule) and the non-required `gate-mode` visibility job documented in
 
 ### B.6 Dependency coverage contract (option B, strict)
 
-The inspector walks every tracked file (`git ls-files`; a filesystem walk
+The inspector walks the repository's files (`git ls-files`; a filesystem walk
 skipping `.git`/`node_modules` otherwise) and classifies each manifest with the
-table in A.3:
+table in A.3. Only a **tracked** lockfile provides coverage: a CI checkout holds
+nothing else, so an ignored or untracked lockfile is `uncovered` and covers no
+manifest next to it.
 
 | Class | Meaning | Generation |
 | --- | --- | --- |
-| `native+osv` | root `package-lock.json` / `requirements.txt` | allowed |
+| `native+osv` | `package-lock.json` / `npm-shrinkwrap.json` of any npm dependency root (root or nested); root `requirements.txt` | allowed |
 | `osv` (no native scanner exists) | `go.mod`, `Cargo.lock`, `Gemfile.lock`, … | allowed |
 | `osv-unverified` | a lockfile OSV-Scanner documents but that was not verified against the pinned image (`composer.lock`, …) | allowed, with a warning |
 | `workspace` / `covered-by-lockfile` / `no-dependencies` | covered through a lockfile, or declares nothing | allowed |
-| `osv-only` | npm/PyPI file the language-native scanner does not read (nested lockfiles, `yarn.lock`, `pnpm-lock.yaml`, `poetry.lock`, …) | **blocked** |
+| `osv-only` | npm/PyPI file the language-native scanner does not read (nested `requirements.txt`, `yarn.lock`, `pnpm-lock.yaml`, `poetry.lock`, a `package-lock.json` shadowed by an `npm-shrinkwrap.json`, an npm root refused as unsafe, …) | **blocked** |
+| `osv-skipped` | a tracked lockfile that the repository's `.gitignore` rules match (`git ls-files --cached --ignored --exclude-per-directory=.gitignore`) and whose OSV coverage rests on the recursive walk, which skips it — any lockfile except an npm dependency-root lockfile, which is scanned by name (C.3). Reason shown: "tracked lockfile is ignored by Git rules and recursive OSV would skip it" | **blocked** |
 | `uncovered` | a manifest nothing scans (`pyproject.toml` with deps and no lock, `setup.py`, `Pipfile`, `requirements/base.txt`, bare `package.json`) | **blocked** |
 
 **There is no local override.** An earlier draft let an owned, expiring
@@ -285,10 +304,9 @@ add one, designed as:
 
 That mechanism does not exist in this version and is not implemented here.
 
-Option A (a `dependency_roots` contract in `_source-security.yml` running native
-scanners per directory and teaching the gate to merge N reports) is the right
-long-term fix for nested layouts. It changes the gate's input contract and needs
-live validation; it is designed in C.3, not implemented.
+Option A — native scanners per dependency root, with the gate merging N reports —
+is implemented for npm (C.3). It is not implemented for pip-audit or any other
+ecosystem; those nested layouts stay blocked.
 
 ### B.7 Rollout / baseline state machine
 
@@ -509,20 +527,94 @@ made anyway because the accepted behaviour silently produced a wrong baseline;
 fail-closed is the direction this framework resolves such conflicts. Onboarding
 §1.1 now instructs `workflow_dispatch`.
 
-### C.3 Designed, not made: `dependency_roots`
+### C.3 npm dependency roots (implemented)
 
-```yaml
-dependency_roots:        # newline-separated directories; default '.'
-  type: string
-  default: '.'
+An npm **dependency root** is a repository-relative directory holding a tracked
+`package-lock.json` or `npm-shrinkwrap.json`, outside any `node_modules/`. When
+a directory holds both, npm reads the shrinkwrap, so that is the root's lockfile
+and the `package-lock.json` is `osv-only` (shadowed).
+
+One function derives the roots — `discoverNpmRoots()` in
+`security/scripts/dependency-roots.mjs` — and three readers use it:
+
+| Reader | Uses it to |
+| --- | --- |
+| `npm-audit-roots.mjs` (dependency-scanning job) | run `npm audit --json --package-lock-only --prefix <root>` once per root, cwd `<root>`, via `execFile` (no shell) |
+| `osv-npm-roots.mjs` (dependency-scanning job) | run the pinned OSV-Scanner once over exactly the root lockfiles, each named with `-L package-lock.json:/repo/<lockfile>` |
+| `security-gate.mjs` (source-gate job, its own checkout) | require exactly one valid npm audit report per root |
+| `onboarding/lib/inspect.mjs` → `coverage.mjs` | classify an npm lockfile `native+osv` only when it is a root's lockfile |
+
+So `native+osv` in onboarding holds exactly when CI runs npm audit for that
+lockfile's root and OSV-Scanner reads that lockfile.
+
+**Two OSV-Scanner runs, one inventory.** The recursive backstop is unchanged
+(`scan source --recursive --allow-no-lockfiles /repo`, all ecosystems,
+`.gitignore` filtering on). The npm-root run is
+
+```
+docker run --rm -v <checkout>:/repo:ro <same pinned digest> \
+  scan source --allow-no-lockfiles --format=json \
+  -L package-lock.json:/repo/<root lockfile>   # one -L per npm dependency root
 ```
 
-Per root: npm audit when `<root>/package-lock.json` exists, pip-audit when
-`<root>/requirements.txt` exists, reports named `npm-audit.<slug>.json`; the gate
-reads a manifest of reports rather than two fixed file names; `detect-ecosystems.mjs`
-emits a JSON list. Needs gate schema work (per-root report attribution in
-`integrity.failures[].control`) and a live validation run. Until then the CLI
-blocks the layouts it would cover (B.6).
+Pinned-image facts it rests on (`tools/verify-scanner-behaviour.mjs` § 3): `-L`
+reads a tracked lockfile `.gitignore` lists; the `package-lock.json:` parse-as
+prefix is always passed, because without it a `:` inside the path is misread as
+a format prefix, and it reads `npm-shrinkwrap.json` too; `-L`
+cannot share an invocation with a directory argument (exit 127); a missing path
+exits 127; and a lockfile with no vulnerable package is **absent** from
+`results`. So the run cannot show what it scanned, and its report is an envelope
+declaring it, `reports/osv-scanner-npm-roots.json`:
+`{ schemaVersion: 1, scanner, lockfiles: [...], exitCode, report }`. The gate
+requires `lockfiles` to equal its own discovery, rejects any reported source
+that is not one of them, and merges the results into the recursive report (a
+lockfile both runs reported counts once). The scanner never decides the
+inventory: a global `--no-ignore` was rejected because it would have let the
+scanner's own walk, including any untracked file present at scan time, feed the
+gate.
+
+**No caller input.** The reusable workflows derive the roots from the checkout;
+generated callers are unchanged and no permission changed. The `dependency_roots`
+input sketched in an earlier draft was not needed.
+
+**Tracked files only.** Roots come from `git ls-files --cached` (a filesystem
+walk only outside a git work tree), so an ignored or untracked lockfile never
+becomes a root.
+
+**Untrusted paths.** A lockfile path that is absolute or contains an empty,
+`.` or `..` segment, a backslash or a control character is refused. So is a
+root whose directory components or lockfile is a symbolic link (the same "no
+symbolic link anywhere" rule as `onboarding/lib/safe-path.mjs`), or one that
+resolves outside the checkout. A refused root fails the npm audit step, is an
+integrity failure of `dependency-scan` in the gate, and is `osv-only` (blocking)
+in onboarding.
+
+**Reports.** `reports/npm-audit.json` is still exactly npm's output for the
+repository-root project. `reports/npm-audit-nested.json` holds every root below
+it:
+
+```json
+{ "schemaVersion": 1, "scanner": "npm-audit",
+  "roots": [ { "root": "frontend", "lockfile": "frontend/package-lock.json",
+               "status": "valid", "attempts": 1, "report": { "…": "npm audit JSON" } } ] }
+```
+
+Every root is audited even when another fails; each is validated on its own.
+The step fails if any root has no valid report. The gate re-derives the roots and
+reports a `dependency-scan` integrity failure for a missing, failed, duplicated
+or unexpected root. npm audit findings carry `location: <lockfile>` (for example
+`frontend/package-lock.json`), so a finding names the root that produced it;
+`security-gate.json` gains an additive `dependencyRoots.npm` list.
+
+**Residuals:** npm honours a project `.npmrc` in each root (as it always did at
+the repository root), so a repository can point its own audit at another
+registry; this is documented, not changed, here. A tracked lockfile of any
+OTHER ecosystem that `.gitignore` lists is skipped by the recursive OSV-Scanner
+walk; ssd-onboard classifies it `osv-skipped` and blocks (B.6) rather than
+scanning it by name — explicit per-file OSV support exists for npm roots only.
+pip-audit remains root-only; pnpm/yarn workspaces, Poetry, Go, Cargo
+and other multi-root layouts are not covered by this and remain blocked where
+they were.
 
 ### C.4 Designed, not made: explicit empty-means-none for scanner config inputs
 

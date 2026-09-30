@@ -47,9 +47,8 @@ describe('dependency layout: root', () => {
 });
 
 describe('dependency layout: what must NOT be reported as covered', () => {
-  it('a nested package-lock.json / requirements.txt is OSV-only: the native scanner reads the root only', () => {
-    const result = classify({ 'svc/api/package-lock.json': '{}', 'svc/py/requirements.txt': '' });
-    assert.equal(result['svc/api/package-lock.json'], 'osv-only');
+  it('a nested requirements.txt is OSV-only: pip-audit reads the root requirements.txt only', () => {
+    const result = classify({ 'svc/py/requirements.txt': '' });
     assert.equal(result['svc/py/requirements.txt'], 'osv-only');
   });
 
@@ -109,11 +108,11 @@ describe('dependency layout: legitimately covered or empty', () => {
 });
 
 describe('partial dependency coverage is strictly blocking', () => {
-  const manifests = classifyManifests(['svc/package-lock.json', 'setup.py', 'package-lock.json', 'go.mod', 'composer.lock', 'pnpm-lock.yaml'], () => null).manifests;
+  const manifests = classifyManifests(['svc/requirements.txt', 'setup.py', 'package-lock.json', 'go.mod', 'composer.lock', 'pnpm-lock.yaml'], () => null).manifests;
 
   it('every osv-only / uncovered manifest blocks; nothing in the config can unblock it', () => {
     const { blocking } = dependencyFindings(manifests);
-    assert.deepEqual(blocking.map((m) => m.path).sort(), ['pnpm-lock.yaml', 'setup.py', 'svc/package-lock.json']);
+    assert.deepEqual(blocking.map((m) => m.path).sort(), ['pnpm-lock.yaml', 'setup.py', 'svc/requirements.txt']);
     assert.equal(dependencyFindings.length, 1, 'dependencyFindings takes no acknowledgement argument');
   });
 

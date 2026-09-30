@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 
 import { correlationRecord } from './correlate-findings.mjs';
 import { collectDependencyEvidenceSafely } from './dependency-evidence.mjs';
+import { requireNpmRoots } from './dependency-roots.mjs';
 import { detectEcosystems } from './detect-ecosystems.mjs';
 import { EXECUTION_SCHEMA_VERSION, readExecutionRecords } from './scanner-execution.mjs';
 
@@ -18,6 +19,12 @@ const DEFAULT_PATHS = {
   gitleaks: 'reports/gitleaks.json',
   trufflehog: 'reports/trufflehog.json',
   npmAudit: 'reports/npm-audit.json',
+  // npm audit reports for every npm dependency root BELOW the repository root
+  // (npm-audit-roots.mjs); the repository-root project stays in npmAudit.
+  npmAuditNested: 'reports/npm-audit-nested.json',
+  // OSV-Scanner run over exactly the npm dependency-root lockfiles
+  // (osv-npm-roots.mjs), merged with the recursive OSV-Scanner report.
+  osvNpmRoots: 'reports/osv-scanner-npm-roots.json',
   pipAudit: 'reports/pip-audit.json',
   osv: 'reports/osv-scanner.json',
   semgrep: 'reports/semgrep.json',
@@ -389,7 +396,10 @@ function evaluateSecrets(policy, gitleaks, trufflehog, findings) {
   }
 }
 
-function evaluateNpmAudit(policy, report, findings) {
+// `lockfile` is the repository path of the lockfile npm audited (from
+// dependency-roots.mjs); it is recorded as each finding's `location`, so a
+// finding says which dependency root produced it.
+function evaluateNpmAudit(policy, report, findings, lockfile = null) {
   assert(report && typeof report === 'object', 'npm audit report must be an object');
   assert(report.auditReportVersion, 'npm audit report is missing auditReportVersion');
   assert(
@@ -442,6 +452,7 @@ function evaluateNpmAudit(policy, report, findings) {
     addFinding(findings, policy, {
       source: 'npm-audit',
       id: packageName,
+      ...(lockfile ? { location: lockfile } : {}),
       severity,
       fixAvailable,
       policyRule,
@@ -454,6 +465,95 @@ function evaluateNpmAudit(policy, report, findings) {
       ...(advisory?.url ? { url: advisory.url } : {})
     });
   }
+}
+
+// The per-root npm audit reports for dependency roots below the repository root
+// (npm-audit-nested.json, written by npm-audit-roots.mjs), checked against the
+// roots the GATE derived from its own checkout. Exactly one valid report per
+// expected root: a missing root was not audited, a failed one has unknown
+// findings, and one the checkout does not have means the scan and the gate
+// disagree about what was scanned. Each is an integrity failure, never a skip.
+function nestedNpmAuditReports(record, expected) {
+  assert(record && typeof record === 'object' && !Array.isArray(record), 'npm audit nested report must be an object');
+  assert(record.schemaVersion === 1, `npm audit nested report has unsupported schemaVersion ${record.schemaVersion}`);
+  assert(Array.isArray(record.roots), 'npm audit nested report is missing its roots array');
+  assert(
+    !Array.isArray(record.rejected) || record.rejected.length === 0,
+    `npm audit refused dependency root(s): ${(record.rejected ?? []).map((entry) => entry?.path).join(', ')}`
+  );
+  const byRoot = new Map();
+  for (const entry of record.roots) {
+    assert(
+      entry && typeof entry.root === 'string' && typeof entry.lockfile === 'string',
+      'npm audit nested report has an entry without root and lockfile'
+    );
+    assert(!byRoot.has(entry.root), `npm audit nested report lists dependency root '${entry.root}' more than once`);
+    byRoot.set(entry.root, entry);
+  }
+  const reports = [];
+  for (const { root, lockfile } of expected) {
+    const entry = byRoot.get(root);
+    assert(entry, `npm audit report for dependency root '${root}' (${lockfile}) is missing: that project was not audited`);
+    assert(
+      entry.lockfile === lockfile,
+      `npm audit for dependency root '${root}' read ${entry.lockfile}, but the lockfile there is ${lockfile}`
+    );
+    assert(
+      entry.status === 'valid',
+      `npm audit for dependency root '${root}' (${lockfile}) produced no valid report: ${entry.error ?? `status ${entry.status}`}`
+    );
+    reports.push({ root, lockfile, report: entry.report });
+    byRoot.delete(root);
+  }
+  assert(
+    byRoot.size === 0,
+    `npm audit nested report lists dependency root(s) this checkout does not have: ${[...byRoot.keys()].join(', ')}`
+  );
+  return reports;
+}
+
+// osv-scanner-npm-roots.json (osv-npm-roots.mjs): the results of an OSV-Scanner
+// run that named each npm dependency-root lockfile explicitly. OSV-Scanner omits
+// a lockfile with no vulnerable package from `results`, so what was scanned is
+// the envelope's declared `lockfiles`, which must equal the gate's own roots.
+// Every reported source must be one of them.
+const OSV_MOUNT = '/repo/';
+function npmRootOsvResults(record, expectedLockfiles) {
+  assert(record && typeof record === 'object' && !Array.isArray(record), 'OSV-Scanner (npm dependency roots) report must be an object');
+  assert(record.schemaVersion === 1, `OSV-Scanner (npm dependency roots) report has unsupported schemaVersion ${record.schemaVersion}`);
+  assert(
+    Array.isArray(record.lockfiles) && record.lockfiles.every((lockfile) => typeof lockfile === 'string'),
+    'OSV-Scanner (npm dependency roots) report does not declare its lockfiles'
+  );
+  const declared = new Set(record.lockfiles);
+  const missing = expectedLockfiles.filter((lockfile) => !declared.has(lockfile));
+  assert(missing.length === 0, `OSV-Scanner did not scan npm dependency-root lockfile(s): ${missing.join(', ')}`);
+  const extra = record.lockfiles.filter((lockfile) => !expectedLockfiles.includes(lockfile));
+  assert(extra.length === 0, `OSV-Scanner (npm dependency roots) scanned lockfile(s) this checkout does not declare: ${extra.join(', ')}`);
+  const report = record.report;
+  assert(report && typeof report === 'object' && Object.hasOwn(report, 'results'), 'OSV-Scanner (npm dependency roots) report has no results');
+  assert(report.results === null || Array.isArray(report.results), 'OSV-Scanner (npm dependency roots) results must be an array or null');
+  const allowed = new Set(expectedLockfiles.map((lockfile) => `${OSV_MOUNT}${lockfile}`));
+  for (const result of report.results ?? []) {
+    assert(
+      allowed.has(result?.source?.path),
+      `OSV-Scanner (npm dependency roots) reported ${JSON.stringify(result?.source?.path)}, which is not a declared npm dependency-root lockfile`
+    );
+  }
+  return report.results ?? [];
+}
+
+// The recursive report plus the explicit npm-root results for lockfiles the
+// recursive walk did not report (it skips tracked files .gitignore lists). A
+// lockfile both runs reported is kept once, from the recursive run. A malformed
+// recursive report is returned untouched so evaluateOsv rejects it.
+function mergeOsvResults(osv, npmRootResults) {
+  if (npmRootResults.length === 0 || !osv || typeof osv !== 'object' || !(osv.results === null || Array.isArray(osv.results))) {
+    return osv;
+  }
+  const seen = new Set((osv.results ?? []).map((result) => result?.source?.path));
+  const added = npmRootResults.filter((result) => !seen.has(result.source.path));
+  return added.length === 0 ? osv : { ...osv, results: [...(osv.results ?? []), ...added] };
 }
 
 // pip-audit's JSON differs from npm audit's in two ways that matter here:
@@ -1042,19 +1142,26 @@ export async function runSecurityGate(options = {}) {
     });
     // A language-native dependency report is REQUIRED (fail-closed on a missing
     // file) only when the scanner that produces it would actually run — i.e. its
-    // audit-target file exists (package-lock.json for npm audit, requirements.txt
-    // for pip-audit). Otherwise its absence is a clean skip. OSV-Scanner is always
+    // audit target exists (an npm dependency root for npm audit, see below; a
+    // root requirements.txt for pip-audit). Otherwise its absence is a clean skip. OSV-Scanner is always
     // required and covers every ecosystem's lockfiles, so dependency coverage is
     // never fully absent even when a language-native report is skipped.
     const ecosystems = await attributed('source-gate', () => detectEcosystems(paths.repoDir));
-    const [gitleaks, trufflehog, osv, semgrep, baseline, npmAudit, pipAudit] = await Promise.all([
+    // npm audit is required once per npm dependency root, derived here from the
+    // gate's own checkout with the same function the scanning job used — not
+    // from anything the scanning job reported. A root refused as unsafe (a
+    // symbolic link, an escaping path) is a dependency project nobody audited.
+    const npmRoots = await attributed('dependency-scan', () => requireNpmRoots(paths.repoDir));
+    const topNpmRoot = npmRoots.find((entry) => entry.root === '.') ?? null;
+    const nestedNpmRoots = npmRoots.filter((entry) => entry.root !== '.');
+    const [gitleaks, trufflehog, osv, semgrep, baseline, npmAudit, pipAudit, npmAuditNested] = await Promise.all([
       attributed('secret-scan', () => readJson(paths.gitleaks, 'Gitleaks')),
       attributed('secret-scan', () => readJson(paths.trufflehog, 'TruffleHog')),
       attributed('dependency-scan', () => readJson(paths.osv, 'OSV-Scanner')),
       attributed('sast', () => readJson(paths.semgrep, 'Semgrep')),
       attributed('source-gate', () => readBaseline(paths.baseline, { bootstrap, lifecycle })),
       attributed('dependency-scan', () =>
-        ecosystems.packageLock
+        topNpmRoot
           ? readJson(paths.npmAudit, 'npm audit')
           : readOptionalJson(paths.npmAudit, 'npm audit')
       ),
@@ -1062,18 +1169,47 @@ export async function runSecurityGate(options = {}) {
         ecosystems.requirementsTxt
           ? readJson(paths.pipAudit, 'pip-audit')
           : readOptionalJson(paths.pipAudit, 'pip-audit')
+      ),
+      attributed('dependency-scan', () =>
+        nestedNpmRoots.length > 0
+          ? readJson(paths.npmAuditNested, 'npm audit (nested dependency roots)')
+          : readOptionalJson(paths.npmAuditNested, 'npm audit (nested dependency roots)')
       )
     ]);
+    // The explicit OSV-Scanner run over the npm dependency-root lockfiles. It
+    // must have declared exactly the lockfiles the gate derived, and may report
+    // nothing else: a scanner never widens the dependency inventory.
+    const npmRootOsv = await attributed('dependency-scan', async () => {
+      const record =
+        npmRoots.length > 0
+          ? await readJson(paths.osvNpmRoots, 'OSV-Scanner (npm dependency roots)')
+          : await readOptionalJson(paths.osvNpmRoots, 'OSV-Scanner (npm dependency roots)');
+      return record === null ? [] : npmRootOsvResults(record, npmRoots.map((entry) => entry.lockfile));
+    });
+    const osvEffective = mergeOsvResults(osv, npmRootOsv);
+    const nestedNpmAudits =
+      npmAuditNested === null
+        ? []
+        : await attributed('dependency-scan', () => nestedNpmAuditReports(npmAuditNested, nestedNpmRoots));
     const findings = [];
 
     await attributed('secret-scan', () => evaluateSecrets(policy, gitleaks, trufflehog, findings));
     if (npmAudit !== null) {
-      await attributed('dependency-scan', () => evaluateNpmAudit(policy, npmAudit, findings));
+      await attributed('dependency-scan', () => evaluateNpmAudit(policy, npmAudit, findings, topNpmRoot?.lockfile ?? null));
+    }
+    for (const { root, lockfile, report } of nestedNpmAudits) {
+      await attributed('dependency-scan', () => {
+        try {
+          evaluateNpmAudit(policy, report, findings, lockfile);
+        } catch (error) {
+          throw new Error(`npm audit report for dependency root '${root}' (${lockfile}): ${error.message}`, { cause: error });
+        }
+      });
     }
     if (pipAudit !== null) {
       await attributed('dependency-scan', () => evaluatePipAudit(policy, pipAudit, findings));
     }
-    await attributed('dependency-scan', () => evaluateOsv(policy, osv, findings));
+    await attributed('dependency-scan', () => evaluateOsv(policy, osvEffective, findings));
     await attributed('sast', () => evaluateSemgrep(policy, semgrep, baseline, findings, bootstrap));
     markBreakGlassEligibility(policy, findings);
 
@@ -1091,7 +1227,7 @@ export async function runSecurityGate(options = {}) {
       repoDir: paths.repoDir,
       pipAudit,
       pipAuditSource: pipAudit !== null ? ecosystems.requirementsTxt : null,
-      osv
+      osv: osvEffective
     });
     result = {
       verdict,
@@ -1110,6 +1246,15 @@ export async function runSecurityGate(options = {}) {
       // scanner observed, and the manifests those scanners analyzed. See
       // docs/evidence-model.md. Never read by a policy decision.
       dependencyEvidence,
+      // The npm dependency roots this run required and evaluated an npm audit
+      // report for (additive), so a reader can see which projects were audited.
+      dependencyRoots: {
+        npm: npmRoots.map(({ root, lockfile }) => ({
+          root,
+          lockfile,
+          report: root === '.' ? 'npm-audit.json' : 'npm-audit-nested.json'
+        }))
+      },
       // Scanner execution evidence (additive): whether each recorded scanner
       // acquired its image, ran, and wrote a valid report. Kept apart from
       // `integrity` (could the gate trust a report) and from findings.
@@ -1160,6 +1305,8 @@ function parseArguments(arguments_) {
     '--gitleaks': 'gitleaks',
     '--trufflehog': 'trufflehog',
     '--npm-audit': 'npmAudit',
+    '--npm-audit-nested': 'npmAuditNested',
+    '--osv-npm-roots': 'osvNpmRoots',
     '--pip-audit': 'pipAudit',
     '--osv': 'osv',
     '--semgrep': 'semgrep',

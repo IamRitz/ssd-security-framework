@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 1,
+  "scanner": "osv-scanner",
+  "lockfiles": ["package-lock.json"],
+  "exitCode": 0,
+  "report": { "results": null }
+}

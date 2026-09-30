@@ -290,8 +290,10 @@ export async function analyze({ root, config, configErrors = [], configWarnings 
         `${manifest.path}: ${COVERAGE_CLASSES[manifest.coverage]} (${manifest.why.join('; ')}). ` +
         'This layout is UNSUPPORTED by the current framework, and generation is blocked rather than claiming coverage that does not exist. ' +
         (manifest.coverage === 'osv-only'
-          ? 'Supporting it needs the dependency_roots framework change (docs/onboarding-architecture.md C.3).'
-          : 'Commit a lockfile the framework scans (see docs/onboarding-cli.md § Dependency layouts).') +
+          ? 'The framework runs no language-native scanner for it; see docs/onboarding-cli.md § Dependency layouts for the supported layouts.'
+          : manifest.coverage === 'osv-skipped'
+            ? 'Remove the .gitignore rule that matches this committed lockfile (a tracked file needs no ignore rule), so OSV-Scanner reads it.'
+            : 'Commit a lockfile the framework scans (see docs/onboarding-cli.md § Dependency layouts).') +
         ' There is deliberately no local override in this version.'
     });
   }

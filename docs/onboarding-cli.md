@@ -203,24 +203,36 @@ Generation is **blocked** (exit 1, nothing written) by:
 
 | Class | Example | |
 | --- | --- | --- |
-| `native+osv` | root `package-lock.json`, root `requirements.txt` | covered |
+| `native+osv` | `package-lock.json` / `npm-shrinkwrap.json` of any npm project, root or nested (`frontend/package-lock.json`); root `requirements.txt` | covered |
 | `osv` | `go.mod`, `Cargo.lock`, `Gemfile.lock` | covered (no native scanner exists) |
 | `workspace` / `covered-by-lockfile` / `no-dependencies` | npm workspace member; `pyproject.toml` + `uv.lock` | covered |
 | `osv-unverified` | `pnpm-lock.yaml`, `composer.lock` | warning: OSV documents it; not verified against the pinned image |
-| `osv-only` | `services/api/package-lock.json`, root `yarn.lock` / `pnpm-lock.yaml` / `poetry.lock` | **blocks** |
-| `uncovered` | `package.json` with deps and no lockfile, `pyproject.toml` with deps and no lockfile, `setup.py`, `requirements/base.txt` | **blocks** |
+| `osv-only` | `services/py/requirements.txt`, root `yarn.lock` / `pnpm-lock.yaml` / `poetry.lock` | **blocks** |
+| `osv-skipped` | a committed `Cargo.lock` / `poetry.lock` / `yarn.lock` / … that `.gitignore` also lists (the recursive OSV-Scanner walk skips it); npm dependency-root lockfiles are exempt, OSV-Scanner reads those by name | **blocks** — remove the ignore rule |
+| `uncovered` | `package.json` with deps and no lockfile, `pyproject.toml` with deps and no lockfile, `setup.py`, `requirements/base.txt`, any lockfile that is not tracked by git | **blocks** |
+
+**Nested npm projects are supported.** Every directory with a tracked
+`package-lock.json` or `npm-shrinkwrap.json` is an npm dependency root; CI runs
+`npm audit --package-lock-only` separately in each (pinned with `--prefix`),
+and OSV-Scanner scans each of those lockfiles by name — even one `.gitignore`
+lists, as long as it is tracked. Nothing needs to be configured. A finding from
+a nested root names its lockfile and is reproduced with
+`npm audit --package-lock-only --prefix <root>`; a project `.npmrc` in a root is
+honoured by npm, as it always was at the repository root.
+Commit the lockfiles: an ignored or untracked lockfile is not in the CI checkout
+and gives no coverage. See [architecture § C.3](onboarding-architecture.md#c3-npm-dependency-roots-implemented).
 
 There is **no local acknowledgement**: a gap accepted in this file would expire
 only when someone next ran ssd-onboard, while CI kept passing. A future version
 may add a conformance-backed, CI-enforced exception (owner, reason, expiry,
 control ID); see [architecture § B.6](onboarding-architecture.md#b6-dependency-coverage-contract-option-b-strict).
 
-**Currently unsupported layouts** (blocked by default): monorepos whose npm or
-Python projects live below the root, root `yarn.lock` / `pnpm-lock.yaml` /
-`poetry.lock` / `Pipfile.lock` / `uv.lock` projects (OSV-Scanner only), and any
-Python project declared only in `pyproject.toml` / `setup.py` / `setup.cfg` /
-`Pipfile` without a lockfile. The fix for the first group is a framework
-change (architecture doc C.3); for the last, commit a lockfile.
+**Currently unsupported layouts** (blocked by default): Python projects below
+the root (pip-audit reads the root `requirements.txt` only), root `yarn.lock` /
+`pnpm-lock.yaml` / `poetry.lock` / `Pipfile.lock` / `uv.lock` projects
+(OSV-Scanner only), and any Python project declared only in `pyproject.toml` /
+`setup.py` / `setup.cfg` / `Pipfile` without a lockfile. The first two need
+framework changes that do not exist yet; for the last, commit a lockfile.
 
 ## Readiness: doctor
 

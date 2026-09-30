@@ -8,15 +8,22 @@
 import { createHash } from 'node:crypto';
 import { posix } from 'node:path';
 
+import { npmDependencyRoots } from '../../security/scripts/dependency-roots.mjs';
+
 // --- dependency manifests ------------------------------------------------------
 
 // `osv`: OSV-Scanner (run by the framework with `scan source --recursive`) reads
 // the file. `verified`: observed with the pinned OSV-Scanner v2.4.0.
 // `nativeAtRoot`: the language-native scanner the framework runs, and only for
-// the file at the repository root (detect-ecosystems.mjs checks the root only).
+// the file at the repository root (pip-audit's step audits the root
+// requirements.txt only).
+// `nativeRoots`: npm audit runs once per npm DEPENDENCY ROOT, at any depth —
+// the directories security/scripts/dependency-roots.mjs derives from tracked
+// files, the same function the scanning job and the source gate use. A lockfile
+// is native-covered only when it is the lockfile of such a root.
 const LOCKFILES = {
-  'package-lock.json': { ecosystem: 'npm', osv: true, verified: true, nativeAtRoot: 'npm audit' },
-  'npm-shrinkwrap.json': { ecosystem: 'npm', osv: true, verified: false },
+  'package-lock.json': { ecosystem: 'npm', osv: true, verified: true, nativeRoots: 'npm audit' },
+  'npm-shrinkwrap.json': { ecosystem: 'npm', osv: true, verified: true, nativeRoots: 'npm audit' },
   'yarn.lock': { ecosystem: 'npm', osv: true, verified: true },
   'pnpm-lock.yaml': { ecosystem: 'npm', osv: true, verified: false },
   'bun.lock': { ecosystem: 'npm', osv: true, verified: false },
@@ -41,7 +48,7 @@ const LOCKFILES = {
 // Manifests that declare dependencies but are not themselves read by any
 // scanner the framework runs. Covered only through a lockfile (`coveredBy`).
 const MANIFESTS = {
-  'package.json': { ecosystem: 'npm', coveredBy: ['package-lock.json', 'npm-shrinkwrap.json', 'yarn.lock', 'pnpm-lock.yaml', 'bun.lock'] },
+  'package.json': { ecosystem: 'npm', coveredBy: ['npm-shrinkwrap.json', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'bun.lock'] },
   'pyproject.toml': { ecosystem: 'PyPI', coveredBy: ['poetry.lock', 'uv.lock', 'pdm.lock', 'pylock.toml'] },
   'setup.py': { ecosystem: 'PyPI', coveredBy: [] },
   'setup.cfg': { ecosystem: 'PyPI', coveredBy: [] },
@@ -66,6 +73,7 @@ export const COVERAGE_CLASSES = {
   osv: 'OSV-Scanner (the framework runs no language-native scanner for this ecosystem)',
   'osv-unverified': 'OSV-Scanner documents this format; not verified against the pinned image',
   'osv-only': 'OSV-Scanner only — the framework\'s language-native scanner does NOT read this file',
+  'osv-skipped': 'tracked, but ignored by Git rules — the recursive OSV-Scanner walk skips it',
   workspace: 'covered by an ancestor package-lock.json that records this workspace',
   'covered-by-lockfile': 'covered through its lockfile',
   'no-dependencies': 'declares no dependencies',
@@ -73,7 +81,7 @@ export const COVERAGE_CLASSES = {
 };
 
 // Classes that block generation. Nothing in the config can unblock them.
-export const BLOCKING_CLASSES = new Set(['osv-only', 'uncovered']);
+export const BLOCKING_CLASSES = new Set(['osv-only', 'osv-skipped', 'uncovered']);
 
 function hasEntries(value) {
   return value && typeof value === 'object' && Object.keys(value).length > 0;
@@ -146,13 +154,35 @@ function lockfileWorkspaces(text) {
   }
 }
 
-// files: every tracked path (posix, relative). readText(path) -> string|null.
-export function classifyManifests(files, readText) {
-  const fileSet = new Set(files);
+// files: every repository path (posix, relative). readText(path) -> string|null.
+// options.tracked: the paths git tracks (a CI checkout contains exactly these),
+//   or null/undefined when every path in `files` is to be treated as tracked
+//   (outside git, and in unit tests). A lockfile that is not tracked covers
+//   nothing: CI never sees it.
+// options.npmRoots: the result of dependency-roots.mjs discoverNpmRoots() for
+//   the checkout (roots, rejected, shadowed), so filesystem confinement
+//   (symbolic links) is decided exactly as the scanner decides it. Without it,
+//   roots are derived lexically from the tracked paths.
+// options.ignoredTracked: tracked paths that the repository's .gitignore rules
+//   match (`git ls-files --cached --ignored`). The pinned OSV-Scanner's
+//   recursive walk skips them even though they are tracked (verified; see
+//   docs/onboarding-architecture.md A.3), so a lockfile whose OSV coverage rests
+//   on that walk is not covered. An npm dependency-root lockfile is exempt: it
+//   is also scanned by name (security/scripts/osv-npm-roots.mjs).
+export function classifyManifests(files, readText, { tracked = null, npmRoots = null, ignoredTracked = null } = {}) {
+  const ignoredSet = new Set(ignoredTracked ?? []);
+  const trackedSet = tracked ? new Set(tracked) : null;
+  const isTracked = (file) => trackedSet === null || trackedSet.has(file);
+  // Only a tracked lockfile can cover anything: it is all CI will check out.
+  const fileSet = new Set(files.filter(isTracked));
+  const npm = npmRoots ?? npmDependencyRoots([...fileSet]);
+  const npmRootByLockfile = new Map(npm.roots.map((entry) => [entry.lockfile, entry.root]));
+  const npmRejected = new Map(npm.rejected.map((entry) => [entry.path, entry.reason]));
+  const npmShadowed = new Map(npm.shadowed.map((entry) => [entry.path, entry.by]));
   const results = [];
   const skippedVendored = [];
   const workspaceIndex = new Map();
-  for (const file of files) {
+  for (const file of fileSet) {
     if (posix.basename(file) === 'package-lock.json' && !/(^|\/)node_modules\//.test(file)) {
       const dir = posix.dirname(file);
       const workspaces = lockfileWorkspaces(readText(file) ?? '');
@@ -171,9 +201,19 @@ export function classifyManifests(files, readText) {
     const atRoot = dir === '.';
     let entry = null;
 
-    if (LOCKFILES[name] || isRequirementsVariant(name)) {
+    if ((LOCKFILES[name] || isRequirementsVariant(name)) && !isTracked(file)) {
+      entry = {
+        path: file,
+        ecosystem: (LOCKFILES[name] ?? { ecosystem: 'PyPI' }).ecosystem,
+        kind: 'lockfile',
+        coverage: 'uncovered',
+        native: null,
+        why: ['not tracked by git: a CI checkout does not contain it, so no scanner reads it (commit it to get coverage)']
+      };
+    } else if (LOCKFILES[name] || isRequirementsVariant(name)) {
       const spec = LOCKFILES[name] ?? { ecosystem: 'PyPI', osv: true, verified: true };
-      const native = atRoot && spec.nativeAtRoot ? spec.nativeAtRoot : null;
+      const npmRoot = spec.nativeRoots ? npmRootByLockfile.get(file) : undefined;
+      const native = npmRoot !== undefined ? spec.nativeRoots : atRoot && spec.nativeAtRoot ? spec.nativeAtRoot : null;
       let coverage;
       if (native) {
         coverage = 'native+osv';
@@ -183,8 +223,18 @@ export function classifyManifests(files, readText) {
         coverage = spec.verified ? 'osv' : 'osv-unverified';
       }
       const why = [];
+      // Named only for a nested root; the repository root reads as it always did.
+      if (npmRoot !== undefined && npmRoot !== '.') {
+        why.push(`npm audit runs in dependency root ${npmRoot}; OSV-Scanner reads the lockfile`);
+      }
       if (coverage === 'osv-only') {
-        if (LOCKFILES[name]?.nativeAtRoot) {
+        if (npmRejected.has(file)) {
+          why.push(`npm audit refuses this dependency root: ${npmRejected.get(file)}`);
+        } else if (npmShadowed.has(file)) {
+          why.push(`npm audit reads ${npmShadowed.get(file)} in this directory instead`);
+        } else if (spec.nativeRoots) {
+          why.push(`npm audit does not run for ${file}`);
+        } else if (LOCKFILES[name]?.nativeAtRoot) {
           why.push(`${LOCKFILES[name].nativeAtRoot} runs only on the repository-root ${name}`);
         } else {
           why.push(`the framework runs no ${spec.ecosystem === 'npm' ? 'npm audit' : 'pip-audit'} for ${name}`);
@@ -192,6 +242,10 @@ export function classifyManifests(files, readText) {
         if (!spec.verified) {
           why.push('OSV-Scanner support for this format was not verified against the pinned image');
         }
+      }
+      if (npmRoot === undefined && ignoredSet.has(file)) {
+        coverage = 'osv-skipped';
+        why.splice(0, why.length, 'tracked lockfile is ignored by Git rules and recursive OSV would skip it');
       }
       entry = { path: file, ecosystem: spec.ecosystem, kind: 'lockfile', coverage, native, why };
     } else if (isRequirementsDirFile(file)) {

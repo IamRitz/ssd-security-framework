@@ -227,15 +227,15 @@ describe('render, update and drift', () => {
 
 describe('validation blocks generation on real coverage gaps', () => {
   it('a nested lockfile the native scanner never reads blocks render, and says exactly why', async (t) => {
-    const root = makeRepo(t, { ...PY_REPO, 'services/api/package-lock.json': '{"lockfileVersion":3,"packages":{}}' });
+    const root = makeRepo(t, { ...PY_REPO, 'services/py/requirements.txt': 'requests==2.19.1\n' });
     writeConfig(root, 'source-only');
     const result = await cli(root, ['render']);
     assert.equal(result.code, 1);
-    assert.match(result.out, /services\/api\/package-lock\.json: OSV-Scanner only/);
-    assert.match(result.out, /npm audit runs only on the repository-root package-lock\.json/);
+    assert.match(result.out, /services\/py\/requirements\.txt: OSV-Scanner only/);
+    assert.match(result.out, /pip-audit runs only on the repository-root requirements\.txt/);
     assert.match(result.out, /UNSUPPORTED by the current framework/);
     assert.match(result.out, /There is deliberately no local override/);
-    assert.match(result.out, /Not fully covered: services\/api\/package-lock\.json \(osv-only, UNSUPPORTED/);
+    assert.match(result.out, /Not fully covered: services\/py\/requirements\.txt \(osv-only, UNSUPPORTED/);
     assert.ok(!existsSync(join(root, '.github/workflows/security.yml')), 'nothing generated');
   });
 

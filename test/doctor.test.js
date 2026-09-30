@@ -237,13 +237,13 @@ describe('doctor: readiness per repository state', () => {
 
   it('an uncovered dependency layout is a FAIL, using the existing coverage classes', async (t) => {
     const root = await consumer(t);
-    write(root, 'services/api/package-lock.json', '{"lockfileVersion":3,"packages":{}}');
-    commitAll(root, 'nested lockfile');
+    write(root, 'services/py/requirements.txt', 'requests==2.19.1\n');
+    commitAll(root, 'nested requirements');
     const { code, report } = await doctorJson(root);
     assert.equal(code, 1);
     const deps = checkOf(report, 'dependencies');
     assert.equal(deps.status, FAIL);
-    assert.match(deps.observed.join('\n'), /services\/api\/package-lock\.json: osv-only/);
+    assert.match(deps.observed.join('\n'), /services\/py\/requirements\.txt: osv-only/);
     assert.match(deps.evidence[0].message, /UNSUPPORTED by the current framework/);
     await assertAttribution(root);
   });
