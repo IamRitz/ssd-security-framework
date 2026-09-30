@@ -392,7 +392,7 @@ function codeownersCheck(config, facts) {
     status: NOT_VERIFIED,
     observed: [
       facts.codeowners ? `${facts.codeowners} present` : 'no CODEOWNERS file',
-      'local heuristic coverage is not proof: the matcher is syntactic (known to over-claim for `/*` and ownerless rules), and whether GitHub REQUIRES code-owner review cannot be seen locally'
+      'local heuristic coverage is not proof: the matcher is a conservative subset of CODEOWNERS syntax, and whether GitHub accepts the owners or REQUIRES code-owner review cannot be seen locally'
     ],
     expected: securityOwnedPaths(config),
     why: 'without a designated security/platform reviewer, an application PR could change gate mode, baseline, scan scope or workflow wiring unreviewed.',

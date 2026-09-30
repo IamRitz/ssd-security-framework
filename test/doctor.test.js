@@ -19,7 +19,7 @@ import { serializeConfig } from '../onboarding/lib/config.mjs';
 import { contractProblems } from '../onboarding/lib/contract.mjs';
 import { FAIL, NOT_VERIFIED, PASS, WARN, describeSourceBoundary, diagnose, githubSettingsUrl, routeEntry } from '../onboarding/lib/doctor.mjs';
 import { withMarker } from '../onboarding/lib/files.mjs';
-import { inspectRepository, parseRemoteHost } from '../onboarding/lib/inspect.mjs';
+import { inspectRepository, parseGithubSlug, parseRemoteHost } from '../onboarding/lib/inspect.mjs';
 import { renderAll } from '../onboarding/lib/render.mjs';
 import { FRAMEWORK, SAMPLE_BASELINE, capture, commitAll, config, deepMerge, makeRepo, read, write } from './support/onboarding-fixtures.mjs';
 
@@ -296,6 +296,29 @@ describe('doctor: readiness per repository state', () => {
     assert.equal((await cli(root, ['validate'])).code, 0);
   });
 
+  it('a look-alike GitHub host is not a confirmed identity: WARN, never PASS, never a block', async (t) => {
+    for (const url of ['https://github.com.evil.example/acme/app.git', 'git@github.com.evil.example:acme/app.git', 'https://notgithub.com/acme/app.git', 'https://example.com/github.com/acme/app.git']) {
+      const root = await consumer(t);
+      execFileSync('git', ['-C', root, 'remote', 'set-url', 'origin', url]);
+      const { code, report } = await doctorJson(root);
+      assert.equal(code, 0, url);
+      const identity = checkOf(report, 'identity');
+      assert.equal(identity.status, WARN, url);
+      assert.match(identity.observed.join('\n'), /origin \(not a GitHub remote, or none\)/, url);
+      assert.match(identity.observed.join('\n'), /identity not established: origin is absent or is not a GitHub remote/, url);
+      assert.equal((await cli(root, ['validate'])).code, 0, `${url}: an unknown identity does not block`);
+    }
+  });
+
+  it('a mixed-case or ported github.com origin is a confirmed identity', async (t) => {
+    for (const url of ['git@GitHub.com:ACME/App.git', 'ssh://git@github.com:22/acme/app.git']) {
+      const root = await consumer(t);
+      execFileSync('git', ['-C', root, 'remote', 'set-url', 'origin', url]);
+      const { report } = await doctorJson(root);
+      assert.equal(statusOf(report, 'identity'), PASS, url);
+    }
+  });
+
   it('a non-git directory: identity not established (WARN)', async (t) => {
     const root = await consumer(t);
     rmSync(join(root, '.git'), { recursive: true, force: true });
@@ -315,11 +338,28 @@ describe('doctor: readiness per repository state', () => {
   });
 
   it('CODEOWNERS the heuristic considers complete is still NOT VERIFIED, never PASS', async (t) => {
-    // `/*` is the known over-claim: GitHub matches root-level files only.
-    const root = await consumer(t, { files: { '.github/CODEOWNERS': '/* @acme/sec\n' } });
+    const root = await consumer(t, { files: { '.github/CODEOWNERS': '* @acme/sec\n' } });
     const { report } = await doctorJson(root);
     assert.equal(statusOf(report, 'codeowners'), NOT_VERIFIED);
     assert.match(checkOf(report, 'codeowners').observed.join('\n'), /heuristic coverage is not proof/);
+  });
+
+  it('`/*` is not recursive: the nested security paths are a CODEOWNERS WARN, not coverage', async (t) => {
+    // GitHub matches `/*` against root-level files only.
+    const root = await consumer(t, { files: { '.github/CODEOWNERS': '/* @acme/sec\n' } });
+    const { code, report } = await doctorJson(root);
+    assert.equal(code, 0);
+    const owners = checkOf(report, 'codeowners');
+    assert.equal(owners.status, WARN);
+    assert.match(owners.evidence.map((e) => e.message).join('\n'), /does not cover: \.ssd\/ \.github\/workflows\/ security\/baseline\/semgrep-baseline\.json/);
+  });
+
+  it('a later ownerless rule un-owns a security path: WARN, never PASS', async (t) => {
+    const root = await consumer(t, { files: { '.github/CODEOWNERS': '* @acme/sec\n.ssd/onboarding.yml\n' } });
+    const { report } = await doctorJson(root);
+    const owners = checkOf(report, 'codeowners');
+    assert.equal(owners.status, WARN);
+    assert.match(owners.evidence.map((e) => e.message).join('\n'), /does not cover: \.ssd\/$/);
   });
 });
 
@@ -639,5 +679,37 @@ describe('doctor: governance guidance is host-neutral', () => {
     assert.equal(githubSettingsUrl(cfg, { git: { host: 'github.com', slug: 'ACME/app' } }, 'rules'), 'https://github.com/acme/app/settings/rules');
     assert.equal(githubSettingsUrl(cfg, { git: { host: 'notgithub.com', slug: 'acme/app' } }, 'rules'), null);
     assert.equal(githubSettingsUrl(cfg, { git: { host: 'github.com', slug: null } }, 'rules'), null);
+  });
+
+  it('parseGithubSlug requires the exact github.com host', () => {
+    for (const [url, slug] of [
+      ['https://github.com/acme/app.git', 'acme/app'],
+      ['http://github.com/acme/app.git', 'acme/app'],
+      ['https://github.com/acme/app', 'acme/app'],
+      ['ssh://git@github.com/acme/app.git', 'acme/app'],
+      ['ssh://git@github.com:22/acme/app.git', 'acme/app'],
+      ['git@github.com:acme/app.git', 'acme/app'],
+      ['git@GitHub.com:ACME/App.git', 'ACME/App'],
+      ['https://GITHUB.COM/acme/app.git', 'acme/app']
+    ]) {
+      assert.equal(parseGithubSlug(url), slug, url);
+    }
+    for (const url of [
+      'https://notgithub.com/acme/app.git',
+      'https://github.com.evil.example/acme/app.git',
+      'git@github.com.evil.example:acme/app.git',
+      'https://example.com/github.com/acme/app.git',
+      'https://evil.example/x/github.com:acme/app.git',
+      'git@evil.example:github.com/acme/app.git',
+      'file://github.com/acme/app.git',
+      'https://github.com/acme/app/extra',
+      'https://ghe.example.com/acme/app.git',
+      '/srv/git/app.git',
+      '',
+      null,
+      undefined
+    ]) {
+      assert.equal(parseGithubSlug(url), null, String(url));
+    }
   });
 });
