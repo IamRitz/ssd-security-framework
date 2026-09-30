@@ -1,29 +1,35 @@
 // Interactive prompting behind a small interface, so `init` can be driven by a
 // terminal or by keyed scripted answers in tests. Every question has a stable
 // `id`; the text is for people.
+//
+// Defaults and `say` text can come from the repository (a remote, Dockerfile
+// paths, an existing .semgrepignore), so everything the terminal prompter
+// echoes is sanitized first (output.mjs).
 import { createInterface } from 'node:readline/promises';
+
+import { sanitize } from './output.mjs';
 
 export function terminalPrompter({ input = process.stdin, output = process.stderr } = {}) {
   const rl = createInterface({ input, output, terminal: Boolean(input.isTTY) });
   return {
     say(text) {
-      output.write(`${text}\n`);
+      output.write(`${sanitize(text)}\n`);
     },
     async ask({ question, default: fallback = '', validate }) {
       for (;;) {
-        const suffix = fallback !== '' ? ` [${fallback}]` : '';
-        const answer = (await rl.question(`${question}${suffix}: `)).trim();
+        const suffix = fallback !== '' ? ` [${sanitize(fallback, { singleLine: true })}]` : '';
+        const answer = (await rl.question(`${sanitize(question)}${suffix}: `)).trim();
         const value = answer === '' ? fallback : answer;
         const problem = validate?.(value);
         if (!problem) {
           return value;
         }
-        output.write(`  ${problem}\n`);
+        output.write(`  ${sanitize(problem)}\n`);
       }
     },
     async confirm({ question, default: fallback = false }) {
       for (;;) {
-        const answer = (await rl.question(`${question} ${fallback ? '[Y/n]' : '[y/N]'}: `)).trim().toLowerCase();
+        const answer = (await rl.question(`${sanitize(question)} ${fallback ? '[Y/n]' : '[y/N]'}: `)).trim().toLowerCase();
         if (answer === '') {
           return fallback;
         }
@@ -36,8 +42,12 @@ export function terminalPrompter({ input = process.stdin, output = process.stder
       }
     },
     async choose({ question, choices, default: fallback }) {
-      output.write(`${question}\n`);
-      choices.forEach((choice, index) => output.write(`  ${index + 1}. ${choice.value}${choice.help ? ` — ${choice.help}` : ''}\n`));
+      output.write(`${sanitize(question)}\n`);
+      const width = Math.max(...choices.map((choice) => sanitize(choice.value, { singleLine: true }).length));
+      choices.forEach((choice, index) => {
+        const value = sanitize(choice.value, { singleLine: true });
+        output.write(`  ${String(index + 1).padStart(String(choices.length).length)}  ${choice.help ? `${value.padEnd(width)}  ${sanitize(choice.help)}` : value}\n`);
+      });
       const defaultIndex = choices.findIndex((choice) => choice.value === fallback);
       for (;;) {
         const answer = (await rl.question(`Choice${defaultIndex >= 0 ? ` [${defaultIndex + 1}]` : ''}: `)).trim();

@@ -472,13 +472,21 @@ describe('doctor: command behaviour', () => {
     const root = await consumer(t, { gateMode: 'log-only' });
     const { code, out } = await cli(root, ['doctor']);
     assert.equal(code, 0);
-    assert.match(out, /^SSD Doctor — source-only/);
-    assert.match(out, /^WARN {10}Gate mode$/m);
-    assert.match(out, /^NOT VERIFIED {2}GitHub merge governance$/m);
-    assert.match(out, /^WARN {2}Gate mode\nWhat:/m);
-    assert.match(out, /^Why: /m);
-    assert.match(out, /^How: /m);
-    assert.match(out, /^Result: READY WITH WARNINGS/m);
+    assert.match(out, /^SSD Doctor\n/);
+    assert.match(out, /^ {2}Profile +source-only$/m);
+    // Status symbol AND word on every check row, aligned.
+    assert.match(out, /^ {2}! WARN {10}Gate mode$/m);
+    assert.match(out, /^ {2}\? NOT VERIFIED {2}GitHub merge governance$/m);
+    assert.match(out, /^ {2}✓ PASS {10}Configuration$/m);
+    // Details only for non-PASS checks, each What / Why / Expected / How.
+    const details = out.slice(out.indexOf('\nDetails\n'), out.indexOf('\nResult\n'));
+    assert.match(details, /^ {2}! WARN +Gate mode\n +What +rollout\.gateMode: log-only$/m);
+    assert.match(details, /^ +Why +\S/m);
+    assert.match(details, /^ +Expected +\S/m);
+    assert.match(details, /^ +How +\S/m);
+    assert.doesNotMatch(details, /Configuration/, 'no detail block for a PASS');
+    // The outcome is the machine outcome, verbatim.
+    assert.match(out, /^Result\n {2}! READY WITH WARNINGS {2}0 FAIL · /m);
   });
 
   it('--json and the human output come from one structured model', async (t) => {

@@ -24,6 +24,7 @@ import { NEXT_STEP } from './baseline.mjs';
 import { isContainerProfile, isEcrProfile } from './config.mjs';
 import { COVERAGE_CLASSES } from './coverage.mjs';
 import { bootstrapAvailable } from './render.mjs';
+import { STATUS, blank, dim, group, heading, result as resultLine, row, rows, section, status as statusRow } from './output.mjs';
 import { parseYaml } from './yaml.mjs';
 
 export const PASS = 'PASS';
@@ -559,37 +560,42 @@ export function doctorErrorReport(error) {
 
 // --- output ---------------------------------------------------------------------------
 
-const WIDTH = 14;
+// --- human rendering ------------------------------------------------------------
 
-export function renderDoctor(report) {
-  const out = [`SSD Doctor — ${report.profile ?? '(no valid profile)'}${report.repository ? `  (${report.repository})` : ''}`, ''];
-  for (const c of report.checks) {
-    out.push(`${c.status.padEnd(WIDTH)}${c.title}`);
-  }
-  for (const c of report.checks.filter((x) => x.status !== PASS)) {
-    out.push('', `${c.status}  ${c.title}`);
-    out.push(...section('What', [...c.observed, ...c.evidence.map((e) => `${e.severity === 'error' ? '✗' : '!'} [${e.area}] ${e.message}`)]));
-    out.push(`Why: ${c.why}`);
-    out.push(...section('Expected', c.expected));
-    out.push(...section('How', c.remediation));
-  }
-  const nv = report.counts[NOT_VERIFIED];
-  out.push(
-    '',
-    `Result: ${report.outcome} (${report.counts[FAIL]} FAIL, ${report.counts[WARN]} WARN, ${nv} NOT VERIFIED, ${report.counts[PASS]} PASS)`
+// What / Why / Expected / How for one non-PASS check.
+function detailRows(c) {
+  const evidence = c.evidence.map((e) => `${STATUS[e.severity === 'error' ? FAIL : WARN].symbol} [${e.area}] ${e.message}`);
+  return rows(
+    [
+      ['What', [...c.observed, ...evidence]],
+      ['Why', c.why ? [c.why] : []],
+      ['Expected', c.expected],
+      ['How', c.remediation]
+    ]
+      .filter(([, items]) => items.length > 0)
+      .map(([label, items]) => row(label, items.join('\n')))
   );
-  if (nv > 0) {
-    out.push('NOT VERIFIED items cannot be proven from this checkout; verify them where stated before relying on them.');
-  }
-  return `${out.join('\n')}\n`;
 }
 
-function section(label, items) {
-  if (items.length === 0) {
-    return [];
-  }
-  if (items.length === 1) {
-    return [`${label}: ${items[0]}`];
-  }
-  return [`${label}:`, ...items.map((item) => `  ${item}`)];
+export function doctorBlocks(report, { title = 'SSD Doctor' } = {}) {
+  const nv = report.counts[NOT_VERIFIED];
+  const problems = report.checks.filter((c) => c.status !== PASS);
+  return [
+    heading(title),
+    section(
+      'Repository',
+      rows([row('Name', report.repository ?? '(unknown)', { strong: true }), row('Profile', report.profile ?? '(no valid profile)')])
+    ),
+    section('Checks', rows(report.checks.map((c) => statusRow(c.status, c.title)), { words: true })),
+    problems.length > 0 &&
+      section(
+        'Details',
+        problems.flatMap((c, index) => [index > 0 && blank(), rows([statusRow(c.status, c.title)], { words: true }), group(detailRows(c))])
+      ),
+    section(
+      'Result',
+      resultLine(report.outcome, `${report.counts[FAIL]} FAIL · ${report.counts[WARN]} WARN · ${nv} NOT VERIFIED · ${report.counts[PASS]} PASS`),
+      nv > 0 && dim('NOT VERIFIED items cannot be proven from this checkout; verify them where stated before relying on them.')
+    )
+  ].filter(Boolean);
 }

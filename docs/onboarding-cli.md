@@ -118,6 +118,34 @@ the tools for everything after first onboarding.
 `--repo <dir>` points at the consumer repository (default: the current directory).
 Nothing is ever committed; every change is a diff for a pull request.
 
+### Output
+
+Human-readable output is presentation only: its layout may change between
+versions, and nothing should parse it. Scripts use `--json` (`inspect`,
+`validate`, `doctor`) and the exit code.
+
+- **Color** is used only when the stream is an interactive terminal. Redirected
+  or piped output, CI logs and `--json` are plain text. Color is also off when
+  `NO_COLOR` is set to any non-empty value ([no-color.org](https://no-color.org))
+  or `TERM=dumb`. There is no flag to force it on.
+- **Status is never color alone.** Every status carries its symbol and word:
+  `✓ PASS`, `! WARN`, `✗ FAIL`, `? NOT VERIFIED`. Report results are `READY`,
+  `READY WITH WARNINGS` or `BLOCKED`; doctor results are its JSON `outcome`,
+  verbatim. Planned files are marked `+ create`, `~ update`, `= unchanged`,
+  `! conflict`, `! overwrite`, `~ adopt`, `- stale`.
+- **Nothing is truncated.** Paths, SHAs, commands and messages are printed in
+  full; a value too long to align moves to its own line.
+- **Repository-controlled text cannot drive the terminal.** File names, config
+  values, scanner messages and diffs are shown with terminal control characters
+  made visible (`\x1b[31m`, `\r`, `\u202e`) rather than executed or silently
+  dropped, so an ANSI, OSC (title, hyperlink) or carriage-return injection
+  attempt is visible in the output. `--json` output is byte-compatible with the
+  previous behavior: `JSON.stringify` escapes C0 controls such as ESC and CR,
+  while other Unicode/control characters remain JSON data and are not passed
+  through the human-output sanitizer.
+- **Streams are unchanged**: reports on stdout; refusals, errors and prompts on
+  stderr. With `--json`, stdout holds exactly one JSON document.
+
 ## Configuration reference
 
 Schema version `1`. The schema is **closed**: an unknown key is an error, so a
