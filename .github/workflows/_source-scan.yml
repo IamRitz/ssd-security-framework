@@ -496,40 +496,30 @@ jobs:
         run: mkdir -p reports
 
       - name: Detect dependency ecosystems
-        # Decides which language-native scanner runs. npm audit needs a
-        # package-lock.json; pip-audit needs a requirements.txt. OSV-Scanner runs
+        # Decides whether pip-audit runs (it needs a root requirements.txt).
+        # npm audit decides its own dependency roots below. OSV-Scanner runs
         # regardless and covers every ecosystem's lockfiles. Neither present is a
         # clean skip, mirroring the AWS-not-configured detect-and-skip pattern.
         id: detect
         run: node "$SSD_TOOLKIT/scripts/detect-ecosystems.mjs" --github-output
 
-      - name: Run npm audit (report only)
-        if: steps.detect.outputs.package_lock == 'true'
-        continue-on-error: true
+      - name: Run npm audit per dependency root (report only)
+        # One `npm audit --json --package-lock-only --prefix <root>` per npm
+        # dependency root: every directory holding a TRACKED package-lock.json or
+        # npm-shrinkwrap.json (outside node_modules), discovered from the checkout
+        # by dependency-roots.mjs — no caller input lists them. Nothing is
+        # installed, no lifecycle script runs, no lockfile is written. npm is
+        # started with an argument vector and cwd, never through a shell.
+        #
+        # Every root is audited even when another fails, and each is validated
+        # on its own; the step fails when ANY root produced no valid report or a
+        # root was refused as unsafe (a symbolic link or escaping path). Reports:
+        # reports/npm-audit.json (repository-root project, unchanged) and
+        # reports/npm-audit-nested.json (each root below it, with its path).
+        # No npm root at all is a clean skip. The gate re-derives the roots from
+        # its own checkout and requires a valid report for every one.
         run: |
-          for attempt in 1 2 3; do
-            set +e
-            npm audit --json --package-lock-only > reports/npm-audit.json
-            audit_status=$?
-            set -e
-            if node "$SSD_TOOLKIT/scripts/validate-dependency-report.mjs" \
-              npm-audit reports/npm-audit.json; then
-              echo "npm audit produced a valid report (scanner exit $audit_status)"
-              exit 0
-            fi
-            echo "npm audit report attempt $attempt was invalid; retrying" >&2
-            if [ "$attempt" -lt 3 ]; then
-              sleep 15
-            fi
-          done
-          exit 1
-
-      - name: Validate npm audit report
-        if: steps.detect.outputs.package_lock == 'true'
-        run: |
-          node "$SSD_TOOLKIT/scripts/validate-dependency-report.mjs" \
-            npm-audit reports/npm-audit.json
-          echo "npm audit report is valid; the security gate evaluates findings"
+          node "$SSD_TOOLKIT/scripts/npm-audit-roots.mjs" --repo-dir . --output-dir reports
 
       - name: Run pip-audit (report only)
         # Python's npm-audit-equivalent. Pinned tool version; audits the pinned
@@ -606,6 +596,21 @@ jobs:
           node "$SSD_TOOLKIT/scripts/check-scanner-exit.mjs" \
             osv-scanner "$scanner_status" reports/osv-scanner.json
 
+      - name: Run OSV-Scanner on each npm dependency root lockfile (report only)
+        # The recursive step above honours .gitignore even for TRACKED files, so
+        # a force-added, gitignored package-lock.json (OWASP Juice Shop's layout)
+        # is skipped by it — verified against the pinned digest. This step names
+        # every npm dependency-root lockfile explicitly instead
+        # (`-L package-lock.json:/repo/<lockfile>`), from the same tracked,
+        # confined discovery npm audit uses, so OSV-Scanner reads exactly the
+        # framework's declared inventory: an untracked file is never passed and
+        # .gitignore filtering stays on for the backstop. Same pinned image; its
+        # exit status is judged with the report as above. No npm root: skipped.
+        # The gate requires the declared lockfiles to equal its own discovery.
+        run: |
+          node "$SSD_TOOLKIT/scripts/osv-npm-roots.mjs" --repo-dir . --output-dir reports \
+            --image ghcr.io/google/osv-scanner@sha256:5116601dedc01c1c580eb92371883ec052fc4c13c3fbc109d621a63ac416d475
+
       - name: Validate OSV-Scanner report
         run: |
           node "$SSD_TOOLKIT/scripts/validate-dependency-report.mjs" \
@@ -616,12 +621,14 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          # npm-audit.json / pip-audit.json are present only for those ecosystems;
+          # npm-audit*.json / pip-audit.json are present only for those ecosystems;
           # upload-artifact errors only when NO listed file matches, and
           # osv-scanner.json is always produced, so this stays green for any repo.
           name: dependency-scan-reports
           path: |
             reports/npm-audit.json
+            reports/npm-audit-nested.json
+            reports/osv-scanner-npm-roots.json
             reports/pip-audit.json
             reports/osv-scanner.json
           if-no-files-found: error

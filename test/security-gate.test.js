@@ -217,6 +217,8 @@ describe('security gate', () => {
       join(CLEAN, 'trufflehog.json'),
       '--osv',
       join(CLEAN, 'osv-scanner.json'),
+      '--osv-npm-roots',
+      join(CLEAN, 'osv-scanner-npm-roots.json'),
       '--semgrep',
       join(CLEAN, 'semgrep.json'),
       '--baseline',
@@ -412,6 +414,7 @@ describe('security gate — ecosystem detect-and-skip', () => {
       const { result } = await evaluate({
         repoDir,
         npmAudit: join(CLEAN, 'npm-audit.json'),
+        osvNpmRoots: join(CLEAN, 'osv-scanner-npm-roots.json'),
         pipAudit: join(PIP, 'high-no-fix.json')
       });
       assert.equal(hasIntegrityBlock(result), false);

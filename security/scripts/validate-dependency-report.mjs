@@ -70,6 +70,56 @@ export async function readDependencyReport(scanner, reportPath) {
   return readReport(scanner, reportPath);
 }
 
+// An already-parsed npm audit report (one per dependency root; see
+// npm-audit-roots.mjs). Same acceptance as the file-based check below.
+export function validateNpmAuditReport(report) {
+  assert(report && typeof report === 'object' && !Array.isArray(report), 'npm audit report is not a JSON object');
+  if (report.error) {
+    throw new Error(`npm audit failed: ${report.error.summary ?? 'unknown error'}`);
+  }
+  assert(
+    report.auditReportVersion && report.metadata?.vulnerabilities,
+    'npm audit report does not have the expected schema'
+  );
+  return `npm-audit vulnerabilities=${report.metadata.vulnerabilities.total}`;
+}
+
+// An already-parsed OSV-Scanner report (the recursive backstop, or the explicit
+// npm dependency-root scan in osv-npm-roots.mjs).
+export function validateOsvReport(report) {
+  assert(report && typeof report === 'object' && !Array.isArray(report), 'OSV-Scanner report is not a JSON object');
+  // OSV-Scanner is written in Go, and Go marshals an empty slice as `null`
+  // rather than `[]`. A successful scan that found no package sources emits
+  // exactly `{"results": null, "experimental_config": {...}}` with exit 0 —
+  // verified against this pinned version both locally and on a runner.
+  //
+  // That is the scanner asserting "I looked and found nothing", so it is a
+  // clean empty result set, not a malformed report. It is trusted precisely
+  // BECAUSE the scanner wrote it, which an empty file cannot do.
+  //
+  // The key must still be PRESENT. A payload with no `results` key at all is
+  // not something this scanner produces, so it stays a fail-closed rejection
+  // rather than being normalized away.
+  assert(Object.hasOwn(report, 'results'), 'OSV-Scanner report has no results key');
+  assert(
+    report.results === null || Array.isArray(report.results),
+    'OSV-Scanner report results must be an array, or null when no package sources were found'
+  );
+
+  const results = report.results ?? [];
+  const advisoryIds = results
+    .flatMap((result) => result.packages ?? [])
+    .flatMap((dependency) => dependency.vulnerabilities ?? [])
+    .map((advisory) => advisory.id)
+    .filter(Boolean);
+  const maliciousAdvisories = advisoryIds.filter((id) => id.startsWith('MAL-'));
+
+  return (
+    `osv-scanner advisories=${advisoryIds.length} malicious=${maliciousAdvisories.length}` +
+    (results.length === 0 ? ' (no package sources — repository has no dependencies)' : '')
+  );
+}
+
 // Returns a short human-readable summary. Throws on anything that means the
 // report cannot be trusted; the caller's non-zero exit is the fail-closed signal.
 export async function validateDependencyReport(scanner, reportPath) {
@@ -78,14 +128,7 @@ export async function validateDependencyReport(scanner, reportPath) {
   const report = await readReport(scanner, reportPath);
 
   if (scanner === 'npm-audit') {
-    if (report.error) {
-      throw new Error(`npm audit failed: ${report.error.summary ?? 'unknown error'}`);
-    }
-    assert(
-      report.auditReportVersion && report.metadata?.vulnerabilities,
-      'npm audit report does not have the expected schema'
-    );
-    return `npm-audit vulnerabilities=${report.metadata.vulnerabilities.total}`;
+    return validateNpmAuditReport(report);
   }
 
   if (scanner === 'pip-audit') {
@@ -97,36 +140,7 @@ export async function validateDependencyReport(scanner, reportPath) {
   }
 
   if (scanner === 'osv-scanner') {
-    // OSV-Scanner is written in Go, and Go marshals an empty slice as `null`
-    // rather than `[]`. A successful scan that found no package sources emits
-    // exactly `{"results": null, "experimental_config": {...}}` with exit 0 —
-    // verified against this pinned version both locally and on a runner.
-    //
-    // That is the scanner asserting "I looked and found nothing", so it is a
-    // clean empty result set, not a malformed report. It is trusted precisely
-    // BECAUSE the scanner wrote it, which an empty file cannot do.
-    //
-    // The key must still be PRESENT. A payload with no `results` key at all is
-    // not something this scanner produces, so it stays a fail-closed rejection
-    // rather than being normalized away.
-    assert(Object.hasOwn(report, 'results'), 'OSV-Scanner report has no results key');
-    assert(
-      report.results === null || Array.isArray(report.results),
-      'OSV-Scanner report results must be an array, or null when no package sources were found'
-    );
-
-    const results = report.results ?? [];
-    const advisoryIds = results
-      .flatMap((result) => result.packages ?? [])
-      .flatMap((dependency) => dependency.vulnerabilities ?? [])
-      .map((advisory) => advisory.id)
-      .filter(Boolean);
-    const maliciousAdvisories = advisoryIds.filter((id) => id.startsWith('MAL-'));
-
-    return (
-      `osv-scanner advisories=${advisoryIds.length} malicious=${maliciousAdvisories.length}` +
-      (results.length === 0 ? ' (no package sources — repository has no dependencies)' : '')
-    );
+    return validateOsvReport(report);
   }
 
   throw new Error(`unsupported scanner: ${scanner}`);

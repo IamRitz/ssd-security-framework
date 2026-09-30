@@ -402,7 +402,8 @@ describe('onboard: refusals before any write', () => {
   });
 
   it('a coverage gap that blocks render blocks onboard, instead of writing a config that cannot render', async (t) => {
-    const root = makeRepo(t, { ...PY_REPO, 'packages/web/package.json': '{"dependencies":{"x":"1"}}\n', 'packages/web/package-lock.json': '{}\n' });
+    // A nested package.json with dependencies and NO lockfile: scanned by nothing.
+    const root = makeRepo(t, { ...PY_REPO, 'packages/web/package.json': '{"dependencies":{"x":"1"}}\n' });
     const before = snapshot(root);
     const { code, out } = await onboardFrom(root, SOURCE_ONLY);
     assert.equal(code, 1);

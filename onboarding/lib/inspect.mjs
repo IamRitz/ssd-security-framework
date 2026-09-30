@@ -8,6 +8,7 @@ import { readdir, readFile, stat } from 'node:fs/promises';
 import { join, posix, relative, sep } from 'node:path';
 import { promisify } from 'node:util';
 
+import { discoverNpmRoots, listTrackedFiles } from '../../security/scripts/dependency-roots.mjs';
 import { classifyManifests, suggestIgnores, suggestRulesets } from './coverage.mjs';
 import { readMarker } from './files.mjs';
 
@@ -148,7 +149,24 @@ export async function inspectRepository(root) {
       texts.set(file, await readTextOrNull(join(root, file)));
     }
   }
-  const { manifests, vendored } = classifyManifests(files, (file) => texts.get(file) ?? null);
+  // Dependency coverage is decided on TRACKED files only (a CI checkout holds
+  // nothing else), and npm dependency roots come from the very function the
+  // scanning job and the source gate use, confinement checks included.
+  const tracked = await listTrackedFiles(root);
+  // Tracked files the committed .gitignore rules match: a CI checkout has the
+  // same rules (and no .git/info/exclude or global excludes file), and the
+  // recursive OSV-Scanner walk skips these files although they are tracked.
+  const ignoredTracked = tracked.source === 'git'
+    ? (await git(root, ['ls-files', '-z', '--cached', '--ignored', '--exclude-per-directory=.gitignore']))?.split('\0').filter(Boolean) ?? null
+    : null;
+  if (tracked.source === 'git' && ignoredTracked === null) {
+    throw new Error('could not list tracked files that .gitignore matches; dependency coverage cannot be decided');
+  }
+  const { manifests, vendored } = classifyManifests(files, (file) => texts.get(file) ?? null, {
+    tracked: tracked.source === 'git' ? tracked.files : null,
+    npmRoots: await discoverNpmRoots(root),
+    ignoredTracked
+  });
 
   const workflowFiles = files.filter((file) => /^\.github\/workflows\/[^/]+\.ya?ml$/.test(file));
   const workflows = [];

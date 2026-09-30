@@ -64,6 +64,7 @@ pass "detect-ecosystems.mjs resolved the CONSUMER's manifests, not the toolkit's
 mkdir -p "$CONSUMER/reports"
 cp "$FIXTURES"/clean/gitleaks.json "$FIXTURES"/clean/trufflehog.json \
    "$FIXTURES"/clean/npm-audit.json "$FIXTURES"/clean/osv-scanner.json \
+   "$FIXTURES"/clean/osv-scanner-npm-roots.json \
    "$FIXTURES"/clean/semgrep.json "$CONSUMER/reports/"
 
 node "$TOOLKIT/security/scripts/security-gate.mjs" \

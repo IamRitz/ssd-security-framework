@@ -11,6 +11,10 @@
 //      CUSTOM rule detects must BOTH be found with the config ssd-onboard
 //      generates — and a rules-only config (no [extend] useDefault) must miss
 //      the built-in one, which is why existing configs need review.
+//   3. OSV-Scanner: the recursive backstop (workflow arguments) skips a tracked
+//      lockfile .gitignore lists; the explicit npm-root run (osv-npm-roots.mjs)
+//      reads every npm dependency-root lockfile — root, nested, shrinkwrap,
+//      gitignored — and never an untracked one.
 //
 // Requires docker and git.
 import { execFileSync, spawnSync } from 'node:child_process';
@@ -20,6 +24,8 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { renderGitleaksToml, renderSemgrepignore } from '../onboarding/lib/render.mjs';
+import { discoverNpmRoots } from '../security/scripts/dependency-roots.mjs';
+import { osvDockerArguments } from '../security/scripts/osv-npm-roots.mjs';
 import { config } from '../test/support/onboarding-fixtures.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -33,6 +39,15 @@ const pinned = (name) => {
 };
 const SEMGREP = pinned('semgrep/semgrep');
 const GITLEAKS = pinned('ghcr.io/gitleaks/gitleaks');
+const OSV = pinned('ghcr.io/google/osv-scanner');
+// The OSV-Scanner arguments exactly as the workflow passes them, /repo mount included.
+const OSV_ARGS = (() => {
+  const match = /osv-scanner@sha256:[0-9a-f]{64} \\\n\s+(scan source [^\n\\]+?)\s*\\?\n/.exec(SOURCE_SECURITY);
+  if (!match) {
+    throw new Error('no OSV-Scanner invocation in _source-security.yml');
+  }
+  return match[1].trim().split(/\s+/);
+})();
 const FIXTURE = join(ROOT, 'test/fixtures/scanner-behaviour/semgrep-scope.json');
 const update = process.argv.includes('--update');
 
@@ -138,6 +153,47 @@ try {
   check(generated.includes('acme-token@custom.txt'), 'generated config: the custom-only secret is found');
   const rulesOnly = scan('rules-only.toml');
   check(!rulesOnly.some((f) => f.startsWith('aws-access-token')), 'a rules-only config (no [extend] useDefault) misses the built-in secret — existing configs need review');
+
+  // ---- 3. OSV-Scanner reads every npm dependency root's lockfile ---------------
+  // ssd-onboard says `native+osv` for the lockfile of every npm dependency root
+  // (root or nested, package-lock.json or npm-shrinkwrap.json, tracked even when
+  // .gitignore lists it). The recursive backstop (workflow arguments, verbatim)
+  // skips a tracked-but-gitignored lockfile; the explicit npm-root run
+  // (osv-npm-roots.mjs, its own argument builder over the real discovery)
+  // must read every root lockfile and nothing the discovery did not return.
+  console.log(`== OSV-Scanner npm dependency roots (${OSV.split('@')[1]}) ==`);
+  const osvRepo = repo('osv');
+  const lock = JSON.stringify({
+    name: 'x',
+    lockfileVersion: 3,
+    requires: true,
+    packages: { '': { name: 'x', dependencies: { minimist: '1.2.5' } }, 'node_modules/minimist': { version: '1.2.5' } }
+  });
+  const lockfiles = ['package-lock.json', 'frontend/package-lock.json', 'apps/api/npm-shrinkwrap.json', 'ignored/package-lock.json', 'odd:dir/package-lock.json'];
+  for (const file of [...lockfiles, 'untracked/package-lock.json']) {
+    mkdirSync(dirname(join(osvRepo, file)), { recursive: true });
+    writeFileSync(join(osvRepo, file), lock);
+  }
+  writeFileSync(join(osvRepo, '.gitignore'), 'ignored/package-lock.json\nuntracked/\n');
+  git(osvRepo, 'add', '-A');
+  git(osvRepo, 'add', '-f', 'ignored/package-lock.json');
+  git(osvRepo, 'commit', '-q', '-m', 'x');
+  const sourcesOf = (args) => {
+    const result = spawnSync('docker', args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+    return { status: result.status, sources: (JSON.parse(result.stdout).results ?? []).map((r) => r.source.path.replace(/^\/repo\//, '')).sort() };
+  };
+  const recursive = sourcesOf(['run', '--rm', '-v', `${osvRepo}:/repo:ro`, OSV, ...OSV_ARGS]);
+  check(!recursive.sources.includes('ignored/package-lock.json'), `recursive backstop (${OSV_ARGS.join(' ')}) skips the tracked-but-gitignored lockfile — why the explicit run exists`);
+  const { roots } = await discoverNpmRoots(osvRepo);
+  const declared = roots.map((r) => r.lockfile);
+  check(JSON.stringify([...declared].sort()) === JSON.stringify([...lockfiles].sort()), `discovery returns exactly the tracked root lockfiles (untracked excluded): ${declared.join(', ')}`);
+  const explicit = sourcesOf(osvDockerArguments({ checkout: osvRepo, image: OSV, lockfiles: declared }));
+  check(
+    explicit.status === 1 && JSON.stringify(explicit.sources) === JSON.stringify([...lockfiles].sort()),
+    `explicit npm-root run reads every root lockfile — nested, shrinkwrap, gitignored, ':' in the path — and nothing else: ${explicit.sources.join(', ')}`
+  );
+  const unprefixed = spawnSync('docker', ['run', '--rm', '-v', `${osvRepo}:/repo:ro`, OSV, 'scan', 'source', '--allow-no-lockfiles', '--format=json', '-L', '/repo/odd:dir/package-lock.json'], { encoding: 'utf8' });
+  check(unprefixed.status !== 0 && unprefixed.status !== 1, `without the package-lock.json: parse-as prefix a ':' in the path is misread as a format prefix (exit ${unprefixed.status}) — why the prefix is always passed`);
 } finally {
   rmSync(work, { recursive: true, force: true });
 }

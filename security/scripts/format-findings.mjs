@@ -98,6 +98,17 @@ function shellArg(value) {
   return /^[A-Za-z0-9_./:=@+-]+$/.test(value) ? value : `'${String(value).replaceAll("'", "'\\''")}'`;
 }
 
+// The npm dependency root below the repository root that produced an npm audit
+// finding (its `location` is that root's lockfile), or null for the repository
+// root and for any other source. See dependency-roots.mjs.
+function nestedNpmRoot(finding) {
+  if (finding?.source !== 'npm-audit' || typeof finding.location !== 'string') {
+    return null;
+  }
+  const slash = finding.location.lastIndexOf('/');
+  return slash > 0 ? finding.location.slice(0, slash) : null;
+}
+
 // The command that reproduces THIS finding, from what the run actually used.
 // An explicit per-repo override always wins. Returns null rather than a command
 // that would not reproduce the finding.
@@ -112,6 +123,12 @@ function reproduceCommand(finding, context, gate) {
   const scan = context?.scan || {};
 
   switch (finding.source) {
+    case 'npm-audit': {
+      // A nested root is audited with --prefix <root> in CI; the same flag
+      // reproduces it from the repository root.
+      const root = nestedNpmRoot(finding);
+      return root ? `${DEFAULT_REPRODUCE_COMMANDS['npm-audit']} --prefix ${shellArg(root)}` : DEFAULT_REPRODUCE_COMMANDS['npm-audit'];
+    }
     case 'gitleaks':
       return scan.gitleaksConfig
         ? `gitleaks git . --config ${shellArg(scan.gitleaksConfig)} --redact=100`
@@ -232,7 +249,16 @@ function maliciousCard(base, finding, scannerLabel) {
 // Turn one decided gate finding into a surface-agnostic, plain-language card.
 function classify(finding, context, gate) {
   const severity = (finding.severity || 'none').toLowerCase();
-  const place = locationParts(finding.location);
+  // An npm audit finding's location is a lockfile path, never "path:line".
+  // Shown only for a nested dependency root: the repository-root lockfile is
+  // what every single-root repository has always implied, and the gate result
+  // keeps the location either way.
+  const place =
+    finding.source === 'npm-audit'
+      ? nestedNpmRoot(finding)
+        ? { path: finding.location, line: null }
+        : null
+      : locationParts(finding.location);
   const isException = finding.action === 'EXCEPTION';
 
   const base = {
