@@ -26,7 +26,8 @@ const TESTS = [
   'test/doctor.test.js',
   'test/onboard.test.js',
   'test/onboarding-codeowners.test.js',
-  'test/dependency-roots.test.js'
+  'test/dependency-roots.test.js',
+  'test/cli-output.test.js'
 ];
 
 // [invariant, file, search, replace]
@@ -110,7 +111,7 @@ const MUTATIONS = [
   ['non-interactive accept needs the exact count', 'onboarding/cli.mjs', "if (options['expect-findings'] === undefined || Number(options['expect-findings']) !== count) {", 'if (false) {'],
   ['promotion has no yes-default', 'onboarding/cli.mjs', "question: 'Write these changes?', default: false", "question: 'Write these changes?', default: true"],
   ['onboard: the final confirmation defaults to no', 'onboarding/cli.mjs', "question: 'Write these onboarding files?', default: false", "question: 'Write these onboarding files?', default: true"],
-  ['onboard writes nothing while the plan blocks', 'onboarding/cli.mjs', '    if (isBlocking(planned)) {', '    if (false) {'],
+  ['onboard writes nothing while the plan blocks', 'onboarding/cli.mjs', '    const blocking = isBlocking(planned);', '    const blocking = false;'],
   ['onboard succeeds only when the written state validates', 'onboarding/cli.mjs', '  if (validationFails(fresh.result)) {', '  if (false) {'],
   ['onboard adopts only the paths the operator named', 'onboarding/cli.mjs', 'const explicit = { adopt: options.adopt ?? [], force: options.force ?? [] };', "const explicit = { adopt: options.adopt ?? ['.github/workflows/security.yml', '.semgrepignore'], force: options.force ?? [] };"],
   ['onboard proves every path confined before the first write', 'onboarding/cli.mjs', '    await assertSafeRepoPath(root, path);', '    void path;'],
@@ -151,7 +152,17 @@ const MUTATIONS = [
   ['an unsupported baseline state is a written report-integrity BLOCK', 'security/scripts/security-gate.mjs', "  } catch (error) {\n    const finding = {\n      source: 'security-gate',", "  } catch (error) {\n    if (lifecycle === undefined) throw error;\n    const finding = {\n      source: 'security-gate',"],
   ['the workflow hands the declared baseline state to the gate', '.github/workflows/_source-security.yml', 'args+=(--baseline-state "$BASELINE_STATE")', ':'],
   ['the generated caller declares the configured baseline state', 'onboarding/lib/render.mjs', 'semgrep_baseline_state: ${config.semgrep.baseline.state}', 'semgrep_baseline_state: absent'],
-  ['the image notifier reads the webhook secret', '.github/workflows/_image-scan-prepush.yml', 'secrets.slack_notify_webhook || inputs.slack_notify_url', 'inputs.slack_notify_url']
+  ['the image notifier reads the webhook secret', '.github/workflows/_image-scan-prepush.yml', 'secrets.slack_notify_webhook || inputs.slack_notify_url', 'inputs.slack_notify_url'],
+  // Human output (onboarding/lib/output.mjs): terminal safety and status semantics.
+  ['output: repository text is sanitized before it reaches a terminal', 'onboarding/lib/output.mjs', "const text = String(value ?? '').replace(UNSAFE, escapeChar);", "const text = String(value ?? '');"],
+  ['output: a newline in a label cannot fake a row', 'onboarding/lib/output.mjs', "return singleLine ? text.replace(/\\n/g, '\\\\n') : text;", 'return text;'],
+  ['output: NO_COLOR disables color', 'onboarding/lib/output.mjs', "const color = tty && !env.NO_COLOR && env.TERM !== 'dumb';", "const color = tty && env.TERM !== 'dumb';"],
+  ['output: redirected output is plain', 'onboarding/lib/output.mjs', 'const tty = Boolean(stream?.isTTY);', 'const tty = true;'],
+  ['output: FAIL is never rendered as PASS', 'onboarding/lib/output.mjs', "  FAIL: { symbol: '✗', tone: 'red' },", "  FAIL: { symbol: '✓', tone: 'green' },"],
+  ['output: an unknown status never looks like a pass', 'onboarding/lib/output.mjs', "const statusOf = (word) => STATUS[word] ?? { symbol: '?', tone: 'red' };", 'const statusOf = (word) => STATUS[word] ?? STATUS.PASS;'],
+  ['output: a blocking issue is never rendered as a warning', 'onboarding/lib/report.mjs', "`Blocking issues (${result.errors.length})`, problemRows(result.errors, 'FAIL')", "`Blocking issues (${result.errors.length})`, problemRows(result.errors, 'WARN')"],
+  ['output: --json never passes through the human renderer', 'onboarding/cli.mjs', "    json: (value) => rawOut(`${JSON.stringify(value, null, 2)}\\n`)", '    json: (value) => rawOut(format(dim(JSON.stringify(value, null, 2)), outStyle))'],
+  ['output: the prompter sanitizes what it echoes', 'onboarding/lib/prompt.mjs', '      output.write(`${sanitize(text)}\\n`);', '      output.write(`${text}\\n`);']
 ];
 
 // Temp-workspace lifecycle

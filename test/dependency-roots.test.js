@@ -262,12 +262,12 @@ describe('tracked lockfiles that .gitignore lists: blocked unless OSV-Scanner re
     assert.deepEqual(lock.why, ['tracked lockfile is ignored by Git rules and recursive OSV would skip it']);
     assert.ok(dependencyFindings((await inspectRepository(root)).manifests).blocking.some((m) => m.path === 'Cargo.lock'));
     const inspect = await cli(root, ['inspect']);
-    assert.match(inspect.out, /Cargo\.lock\s+osv-skipped\s+tracked lockfile is ignored by Git rules and recursive OSV would skip it/);
+    assert.match(inspect.out, /✗ Cargo\.lock\s+osv-skipped · UNSUPPORTED — blocks generation\n\s+tracked lockfile is ignored by Git rules and recursive OSV would skip it/);
     configure(root);
     const render = await cli(root, ['render']);
     assert.equal(render.code, 1);
     assert.match(render.out, /Cargo\.lock: tracked, but ignored by Git rules — the recursive OSV-Scanner walk skips it \(tracked lockfile is ignored by Git rules and recursive OSV would skip it\)/);
-    assert.match(render.out, /Not fully covered: Cargo\.lock \(osv-skipped, UNSUPPORTED/);
+    assert.match(render.out, /Not fully covered\s+Cargo\.lock \(osv-skipped, UNSUPPORTED/);
     assert.ok(!existsSync(join(root, '.github/workflows/security.yml')), 'nothing generated');
   });
 
@@ -331,12 +331,14 @@ describe('Juice Shop-shaped repository (root + frontend npm projects)', () => {
     const root = makeRepo(t, JUICE_SHOP);
     const { code, out } = await cli(root, ['inspect']);
     assert.equal(code, 0);
-    const lines = out.slice(out.indexOf('Dependency manifests:')).split('\n').slice(1, 5).map((l) => l.trim().split(/\s+/).slice(0, 2));
+    // One status row per manifest (its reason is on the dim line beneath).
+    const section = out.slice(out.indexOf('\nDependencies\n'), out.indexOf('\nWorkflows\n'));
+    const lines = section.split('\n').filter((l) => /^ {2}[✓!✗] /.test(l)).map((l) => l.trim().split(/\s+/).slice(0, 3));
     assert.deepEqual(lines, [
-      ['frontend/package-lock.json', 'native+osv'],
-      ['frontend/package.json', 'covered-by-lockfile'],
-      ['package-lock.json', 'native+osv'],
-      ['package.json', 'covered-by-lockfile']
+      ['✓', 'frontend/package-lock.json', 'native+osv'],
+      ['✓', 'frontend/package.json', 'covered-by-lockfile'],
+      ['✓', 'package-lock.json', 'native+osv'],
+      ['✓', 'package.json', 'covered-by-lockfile']
     ]);
   });
 
@@ -345,7 +347,7 @@ describe('Juice Shop-shaped repository (root + frontend npm projects)', () => {
     write(root, '.ssd/onboarding.yml', serializeConfig(config('source-only', { semgrep: { rulesets: ['p/owasp-top-ten', 'p/typescript'] } })));
     const validate = await cli(root, ['validate']);
     assert.doesNotMatch(validate.out + validate.err, /UNSUPPORTED by the current framework/);
-    assert.match(validate.out, /Not fully covered: none/);
+    assert.match(validate.out, /Not fully covered\s+none/);
     const render = await cli(root, ['render']);
     assert.equal(render.code, 0, render.out + render.err);
     assert.ok(existsSync(join(root, '.github/workflows/security.yml')));

@@ -78,7 +78,7 @@ describe('init', () => {
     assert.deepEqual(written.semgrep.ignore, { managed: true, patterns: [] });
     assert.equal(written.rollout.gateMode, 'log-only');
     // src/app.py, tests/test_app.py and the lint workflow: tests are IN scope.
-    assert.match(out, /Semgrep scope:\s+3 source file\(s\) scanned, 0 ignored/);
+    assert.match(out, /^ {2}[✓!] Semgrep +3 source file\(s\) scanned · 0 ignored/m);
   });
 
   it('interactive: scripted answers -> the expected config, and the effective scope is shown before writing', async (t) => {
@@ -100,7 +100,8 @@ describe('init', () => {
     assert.deepEqual(written.notifications.slack, { enabled: true, githubSecretName: 'TEAM_SLACK_WEBHOOK' });
     assert.equal(written.breakGlass.mode, 'disabled');
     assert.ok(prompter.said.some((line) => /silently skips tests\//.test(line)), 'the implicit Semgrep ignore list is explained');
-    assert.ok(out.indexOf('Semgrep scope:') < out.indexOf('Wrote .ssd/onboarding.yml'), 'scope is shown before the file is written');
+    const scope = out.search(/Semgrep +\d+ source file\(s\) scanned/);
+    assert.ok(scope >= 0 && scope < out.indexOf('\nWritten\n  + create     .ssd/onboarding.yml'), 'scope is shown before the file is written');
     assert.ok(!prompter.asked.includes('awsAccountId'), 'no AWS questions for a self-managed profile');
   });
 
@@ -235,7 +236,7 @@ describe('validation blocks generation on real coverage gaps', () => {
     assert.match(result.out, /pip-audit runs only on the repository-root requirements\.txt/);
     assert.match(result.out, /UNSUPPORTED by the current framework/);
     assert.match(result.out, /There is deliberately no local override/);
-    assert.match(result.out, /Not fully covered: services\/py\/requirements\.txt \(osv-only, UNSUPPORTED/);
+    assert.match(result.out, /Not fully covered\s+services\/py\/requirements\.txt \(osv-only, UNSUPPORTED/);
     assert.ok(!existsSync(join(root, '.github/workflows/security.yml')), 'nothing generated');
   });
 
@@ -270,7 +271,8 @@ describe('validation blocks generation on real coverage gaps', () => {
     writeConfig(root, 'source-only', { semgrep: { ignore: { managed: false, patterns: [] } } });
     const result = await cli(root, ['validate']);
     assert.equal(result.code, 1);
-    assert.match(result.out, /✗ \[semgrep\] semgrep\.ignore\.managed is false and there is no \.semgrepignore/);
+    // A blocking issue: grouped under its area, never shown as a warning.
+    assert.match(result.out, /^Blocking issues \(\d+\)\n(?:.*\n)*? {2}✗ semgrep\n +(- )?semgrep\.ignore\.managed is false and there is no \.semgrepignore/m);
   });
 
   it('blocks generation when the pinned framework commit does not declare an input or secret the render passes', async (t) => {
@@ -300,7 +302,7 @@ describe('validation blocks generation on real coverage gaps', () => {
 
     const validate = await cli(root, ['validate']);
     assert.equal(validate.code, 1);
-    assert.match(validate.out, /✗ \[repository\] repository\.defaultBranch is develop but origin\/HEAD is main/);
+    assert.match(validate.out, /^ {2}✗ repository\n(?: +.*\n)*? +(- )?repository\.defaultBranch is develop but origin\/HEAD is main/m);
     assert.match(validate.out, /pull requests into the real default branch would not be scanned/);
 
     const render = await cli(root, ['render']);
@@ -320,7 +322,7 @@ describe('validation blocks generation on real coverage gaps', () => {
     writeConfig(root, 'source-only', { repository: { slug: 'acme/other' } });
     const validate = await cli(root, ['validate']);
     assert.equal(validate.code, 1);
-    assert.match(validate.out, /✗ \[repository\] repository\.slug is acme\/other but origin points at acme\/app/);
+    assert.match(validate.out, /^ {2}✗ repository\n(?: +.*\n)*? +(- )?repository\.slug is acme\/other but origin points at acme\/app/m);
     assert.equal((await cli(root, ['render'])).code, 1);
     assert.ok(!existsSync(join(root, '.github/workflows/security.yml')));
   });
@@ -385,7 +387,7 @@ describe('the baseline state machine', () => {
 
   it('walks onboarding -> candidate -> accepted -> enforcing, explicitly at each step', async (t) => {
     const root = await onboardingRepo(t);
-    assert.match((await cli(root, ['baseline', 'status'])).out, /Rollout state: onboarding/);
+    assert.match((await cli(root, ['baseline', 'status'])).out, /^ {2}State +onboarding$/m);
     const dispatch = (await cli(root, ['baseline', 'prepare'])).out;
     assert.match(dispatch, /gh workflow run security\.yml --repo acme\/app --ref main -f bootstrap_baseline=true/);
     // The UI alternative is a link, not "find the Actions tab".
@@ -428,7 +430,7 @@ describe('the baseline state machine', () => {
     const promoted = await cli(root, ['promote', '--enforce', '--yes']);
     assert.equal(promoted.code, 0, promoted.err);
     assert.match(promoted.out, /-\s+gate_mode: log-only\n\+\s+gate_mode: enforce/);
-    assert.match((await cli(root, ['baseline', 'status'])).out, /Rollout state: enforcing/);
+    assert.match((await cli(root, ['baseline', 'status'])).out, /^ {2}State +enforcing$/m);
   });
 
   it('non-interactive accept needs --yes AND the exact finding count', async (t) => {

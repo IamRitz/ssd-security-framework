@@ -143,23 +143,24 @@ describe('onboard: a fresh source-only repository', () => {
     assert.equal(status(report, 'source-boundary'), 'PASS');
     assert.equal(status(report, 'framework-pin'), 'PASS');
     // The same projection is shown by onboard itself.
-    assert.match(out, /Readiness:\nSSD Doctor — source-only/);
-    assert.match(out, /Result: READY WITH WARNINGS \(0 FAIL/);
+    const readiness = out.slice(out.indexOf('\nReadiness\n'));
+    assert.match(readiness, /^Readiness\n\nRepository\n {2}Name +acme\/app\n {2}Profile +source-only$/m);
+    assert.match(readiness, /^ {2}! READY WITH WARNINGS {2}0 FAIL · /m);
   });
 
   it('closes with the rollout state, NOT production-ready, and the existing lifecycle guidance', async (t) => {
     const root = makeRepo(t, PY_REPO);
     const { code, out } = await onboard(root);
     assert.equal(code, 0, out);
-    assert.match(out, /Onboarding generated successfully\.\nLocal validation passed/);
-    assert.match(out, /Rollout state: onboarding\nThis repository is NOT production-ready yet/);
+    assert.match(out, /^ {2}✓ Onboarding generated successfully\.\n {2}✓ Local validation passed/m);
+    assert.match(out, /^Rollout\n {2}State +onboarding\n {2}! This repository is NOT production-ready yet/m);
     assert.doesNotMatch(out, /production[- ]ready\.|is production-ready/i);
     // dispatchInstructions, not a second copy of the bootstrap procedure.
     assert.match(out, /gh workflow run security\.yml --repo acme\/app --ref main -f bootstrap_baseline=true/);
     assert.match(out, /ssd-onboard baseline prepare --run <run-id>/);
     assert.match(out, /Do not copy a candidate baseline into place by hand/);
     assert.match(out, /does not accept a baseline, enable enforcement, or configure GitHub/);
-    assert.match(out, /Planned files:\n {2}CREATE {4}\.ssd\/onboarding\.yml\n {2}CREATE {4}\.github\/workflows\/security\.yml\n {2}CREATE {4}\.semgrepignore/);
+    assert.match(out, /^Files\n {2}\+ create {5}\.ssd\/onboarding\.yml\n {2}\+ create {5}\.github\/workflows\/security\.yml\n {2}\+ create {5}\.semgrepignore$/m);
   });
 
   it('non-interactive: the same result from a partial config, through init\'s path', async (t) => {
@@ -292,7 +293,7 @@ describe('onboard: existing files are never silently overwritten', () => {
     const before = snapshot(root);
     const { code, out, err } = await onboard(root);
     assert.equal(code, 1);
-    assert.match(out, /CONFLICT {2}\.github\/workflows\/security\.yml/);
+    assert.match(out, /! conflict {3}\.github\/workflows\/security\.yml/);
     assert.match(err, /--adopt <path>/);
     assert.deepEqual(snapshot(root), before, 'not even the config is written');
   });
@@ -302,7 +303,7 @@ describe('onboard: existing files are never silently overwritten', () => {
     const before = snapshot(root);
     const declined = await onboard(root, { frameworkRef: REF, profile: 'source-only' }, {}, ['--adopt', SECURITY]);
     assert.equal(declined.code, 1);
-    assert.match(declined.out, /ADOPT {5}\.github\/workflows\/security\.yml/);
+    assert.match(declined.out, /~ adopt {6}\.github\/workflows\/security\.yml/);
     assert.match(declined.out, /--- a\/\.github\/workflows\/security\.yml\n\+\+\+ b\/\.github\/workflows\/security\.yml/);
     assert.match(declined.out, /-      - run: echo hand-written/);
     assert.deepEqual(snapshot(root), before);
@@ -316,7 +317,7 @@ describe('onboard: existing files are never silently overwritten', () => {
     const root = makeRepo(t, { ...PY_REPO, [SECURITY]: HUMAN_WORKFLOW, '.semgrepignore': 'dist/\n' });
     const onlyOne = await onboardFrom(root, SOURCE_ONLY, ['--adopt', SECURITY]);
     assert.equal(onlyOne.code, 1, 'the unnamed .semgrepignore is still a conflict');
-    assert.match(onlyOne.out, /CONFLICT {2}\.semgrepignore/);
+    assert.match(onlyOne.out, /! conflict {3}\.semgrepignore/);
     assert.ok(!existsSync(join(root, CONFIG)));
     assert.equal(read(root, SECURITY), HUMAN_WORKFLOW);
   });
@@ -328,12 +329,12 @@ describe('onboard: existing files are never silently overwritten', () => {
     for (const extra of [[], ['--adopt', '.semgrepignore'], ['--force', SECURITY]]) {
       const { code, out } = await onboardFrom(root, { ...SOURCE_ONLY, semgrep: { ignore: { managed: true } } }, extra);
       assert.equal(code, 1, extra.join(' '));
-      assert.match(out, /CONFLICT {2}\.semgrepignore/);
+      assert.match(out, /! conflict {3}\.semgrepignore/);
       assert.deepEqual(snapshot(root), before);
     }
     const forced = await onboard(root, { ...ANSWERS, manageSemgrepignore: true }, {}, ['--force', '.semgrepignore']);
     assert.equal(forced.code, 0, forced.err);
-    assert.match(forced.out, /OVERWRITE \.semgrepignore/);
+    assert.match(forced.out, /! overwrite {2}\.semgrepignore/);
     assert.ok(readMarker(read(root, '.semgrepignore')).intact);
   });
 
@@ -462,10 +463,10 @@ describe('onboard: after writing, success is only what validate says', () => {
     const framework = { ...FRAMEWORK, dirtyPaths: ['onboarding/lib/render.mjs'], get clean() { reads += 1; return reads <= 1; } };
     const { code, out, err } = await onboardFrom(root, SOURCE_ONLY, [], { framework });
     assert.equal(code, 1);
-    assert.match(out, /ssd-onboard validate\n=+/);
+    assert.match(out, /^SSD Validate$/m);
     assert.match(out, /has uncommitted changes/);
     assert.match(err, /Onboarding did NOT complete: the written state does not validate/);
-    assert.match(err, /\.ssd\/onboarding\.yml\n {2}\.github\/workflows\/security\.yml\n {2}\.semgrepignore/);
+    assert.match(err, /Written \(nothing was committed\)\n {2}\+ create {5}\.ssd\/onboarding\.yml\n {2}\+ create {5}\.github\/workflows\/security\.yml\n {2}\+ create {5}\.semgrepignore/);
     assert.doesNotMatch(out, /successfully/);
   });
 
@@ -486,7 +487,7 @@ describe('onboard: after writing, success is only what validate says', () => {
     const { code, out, err } = await cli(root, ['onboard'], { prompter });
     assert.equal(code, 1);
     assert.match(err, /writing \.github\/workflows\/security\.yml failed: EISDIR/);
-    assert.match(err, /Onboarding did NOT complete\. Written \(nothing was rolled back\):\n {2}\.ssd\/onboarding\.yml\nOnce the cause is fixed, `ssd-onboard render` completes the generated files/);
+    assert.match(err, /✗ Onboarding did NOT complete\. Written \(nothing was rolled back\):\n {4}- \.ssd\/onboarding\.yml\nOnce the cause is fixed, `ssd-onboard render` completes the generated files/);
     assert.doesNotMatch(`${out}\n${err}`, /successfully|Local validation passed/);
     assert.ok(existsSync(join(root, CONFIG)), 'the config is kept, not rolled back');
     assert.ok(!existsSync(join(root, '.semgrepignore')), 'the file after the failure was never attempted');
@@ -568,7 +569,7 @@ describe('onboard: container profiles', () => {
     assert.equal(config.rollout.gateMode, 'log-only');
     assert.ok(!existsSync(join(root, '.github/workflows/deploy.yml')));
     assert.doesNotMatch(read(root, SECURITY), /aws-actions|role-to-assume/);
-    assert.match(out, /AWS\/OIDC: {10}not used/);
+    assert.match(out, /^ {2}AWS\/OIDC +not used$/m);
     assert.deepEqual(shimCalls().slice(calls), []);
     assert.equal((await doctorJson(root)).counts.FAIL, 0);
   });
