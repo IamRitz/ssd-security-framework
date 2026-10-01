@@ -4,8 +4,15 @@
 // wrapper's `--region <r> --output json --no-cli-pager` suffix, joined by
 // spaces — to a recorded { stdout, stderr, exitCode }. fakeAws(world) is an
 // injectable executor that records every argv it receives (exactly as
-// execFile would get it) and answers an UNRECORDED call with a loud failure,
-// so a test proves both the calls that happen and the calls that must not.
+// execFile would get it). It is STRICT, independently of the code under test:
+//   - every argv must end in exactly the wrapper suffix and its call part must
+//     pass the read-only allowlist, so a path that bypasses readOnlyAws() fails;
+//   - an UNRECORDED call throws a plain Error (FakeAwsError), which no doctor
+//     code treats as an AWS answer, so the test fails instead of degrading the
+//     call to NOT VERIFIED.
+// A key ending in ' *' matches every call that starts with the text before it
+// (exact keys win).
+import { assertReadOnly } from '../../onboarding/aws/aws-cli.mjs';
 import { ACCOUNT, DEPLOY_ROLE, PUSH_ROLE } from './onboarding-fixtures.mjs';
 
 export { ACCOUNT, DEPLOY_ROLE, PUSH_ROLE };
@@ -145,12 +152,9 @@ export function readyWorld() {
   for (const id of [PROVIDER, REPOSITORY, 'app-ecr-push-scan', 'app-deploy']) {
     world[`cloudformation describe-stack-resources --physical-resource-id ${id}`] = notInStack(id);
   }
-  // Simulation: denied to this operator unless a test records results.
-  for (const [arn, groups] of [
-    [PUSH_ROLE, [[['ecr:GetAuthorizationToken'], '*'], [['ecr:BatchCheckLayerAvailability', 'ecr:InitiateLayerUpload', 'ecr:UploadLayerPart', 'ecr:CompleteLayerUpload', 'ecr:PutImage', 'ecr:DescribeImageScanFindings'], REPO_ARN]]],
-    [DEPLOY_ROLE, [[['ssm:SendCommand'], INSTANCE_ARN], [['ssm:SendCommand'], `arn:aws:ssm:${REGION}::document/AWS-RunShellScript`], [['ssm:GetCommandInvocation'], '*']]]
-  ]) {
-    world[simulateKey(arn, groups[0][0], groups[0][1])] = accessDenied('SimulatePrincipalPolicy', 'iam:SimulatePrincipalPolicy');
+  // Simulation: denied to this operator unless a test records exact results.
+  for (const arn of [PUSH_ROLE, DEPLOY_ROLE]) {
+    world[`iam simulate-principal-policy --policy-source-arn ${arn} *`] = accessDenied('SimulatePrincipalPolicy', 'iam:SimulatePrincipalPolicy');
   }
   return world;
 }
@@ -174,17 +178,44 @@ export const SSD_STACK_TAGS = [
 
 const WRAPPER = ['--region', '--output', 'json', '--no-cli-pager'];
 
+export class FakeAwsError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'FakeAwsError';
+  }
+}
+
+function lookup(world, key) {
+  if (Object.hasOwn(world, key)) {
+    return world[key];
+  }
+  const prefix = Object.keys(world)
+    .filter((k) => k.endsWith(' *') && key.startsWith(k.slice(0, -1)))
+    .sort((a, b) => b.length - a.length)[0];
+  return prefix ? world[prefix] : undefined;
+}
+
 export function fakeAws(world) {
   const calls = [];
   const unexpected = [];
   const exec = async (argv, options) => {
     calls.push({ argv: [...argv], options });
     const at = argv.indexOf('--region');
-    const key = (at === -1 ? argv : argv.slice(0, at)).join(' ');
-    const response = world[key];
+    const suffix = at === -1 ? [] : argv.slice(at);
+    if (at === -1 || suffix.length !== 5 || suffix[0] !== '--region' || suffix[2] !== '--output' || suffix[3] !== 'json' || suffix[4] !== '--no-cli-pager') {
+      throw new FakeAwsError(`argv without the read-only wrapper suffix reached the executor: ${argv.join(' ')}`);
+    }
+    const call = argv.slice(0, at);
+    try {
+      assertReadOnly(call);
+    } catch (error) {
+      throw new FakeAwsError(`a non-allowlisted argv reached the executor: ${call.join(' ')} (${error.message})`);
+    }
+    const key = call.join(' ');
+    const response = lookup(world, key);
     if (!response) {
       unexpected.push(key);
-      return { stdout: '', stderr: `UNRECORDED CALL: ${key}`, exitCode: 99 };
+      throw new FakeAwsError(`UNRECORDED AWS CALL: ${key}`);
     }
     return typeof response === 'function' ? response(argv) : response;
   };

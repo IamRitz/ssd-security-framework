@@ -125,6 +125,51 @@ describe('read-only allowlist', () => {
     }
   });
 
+  it('M1: a value the AWS CLI would resolve (file://, fileb://, http(s)://) is refused before spawning aws', async () => {
+    const f = fakeAws({});
+    const aws = readOnlyAws({ region: 'us-east-1', exec: f.exec });
+    const hostile = ['file:///etc/passwd', 'fileb:///tmp/x', 'https://example.com/x', 'http://127.0.0.1/x', 'FILE:///etc/passwd', 'Https://example.com/x', 'file://relative/path'];
+    const targets = [
+      (v) => ['iam', 'get-role', '--role-name', v],
+      (v) => ['iam', 'get-policy', '--policy-arn', v],
+      (v) => ['cloudformation', 'describe-stacks', '--stack-name', v],
+      (v) => ['iam', 'get-role-policy', '--role-name', 'app', '--policy-name', v]
+    ];
+    for (const value of hostile) {
+      for (const build of targets) {
+        await assert.rejects(aws(build(value)), (error) => error.kind === 'refused' && /file:\/\/ \/ fileb:\/\/ \/ http\(s\):\/\//.test(error.message), build(value).join(' '));
+      }
+    }
+    assert.deepEqual(f.calls, [], 'nothing was spawned');
+  });
+
+  it('M1: ordinary values are unaffected — ARNs, repository paths, IDs, JSON, values merely containing a scheme', async () => {
+    const values = [
+      ['iam', 'get-policy', '--policy-arn', 'arn:aws:iam::012345678901:policy/app-pull'],
+      ['iam', 'get-open-id-connect-provider', '--open-id-connect-provider-arn', 'arn:aws:iam::012345678901:oidc-provider/token.actions.githubusercontent.com'],
+      ['cloudformation', 'describe-stacks', '--stack-name', 'arn:aws:cloudformation:us-east-1:012345678901:stack/ssd-app/1'],
+      ['ecr', 'describe-repositories', '--registry-id', '012345678901', '--repository-names', 'team/app'],
+      ['ec2', 'describe-instances', '--instance-ids', 'i-0123456789abcdef0'],
+      ['inspector2', 'batch-get-account-status', '--account-ids', '012345678901'],
+      ['ssm', 'describe-instance-information', '--filters', '[{"Key":"InstanceIds","Values":["i-0123456789abcdef0"]}]'],
+      ['iam', 'get-role', '--role-name', 'role-named-file'],
+      ['cloudformation', 'describe-stack-resources', '--physical-resource-id', 'x-https://not-at-start']
+    ];
+    for (const argv of values) {
+      assert.doesNotThrow(() => assertReadOnly(argv), argv.join(' '));
+    }
+    const f = fakeAws({ 'iam get-role --role-name role-named-file': ok({ Role: {} }) });
+    await readOnlyAws({ region: 'eu-west-1', exec: f.exec })(['iam', 'get-role', '--role-name', 'role-named-file']);
+    assert.deepEqual(f.calls[0].argv.slice(-5), ['--region', 'eu-west-1', '--output', 'json', '--no-cli-pager'], 'the region value is the wrapper\'s own, never checked as a caller value');
+  });
+
+  it('M1: the scheme check applies to values only — command and flag positions are judged by the allowlist', () => {
+    // A scheme-shaped service/operation/flag is refused as unlisted, not as a value.
+    for (const argv of [['file://iam', 'get-role'], ['iam', 'https://get-role'], ['iam', 'get-role', 'file://--role-name', 'x']]) {
+      assert.throws(() => assertReadOnly(argv), (error) => error.kind === 'refused' && !/would resolve/.test(error.message), argv.join(' '));
+    }
+  });
+
   it('non-argv input is refused', () => {
     for (const argv of [null, undefined, 'iam get-role --role-name x', ['sts'], [], ['sts', 'get-caller-identity', 3]]) {
       refused(() => assertReadOnly(argv));

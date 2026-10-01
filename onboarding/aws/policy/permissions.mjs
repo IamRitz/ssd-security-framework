@@ -41,9 +41,17 @@ export function roleRequirements(role, target, { enhanced = false } = {}) {
         { action: 'ecr:GetAuthorizationToken', resource: '*', why: 'ECR login (account-level API)' },
         ...ECR_PUSH.map((action) => ({ action, resource: a.repository, why: 'docker push to the configured repository' })),
         { action: 'ecr:DescribeImageScanFindings', resource: a.repository, why: 'poll the registry scan of the pushed digest' },
-        ...(enhanced
-          ? ['inspector2:ListCoverage', 'inspector2:ListFindings'].map((action) => ({ action, resource: '*', why: 'enhanced scanning: coverage and findings come from Inspector (account-level API)' }))
-          : [])
+        // enhanced: true (ENHANCED), false (BASIC), null (scan type unknown:
+        // the Inspector statement is POSSIBLY needed, so its absence cannot
+        // pass — NOT VERIFIED — but is not proven missing either).
+        ...(enhanced === false
+          ? []
+          : ['inspector2:ListCoverage', 'inspector2:ListFindings'].map((action) => ({
+              action,
+              resource: '*',
+              why: enhanced ? 'enhanced scanning: coverage and findings come from Inspector (account-level API)' : 'the registry scan type is unknown: ENHANCED scanning would need Inspector access',
+              possible: enhanced === null
+            })))
       ],
       forbidden: [
         { action: 'ssm:SendCommand', resource: a.instance, severity: 'FAIL', why: 'the push role must not reach the instance (push and deploy are separate roles)' },
@@ -114,21 +122,33 @@ export function analyzePermissions(role, target, { policies, complete, enhanced 
       continue;
     }
     if (r.decision === 'conditional' || r.decision === 'unsupported') {
-      findings.push({ severity: 'WARN', kind: `permission-${r.decision}`, message: `${r.action} on ${r.resource} (${r.why}): granted only by a statement that is not evaluated offline (${r.by.join(', ')})` });
+      // A possible grant is not proof: a required permission stays unproven.
+      findings.push({
+        severity: r.soft ? 'WARN' : 'NOT VERIFIED',
+        kind: 'permission-unproven',
+        message: `${r.action} on ${r.resource} (${r.why}): granted only conditionally, through NotAction/NotResource, or alongside an unevaluated statement (${r.by.join(', ')}), so it is not proven`
+      });
       continue;
     }
-    const severity = r.soft ? 'WARN' : complete ? 'FAIL' : 'NOT VERIFIED';
+    const severity = r.soft ? 'WARN' : r.possible ? 'NOT VERIFIED' : complete ? 'FAIL' : 'NOT VERIFIED';
     findings.push({ severity, kind: 'permission-missing', message: `${r.action} on ${r.resource} (${r.why}) is ${r.decision === 'denied' ? `explicitly denied by ${r.by.join(', ')}` : 'not granted by the role\'s policies'}` });
   }
   for (const f of req.forbidden) {
     const g = grants(stmts, f.action, f.resource);
     if (g.decision === 'allowed' || g.decision === 'conditional' || g.decision === 'unsupported') {
-      findings.push({ severity: g.decision === 'allowed' ? f.severity : 'WARN', kind: 'permission-too-broad', message: `${f.action} on ${f.resource} is ${g.decision === 'allowed' ? 'granted' : `possibly granted (${g.decision})`} by ${g.by.join(', ')}: ${f.why}` });
+      // A forbidden permission that MAY be granted is as serious as one that is.
+      findings.push({ severity: f.severity, kind: 'permission-too-broad', message: `${f.action} on ${f.resource} is ${g.decision === 'allowed' ? 'granted' : `possibly granted (${g.decision})`} by ${g.by.join(', ')}: ${f.why}` });
     }
   }
   const admin = stmts.filter((s) => s.effect === 'Allow' && s.actions.includes('*') && s.resources.includes('*'));
   if (admin.length > 0) {
     findings.push({ severity: 'FAIL', kind: 'administrator', message: `Action "*" on Resource "*" is granted by ${admin.map((s) => s.sid).join(', ')}` });
+  }
+  // Allow + NotAction over every resource is "everything except a list": treat
+  // it as possible administrator access.
+  const possibleAdmin = stmts.filter((s) => s.effect === 'Allow' && s.notActions.length > 0 && (s.resources.includes('*') || s.notResources.length > 0));
+  if (possibleAdmin.length > 0) {
+    findings.push({ severity: 'FAIL', kind: 'possible-administrator', message: `Allow with NotAction on every resource ("everything except …") is granted by ${possibleAdmin.map((s) => s.sid).join(', ')}` });
   }
   if (!complete) {
     findings.push({ severity: 'NOT VERIFIED', kind: 'policies-incomplete', message: 'not every policy of the role could be read, so the analysis is incomplete' });
@@ -145,8 +165,9 @@ export function analyzePermissions(role, target, { policies, complete, enhanced 
 
 // Groups of required actions per resource, for simulate-principal-policy.
 export function simulationGroups(role, target, { enhanced = false } = {}) {
+  // Only what is certainly required; possibly-needed actions are not simulated.
   const groups = new Map();
-  for (const r of roleRequirements(role, target, { enhanced }).required) {
+  for (const r of roleRequirements(role, target, { enhanced: enhanced === true }).required) {
     if (!groups.has(r.resource)) {
       groups.set(r.resource, []);
     }

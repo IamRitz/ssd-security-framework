@@ -345,7 +345,9 @@ account **root** user, blocks before any resource is read.
 (`execFile`, argv array, no shell) whose allowlist names each permitted
 `service operation` and its permitted parameters explicitly; anything else —
 every mutating verb, an unlisted read, `--endpoint-url`, `--profile`,
-`--debug`, `--cli-input-json` — is refused before it runs. There is no mutating
+`--debug`, `--cli-input-json`, and any parameter **value** beginning with
+`file://`, `fileb://`, `http://` or `https://` (which the AWS CLI would resolve
+by reading a local file or a URL) — is refused before it runs. There is no mutating
 wrapper in this version.
 
 | Section | Check | FAIL when | NOT VERIFIED when |
@@ -355,15 +357,15 @@ wrapper in this version.
 | | Subject format | | **always** (not required): legacy vs immutable customization needs the GitHub API |
 | ECR | Repository | absent; public repository policy | cannot be read |
 | | Tag immutability | | (WARN when MUTABLE: deploys pin digests, but a tag can be repointed) |
-| | Registry scanning coverage | no rule scans the repository automatically (MANUAL is not coverage) | the configuration cannot be read, or an unevaluated rule could matter |
+| | Registry scanning coverage | no rule scans the repository automatically (MANUAL is not coverage) | the configuration cannot be read, the scan type is missing or not BASIC/ENHANCED, or an unevaluated rule could matter |
 | | Inspector (only with ENHANCED) | Inspector ECR scanning not ENABLED; repository coverage INACTIVE | account status cannot be read |
 | IAM | Push/scan and deploy role | absent; same name at another path | cannot be read |
 | | … trust | any trust path beyond this repository + the role's context: wildcard or missing `sub`, org-wide, other repo/branch/environment, `pull_request`, wrong/missing audience, wrong provider, `*` or cross-account principal, unsupported operator (WARN: exact `StringLike`, immutable-format IDs unverified, narrowing extra conditions) | the role is unavailable |
-| | … permissions | a needed action not granted, or granted but denied by simulation; a forbidden one granted (push role reaching SSM, deploy role writing ECR, other repository/instance, `iam:PassRole`, `*:*`) | a policy cannot be read |
+| | … permissions | a needed action not granted, or granted but denied by simulation; a forbidden one granted **or possibly granted** — conditionally, through `NotAction`/`NotResource`, or despite a conditional Deny (push role reaching SSM, deploy role writing ECR, other repository/instance, `iam:PassRole`); `*:*`, or `Allow` + `NotAction` on every resource (possible administrator) | a policy cannot be read; a needed action is granted only conditionally or through `NotAction`/`NotResource`; with an unknown scan type, the Inspector statement is missing |
 | SSM | Instance | absent; another account; not running | cannot be read |
 | | Managed instance Online | not managed by SSM; PingStatus ≠ Online | cannot be read |
 | | Instance role (ECR pull) | no profile; profile in another account or without exactly one role; no ECR login/pull on the repository (a **proposed** policy is printed, never attached) | cannot be read |
-| Ownership | per resource | | the stack lookup is denied |
+| Ownership | per resource | configured `managed`, but the resource exists and is not owned | the stack lookup is denied |
 
 Role contexts: push+scan trusts only `ref:refs/heads/<repository.defaultBranch>`;
 deploy trusts only `environment:<delivery.environment>` (with no environment it
@@ -378,12 +380,14 @@ that specific call makes a resource `absent`; a denial, throttle, timeout or
 malformed response is NOT VERIFIED.
 
 **Ownership: existence is not ownership.** A resource is reported `managed`
-only if CloudFormation lists it as a physical resource of a live stack, of the
-expected type, whose tags are `ssd:framework=ssd-security-framework`,
+only if CloudFormation lists it as a physical resource of a stack in a settled,
+successful state (`CREATE_COMPLETE`, `UPDATE_COMPLETE`, `UPDATE_ROLLBACK_COMPLETE`,
+`IMPORT_COMPLETE`, `IMPORT_ROLLBACK_COMPLETE`), of the expected type, whose tags are `ssd:framework=ssd-security-framework`,
 `ssd:managed-by=ssd-onboard`, `ssd:environment=production|synthetic` and (per
 repository) `ssd:consumer-repository=<owner>/<repo>`. Anything else that exists
-is `exists, not owned` — expected for `existing`, a WARN for `managed` (it will
-never be adopted by name).
+is `exists, not owned` — expected for `existing`, a **FAIL** for `managed` (it
+will never be adopted by name). A resource owned by an ssd-onboard stack but
+configured `existing` is a WARN.
 
 Outcomes and exit codes. Every check carries `required` (in JSON); the human
 output appends **(advisory)** to a non-PASS check whose `required` is false, and

@@ -3,7 +3,9 @@
 // A resource is `managed` only when ALL of these hold:
 //   - CloudFormation reports it as a physical resource of a stack, of the
 //     expected resource type;
-//   - that stack is live (not DELETE_COMPLETE / *_FAILED on create) and its
+//   - that stack is in a settled, successful state (CREATE_COMPLETE,
+//     UPDATE_COMPLETE, UPDATE_ROLLBACK_COMPLETE, IMPORT_COMPLETE,
+//     IMPORT_ROLLBACK_COMPLETE) and its
 //     stack tags carry ssd:framework=ssd-security-framework,
 //     ssd:managed-by=ssd-onboard, ssd:environment=production|synthetic and, for
 //     per-repository resources, ssd:consumer-repository=<owner>/<repo>;
@@ -20,7 +22,9 @@ export const SSD_TAGS = Object.freeze({
   environment: 'ssd:environment'
 });
 const ENVIRONMENTS = ['production', 'synthetic'];
-const DEAD = /^(DELETE_COMPLETE|CREATE_FAILED|ROLLBACK_COMPLETE|ROLLBACK_FAILED|DELETE_FAILED)$/;
+// Only settled, successful stack states. Anything else — in progress, failed,
+// rolled back after create, being deleted — proves no ownership.
+const LIVE = new Set(['CREATE_COMPLETE', 'UPDATE_COMPLETE', 'UPDATE_ROLLBACK_COMPLETE', 'IMPORT_COMPLETE', 'IMPORT_ROLLBACK_COMPLETE']);
 
 // -> { stackResource: result, stack: result|null }
 export async function discoverStack(aws, physicalId) {
@@ -69,8 +73,8 @@ export function evaluateOwnership({ discovered, resourceTags = null, expectedTyp
     return { ownership: 'exists-not-owned', reasons: [...reasons, `stack ${sr.stackName} was not returned`], stack: sr };
   }
   const st = stack.value;
-  if (DEAD.test(st.status ?? '')) {
-    reasons.push(`stack ${st.name} is ${st.status}`);
+  if (!LIVE.has(st.status)) {
+    reasons.push(`stack ${st.name} is ${st.status ?? 'in an unknown state'} (not a settled, successful state)`);
   }
   for (const [key, value] of [SSD_TAGS.framework, SSD_TAGS.managedBy]) {
     if (tagValue(st.tags, key) !== value) {

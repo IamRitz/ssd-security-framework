@@ -175,6 +175,7 @@ const MUTATIONS = [
   ['a region mismatch contacts no AWS', 'onboarding/aws/doctor.mjs', '  if (regionC.status === FAIL) {', '  if (false) {'],
   ['an identity failure stops the run before discovery', 'onboarding/aws/doctor.mjs', '  if (identity.some((c) => c.status === FAIL)) {', '  if (false) {'],
   ['a mutating AWS call cannot pass the read-only allowlist', 'onboarding/aws/aws-cli.mjs', '    assertReadOnly(argv);\n', ''],
+  ['a file:// / fileb:// / http(s):// value never reaches the AWS CLI', 'onboarding/aws/aws-cli.mjs', '      if (INDIRECT_VALUE.test(value)) {', '      if (false) {'],
   ['a caller cannot add unlisted AWS CLI parameters (endpoint, profile, debug)', 'onboarding/aws/aws-cli.mjs', '    if (!Object.hasOwn(flags, flag) || WRAPPER_FLAGS.includes(flag)) {', '    if (WRAPPER_FLAGS.includes(flag)) {'],
   ['a wildcard OIDC subject is never accepted', 'onboarding/aws/policy/trust.mjs', "  return { severity: 'FAIL', kind, message: `subject pattern", "  return { severity: 'WARN', kind, message: `subject pattern"],
   ['a wrong trust audience is never accepted', 'onboarding/aws/policy/trust.mjs', "(value) => (value === STS_AUDIENCE ? [] :", '(value) => (true ? [] :'],
@@ -185,6 +186,19 @@ const MUTATIONS = [
   ['an Offline SSM node cannot PASS', 'onboarding/aws/doctor.mjs', "  const online = result.value.pingStatus === 'Online';", '  const online = true;'],
   ['a required NOT VERIFIED check blocks readiness', 'onboarding/aws/doctor.mjs', '  if (checks.some((c) => c.status === NOT_VERIFIED && c.required)) {', '  if (false) {'],
   ['an AWS prerequisite is required unless explicitly advisory', 'onboarding/aws/doctor.mjs', "  return { id, section, title, status: PASS, required: true,", "  return { id, section, title, status: PASS, required: false,"],
+  // Follow-up review fixes: readiness conclusions fail closed.
+  ['an unknown registry scan type is not evaluated as coverage', 'onboarding/aws/doctor.mjs', '  if (!SCAN_TYPES.includes(s.scanType)) {', '  if (false) {'],
+  ['an unknown scan type still asks the push role for Inspector access', 'onboarding/aws/policy/permissions.mjs', '        ...(enhanced === false', '        ...(enhanced !== true'],
+  ['a possibly-needed permission that is missing is NOT VERIFIED, not a warning', 'onboarding/aws/policy/permissions.mjs', "r.possible ? 'NOT VERIFIED' :", "r.possible ? 'WARN' :"],
+  ['managed + exists-not-owned blocks', 'onboarding/aws/doctor.mjs', "    findings.push({ severity: FAIL, kind: 'present-unowned',", "    findings.push({ severity: WARN, kind: 'present-unowned',"],
+  ['a possibly-granted forbidden permission is never downgraded to WARN', 'onboarding/aws/policy/permissions.mjs', "      findings.push({ severity: f.severity, kind: 'permission-too-broad',", "      findings.push({ severity: g.decision === 'allowed' ? f.severity : 'WARN', kind: 'permission-too-broad',"],
+  ['Allow + NotAction on every resource is possible administrator', 'onboarding/aws/policy/permissions.mjs', '  if (possibleAdmin.length > 0) {', '  if (false) {'],
+  ['a conditional Deny hides no forbidden grant', 'onboarding/aws/policy/evaluate.mjs', '  const hardDenies = denies.filter((s) => !conditional(s));', '  const hardDenies = denies;'],
+  ['a required permission granted only conditionally is NOT VERIFIED', 'onboarding/aws/policy/permissions.mjs', "        severity: r.soft ? 'WARN' : 'NOT VERIFIED',", "        severity: 'WARN',"],
+  ['a grant through NotAction/NotResource is never proof', 'onboarding/aws/policy/evaluate.mjs', '  const direct = (s) => s.actions.length > 0 && s.resources.length > 0;', '  const direct = () => true;'],
+  ['only a settled, successful stack proves ownership', 'onboarding/aws/discover/stacks.mjs', '  if (!LIVE.has(st.status)) {', '  if (false) {'],
+  ['the fake AWS harness fails on an unrecorded call', 'test/support/aws-fake.mjs', '      throw new FakeAwsError(`UNRECORDED AWS CALL: ${key}`);', "      return { stdout: '', stderr: 'UNRECORDED', exitCode: 99 };"],
+  ['the fake AWS harness enforces the read-only allowlist itself', 'test/support/aws-fake.mjs', '      assertReadOnly(call);\n', ''],
   ['a registry rule for another repository does not cover it', 'onboarding/aws/discover/ecr.mjs', '      if (!wildcardFilterMatches(f.filter, repository)) {', '      if (false) {'],
 ];
 

@@ -189,12 +189,27 @@ export function immutabilityCheck(result) {
   };
 }
 
+const SCAN_TYPES = ['BASIC', 'ENHANCED'];
+
+// true (ENHANCED) | false (BASIC) | null (unknown: unreadable or unrecognised).
+export const enhancedOf = (scanning) => (scanning.state === 'present' && SCAN_TYPES.includes(scanning.value.scanType) ? scanning.value.scanType === 'ENHANCED' : null);
+
 export function scanningCheck(result, { repository, repositoryScanOnPush }) {
   const c = check('ecr.scanning', 'ECR', 'Registry scanning coverage', { expected: [`a registry scanning rule that scans ${repository} on push (BASIC) or on push/continuously (ENHANCED)`] });
   if (result.state !== 'present') {
     return result.state === 'unverified' ? unverifiedCheck(c, result) : { ...c, status: NOT_VERIFIED, findings: [{ severity: NOT_VERIFIED, kind: 'malformed-response', message: 'no scanning configuration returned' }] };
   }
   const s = result.value;
+  if (!SCAN_TYPES.includes(s.scanType)) {
+    // Coverage rules mean different things under BASIC and ENHANCED; with no
+    // recognised scan type nothing can be concluded from them.
+    return {
+      ...c,
+      status: NOT_VERIFIED,
+      observed: [`registry scan type ${s.scanType === null || s.scanType === undefined ? 'missing' : `'${s.scanType}'`} (not BASIC or ENHANCED)`],
+      findings: [{ severity: NOT_VERIFIED, kind: 'scan-type-unknown', message: 'the registry scan type is missing or unrecognised, so coverage cannot be evaluated' }]
+    };
+  }
   const coverage = scanningCoverage(s, repository, { repositoryScanOnPush });
   const observed = [`registry scan type ${s.scanType ?? 'unknown'}`, ...s.rules.map((r, i) => `rule ${i + 1}: ${r.frequency} for ${r.filters.map((f) => `${f.type} '${f.filter}'`).join(', ') || '(no filters)'}`)];
   const findings = coverage.unsupported.map((message) => ({ severity: coverage.covered ? WARN : NOT_VERIFIED, kind: 'unsupported-construct', message }));
@@ -404,7 +419,8 @@ export function ownershipCheck({ label, id, mode, evaluation, resourceState }) {
   }
   const findings = [];
   if (mode === 'managed' && ownership !== 'managed') {
-    findings.push({ severity: WARN, kind: 'present-unowned', message: 'configured as managed, but it exists and is NOT owned by ssd-onboard; it will never be adopted by name (use existing, or an explicit CloudFormation import)' });
+    // Proven NOT owned is stronger evidence than unverified, so it blocks too.
+    findings.push({ severity: FAIL, kind: 'present-unowned', message: 'configured as managed, but it exists and is NOT owned by ssd-onboard; it will never be adopted by name (use existing, or an explicit CloudFormation import)' });
   }
   if (mode === 'existing' && ownership === 'managed') {
     findings.push({ severity: WARN, kind: 'ownership-mode-mismatch', message: 'owned by an ssd-onboard stack, but configured as existing' });
@@ -474,9 +490,8 @@ export async function awsDoctor({ config, region: explicitRegion = null, exec, e
   const oidc = await discoverOidcProvider(aws, { account });
   const repo = await discoverRepository(aws, { account, repository: d.ecr.repository });
   const scanning = await discoverRegistryScanning(aws);
-  const scanType = scanning.state === 'present' ? scanning.value.scanType : null;
-  const enhanced = scanType === 'ENHANCED';
-  const inspector = enhanced
+  const enhanced = enhancedOf(scanning);
+  const inspector = enhanced === true
     ? { account: await discoverInspectorAccount(aws, { account }), coverage: await discoverInspectorCoverage(aws, { repository: d.ecr.repository }) }
     : null;
   const target2 = { partition, account, region: resolved.region, repository: d.ecr.repository, instanceId: d.ssm.instanceId };
@@ -493,9 +508,6 @@ export async function awsDoctor({ config, region: explicitRegion = null, exec, e
       if (policies.errors.length > 0) {
         analysis.findings.push(...policies.errors.map((e) => ({ severity: NOT_VERIFIED, kind: e.kind, message: `policy not read: ${e.message}` })));
         analysis.status = worst(analysis.findings);
-      }
-      if (scanning.state !== 'present' && key === 'push') {
-        analysis.findings.push({ severity: WARN, kind: 'scan-type-unknown', message: 'registry scan type unknown: with ENHANCED scanning the role also needs inspector2:ListCoverage and inspector2:ListFindings' });
       }
     }
     roles.push({ key, label, arn, role, analysis, simulation });

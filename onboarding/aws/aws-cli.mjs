@@ -67,6 +67,15 @@ export const READ_ONLY_OPERATIONS = Object.freeze({
 // Appended by the wrapper, so never accepted from a caller.
 const WRAPPER_FLAGS = ['--region', '--output', '--no-cli-pager'];
 
+// The AWS CLI resolves a parameter VALUE beginning with file:// or fileb:// by
+// reading that local file (and, where enabled, http(s):// by fetching the URL)
+// and sends the CONTENT as the parameter. Values here can come from AWS
+// responses (role, policy and stack identifiers), so such indirection is
+// refused for every value. No read operation opts into a scheme; a future
+// command that needs one must do so per reviewed parameter, not by relaxing
+// this check.
+const INDIRECT_VALUE = /^(?:file|fileb|https?):\/\//i;
+
 export const DEFAULT_TIMEOUT_MS = 60_000;
 export const DEFAULT_MAX_BUFFER = 16 * 1024 * 1024;
 
@@ -215,6 +224,11 @@ export function assertReadOnly(argv) {
       // A value that looks like an option would be parsed as one by the CLI.
       if (value === undefined || value === '' || value.startsWith('-')) {
         throw new AwsCliError('refused', `refusing 'aws ${service} ${operation}': '${flag}' needs a value that is not an option`, {
+          operation: `${service} ${operation}`
+        });
+      }
+      if (INDIRECT_VALUE.test(value)) {
+        throw new AwsCliError('refused', `refusing 'aws ${service} ${operation}': the value of '${flag}' is a file:// / fileb:// / http(s):// reference, which the AWS CLI would resolve`, {
           operation: `${service} ${operation}`
         });
       }

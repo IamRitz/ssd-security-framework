@@ -4,9 +4,10 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import { awsDoctor } from '../onboarding/aws/doctor.mjs';
+import { awsDoctor, exitCodeOf } from '../onboarding/aws/doctor.mjs';
 import { scanningCoverage, wildcardFilterMatches } from '../onboarding/aws/discover/ecr.mjs';
 import { evaluateOwnership } from '../onboarding/aws/discover/stacks.mjs';
+import { grants, statements } from '../onboarding/aws/policy/evaluate.mjs';
 import { analyzePermissions } from '../onboarding/aws/policy/permissions.mjs';
 import { config } from './support/onboarding-fixtures.mjs';
 import {
@@ -27,6 +28,7 @@ import {
   SSD_STACK_TAGS,
   accessDenied,
   awsError,
+  FakeAwsError,
   fakeAws,
   managedStack,
   ok,
@@ -501,7 +503,7 @@ describe('ownership: existence is not ownership', () => {
     const world = managedStack(readyWorld(), 'app-deploy', { type: 'AWS::IAM::Role', tags });
     const { check } = await run(world, { delivery: { environment: 'production', roles: { deployOwnership: 'managed' } } });
     assert.equal(check('ownership.deploy-role').ownership, 'exists-not-owned');
-    assert.equal(check('ownership.deploy-role').status, 'WARN');
+    assert.equal(check('ownership.deploy-role').status, 'FAIL');
     assert.ok(kinds(check('ownership.deploy-role')).includes('present-unowned'));
   });
 
@@ -536,5 +538,230 @@ describe('ownership: existence is not ownership', () => {
     assert.equal(check('ownership.deploy-role').ownership, 'unverified');
     assert.equal(check('ownership.deploy-role').status, 'NOT VERIFIED');
     assert.equal(check('ownership.deploy-role').required, false, 'existing mode: informational');
+  });
+});
+
+// --- hardened readiness conclusions (follow-up review fixes) ----------------------
+
+const pushRoleWith = (world, extra, base = PUSH_POLICY) => {
+  world['iam get-role-policy --role-name app-ecr-push-scan --policy-name push'] = ok({ PolicyDocument: { ...base, Statement: [...base.Statement, ...extra] } });
+  return world;
+};
+const deployRoleWith = (world, statements) => {
+  world['iam get-role-policy --role-name app-deploy --policy-name deploy'] = ok({ PolicyDocument: { Version: '2012-10-17', Statement: statements } });
+  return world;
+};
+const COND = { Bool: { 'aws:SecureTransport': 'true' } };
+
+describe('M3: unknown registry scan type fails closed', () => {
+  for (const [label, scanType] of [['missing', undefined], ['unrecognised', 'PREMIUM']]) {
+    it(`a ${label} scanType: scanning is required NOT VERIFIED, exit 1, Inspector not consulted`, async () => {
+      const world = readyWorld();
+      world[SCANNING] = ok({ registryId: ACCOUNT, scanningConfiguration: { ...(scanType ? { scanType } : {}), rules: [rule('SCAN_ON_PUSH', '*')] } });
+      const { check, report, f } = await run(world);
+      assert.equal(check('ecr.scanning').status, 'NOT VERIFIED');
+      assert.equal(check('ecr.scanning').required, true);
+      assert.deepEqual(kinds(check('ecr.scanning')), ['scan-type-unknown']);
+      assert.equal(report.outcome, 'NOT_VERIFIED');
+      assert.equal(exitCodeOf(report), 1);
+      assert.ok(!f.operations().some((op) => op.startsWith('inspector2 ')));
+    });
+  }
+
+  it('unknown scan type: a push role WITHOUT the Inspector statement is NOT VERIFIED (possibly needed), never PASS or FAIL', async () => {
+    const world = readyWorld();
+    world[SCANNING] = ok({ registryId: ACCOUNT, scanningConfiguration: { rules: [] } });
+    const { check } = await run(world);
+    const c = check('iam.push-permissions');
+    assert.equal(c.status, 'NOT VERIFIED');
+    assert.ok(c.findings.some((x) => x.severity === 'NOT VERIFIED' && x.message.startsWith('inspector2:ListCoverage')));
+    assert.ok(!c.findings.some((x) => x.severity === 'FAIL'));
+  });
+
+  it('unknown scan type: a push role WITH the Inspector statement has no possibly-needed finding', async () => {
+    const world = pushRoleWith(readyWorld(), [{ Effect: 'Allow', Action: ['inspector2:ListCoverage', 'inspector2:ListFindings'], Resource: '*' }]);
+    world[SCANNING] = accessDenied('GetRegistryScanningConfiguration', 'ecr:GetRegistryScanningConfiguration');
+    const { check } = await run(world);
+    assert.equal(check('iam.push-permissions').status, 'PASS');
+    assert.equal(check('ecr.scanning').status, 'NOT VERIFIED');
+  });
+
+  it('BASIC never asks for Inspector; ENHANCED makes it a hard requirement', () => {
+    const basic = analyzePermissions('push', TARGET, { policies: [{ name: 'p', document: PUSH_POLICY }], complete: true, enhanced: false });
+    assert.equal(basic.status, 'PASS');
+    const enhanced = analyzePermissions('push', TARGET, { policies: [{ name: 'p', document: PUSH_POLICY }], complete: true, enhanced: true });
+    assert.ok(enhanced.findings.some((x) => x.severity === 'FAIL' && x.message.startsWith('inspector2:ListCoverage')));
+  });
+});
+
+describe('H2: managed vs existing ownership conclusions', () => {
+  it('managed + exists-not-owned (name-only): FAIL, BLOCKED, exit 1', async () => {
+    const { check, report } = await run(readyWorld(), { delivery: { environment: 'production', roles: { deployOwnership: 'managed' } } });
+    const c = check('ownership.deploy-role');
+    assert.deepEqual([c.ownership, c.status, c.required], ['exists-not-owned', 'FAIL', true]);
+    assert.equal(report.outcome, 'BLOCKED');
+    assert.equal(exitCodeOf(report), 1);
+  });
+
+  it('managed + exists-not-owned blocks for every managed resource kind', async () => {
+    for (const overrides of [{ ecr: { ownership: 'managed' } }, { oidcProvider: 'managed' }, { roles: { pushScanOwnership: 'managed' } }]) {
+      const { report } = await run(readyWorld(), { delivery: { environment: 'production', ...overrides } });
+      assert.equal(report.outcome, 'BLOCKED', JSON.stringify(overrides));
+    }
+  });
+
+  it('existing + managed-owned: WARN (mode mismatch), exit 0', async () => {
+    const world = managedStack(readyWorld(), 'app-deploy', { type: 'AWS::IAM::Role', tags: SSD_STACK_TAGS });
+    const { check, report } = await run(world);
+    const c = check('ownership.deploy-role');
+    assert.deepEqual([c.ownership, c.status, c.required], ['managed', 'WARN', false]);
+    assert.ok(kinds(c).includes('ownership-mode-mismatch'));
+    assert.equal(exitCodeOf(report), 0);
+  });
+
+  it('managed + managed-owned: PASS', async () => {
+    const world = managedStack(readyWorld(), 'app-deploy', { type: 'AWS::IAM::Role', tags: SSD_STACK_TAGS });
+    const { check } = await run(world, { delivery: { environment: 'production', roles: { deployOwnership: 'managed' } } });
+    assert.equal(check('ownership.deploy-role').status, 'PASS');
+  });
+});
+
+describe('H1 + M2: permission conclusions fail closed', () => {
+  it('a push role with Allow NotAction on "*" (everything but IAM): FAIL, BLOCKED, exit 1', async () => {
+    const world = pushRoleWith(readyWorld(), [{ Sid: 'AllButIam', Effect: 'Allow', NotAction: 'iam:*', Resource: '*' }]);
+    const { check, report } = await run(world);
+    const c = check('iam.push-permissions');
+    assert.equal(c.status, 'FAIL');
+    assert.ok(kinds(c).includes('possible-administrator'));
+    assert.ok(c.findings.some((x) => x.kind === 'permission-too-broad' && x.severity === 'FAIL' && x.message.startsWith('ssm:SendCommand')));
+    assert.equal(report.outcome, 'BLOCKED');
+    assert.equal(exitCodeOf(report), 1);
+  });
+
+  it('Allow NotAction with NotResource is possible administrator too; a scoped NotAction is not', () => {
+    const notResource = analyzePermissions('push', TARGET, { policies: [{ name: 'p', document: { Statement: [...PUSH_POLICY.Statement, { Effect: 'Allow', NotAction: 'iam:*', NotResource: 'arn:aws:s3:::x' }] } }], complete: true });
+    assert.ok(notResource.findings.some((x) => x.kind === 'possible-administrator'));
+    const scoped = analyzePermissions('push', TARGET, { policies: [{ name: 'p', document: { Statement: [...PUSH_POLICY.Statement, { Effect: 'Allow', NotAction: 'ecr:DeleteRepository', Resource: REPO_ARN }] } }], complete: true });
+    assert.ok(!scoped.findings.some((x) => x.kind === 'possible-administrator'));
+  });
+
+  it('a forbidden action granted only under a Condition is FAIL, never WARN', async () => {
+    const world = pushRoleWith(readyWorld(), [{ Sid: 'MaybeSsm', Effect: 'Allow', Action: 'ssm:SendCommand', Resource: '*', Condition: COND }]);
+    const { check, report } = await run(world);
+    assert.equal(check('iam.push-permissions').status, 'FAIL');
+    assert.ok(check('iam.push-permissions').findings.some((x) => x.kind === 'permission-too-broad' && x.severity === 'FAIL'));
+    assert.equal(exitCodeOf(report), 1);
+  });
+
+  it('a conditional Deny does not hide a forbidden grant; an unconditional Deny does', () => {
+    const allowSsm = { Effect: 'Allow', Action: 'ssm:SendCommand', Resource: '*' };
+    const conditionalDeny = analyzePermissions('push', TARGET, { policies: [{ name: 'p', document: { Statement: [...PUSH_POLICY.Statement, allowSsm, { Effect: 'Deny', Action: 'ssm:*', Resource: '*', Condition: COND }] } }], complete: true });
+    assert.ok(conditionalDeny.findings.some((x) => x.kind === 'permission-too-broad' && x.severity === 'FAIL'));
+    const hardDeny = analyzePermissions('push', TARGET, { policies: [{ name: 'p', document: { Statement: [...PUSH_POLICY.Statement, allowSsm, { Effect: 'Deny', Action: 'ssm:*', Resource: '*' }] } }], complete: true });
+    assert.ok(!hardDeny.findings.some((x) => x.kind === 'permission-too-broad'));
+  });
+
+  it('a required action granted only under a Condition is required NOT VERIFIED, exit 1', async () => {
+    const world = deployRoleWith(readyWorld(), DEPLOY_POLICY.Statement.map((s) => ({ ...s, Condition: COND })));
+    const { check, report } = await run(world);
+    const c = check('iam.deploy-permissions');
+    assert.deepEqual([c.status, c.required], ['NOT VERIFIED', true]);
+    assert.ok(c.findings.every((x) => x.severity !== 'WARN'));
+    assert.ok(kinds(c).includes('permission-unproven'));
+    assert.equal(report.outcome, 'NOT_VERIFIED');
+    assert.equal(exitCodeOf(report), 1);
+  });
+
+  it('a required action granted only through NotAction / NotResource is NOT VERIFIED', () => {
+    const viaNotAction = analyzePermissions('deploy', TARGET, {
+      policies: [{ name: 'd', document: { Statement: [{ Effect: 'Allow', NotAction: 'ecr:*', Resource: [INSTANCE_ARN, `arn:aws:ssm:${REGION}::document/AWS-RunShellScript`] }, DEPLOY_POLICY.Statement[1]] } }],
+      complete: true
+    });
+    assert.equal(viaNotAction.status, 'NOT VERIFIED');
+    assert.ok(viaNotAction.findings.some((x) => x.kind === 'permission-unproven' && x.message.startsWith('ssm:SendCommand')));
+    const viaNotResource = analyzePermissions('deploy', TARGET, {
+      policies: [{ name: 'd', document: { Statement: [{ Effect: 'Allow', Action: 'ssm:SendCommand', NotResource: 'arn:aws:s3:::x' }, DEPLOY_POLICY.Statement[1]] } }],
+      complete: true
+    });
+    assert.ok(viaNotResource.findings.some((x) => x.kind === 'permission-unproven'));
+  });
+
+  it('a required action shadowed by a conditional Deny is NOT VERIFIED; by an unconditional Deny, FAIL', () => {
+    const shadowed = analyzePermissions('deploy', TARGET, { policies: [{ name: 'd', document: { Statement: [...DEPLOY_POLICY.Statement, { Effect: 'Deny', Action: 'ssm:GetCommandInvocation', Resource: '*', Condition: COND }] } }], complete: true });
+    assert.equal(shadowed.status, 'NOT VERIFIED');
+    const denied = analyzePermissions('deploy', TARGET, { policies: [{ name: 'd', document: { Statement: [...DEPLOY_POLICY.Statement, { Effect: 'Deny', Action: 'ssm:GetCommandInvocation', Resource: '*' }] } }], complete: true });
+    assert.equal(denied.status, 'FAIL');
+  });
+
+  it('grants(): NotAction / NotResource are matched by their IAM meaning', () => {
+    const stmts = statements({ Statement: [{ Effect: 'Allow', NotAction: 'iam:*', Resource: '*' }] });
+    assert.equal(grants(stmts, 'ssm:SendCommand', INSTANCE_ARN).decision, 'conditional');
+    assert.equal(grants(stmts, 'iam:PassRole', '*').decision, 'not-granted');
+    const deny = statements({ Statement: [{ Effect: 'Allow', Action: '*', Resource: '*' }, { Effect: 'Deny', NotAction: 'ecr:*', Resource: '*' }] });
+    assert.equal(grants(deny, 'ssm:SendCommand', INSTANCE_ARN).decision, 'denied');
+    assert.equal(grants(deny, 'ecr:PutImage', REPO_ARN).decision, 'allowed');
+  });
+
+  it('a malformed statement makes a required grant unproven and a forbidden one possible', () => {
+    const doc = { Statement: [...DEPLOY_POLICY.Statement, { Effect: 'Maybe', Action: '*', Resource: '*' }] };
+    const result = analyzePermissions('deploy', TARGET, { policies: [{ name: 'd', document: doc }], complete: true });
+    assert.equal(result.status, 'FAIL', 'forbidden actions are possibly granted');
+    assert.ok(result.findings.some((x) => x.kind === 'permission-unproven'));
+  });
+
+  it('the trust evaluator still refuses to bound NotAction / NotPrincipal (unchanged)', async () => {
+    const { evaluateTrust } = await import('../onboarding/aws/policy/trust.mjs');
+    const result = evaluateTrust({ Statement: [{ Effect: 'Allow', Principal: { Federated: PROVIDER }, NotAction: 'sts:AssumeRole' }] }, { account: ACCOUNT, slug: SLUG, contexts: ['ref:refs/heads/main'] });
+    assert.equal(result.verdict, 'rejected');
+  });
+});
+
+describe('L1: only settled, successful stack states prove ownership', () => {
+  const discovered = (status) => ({
+    stackResource: { state: 'present', value: { stackName: 's', stackId: 's', logicalId: 'R', type: 'AWS::IAM::Role' } },
+    stack: { state: 'present', value: { name: 's', status, tags: SSD_STACK_TAGS.map((t) => ({ key: t.Key, value: t.Value })) } }
+  });
+  const ownershipFor = (status) => evaluateOwnership({ discovered: discovered(status), resourceTags: null, expectedType: 'AWS::IAM::Role', slug: SLUG, scope: 'repo' }).ownership;
+
+  it('the five live states are managed', () => {
+    for (const status of ['CREATE_COMPLETE', 'UPDATE_COMPLETE', 'UPDATE_ROLLBACK_COMPLETE', 'IMPORT_COMPLETE', 'IMPORT_ROLLBACK_COMPLETE']) {
+      assert.equal(ownershipFor(status), 'managed', status);
+    }
+  });
+
+  it('every transitional, failed or deleted state is not managed', () => {
+    for (const status of ['CREATE_IN_PROGRESS', 'DELETE_IN_PROGRESS', 'DELETE_COMPLETE', 'DELETE_FAILED', 'UPDATE_IN_PROGRESS', 'UPDATE_ROLLBACK_FAILED', 'UPDATE_ROLLBACK_IN_PROGRESS', 'ROLLBACK_COMPLETE', 'ROLLBACK_FAILED', 'CREATE_FAILED', 'IMPORT_IN_PROGRESS', 'IMPORT_ROLLBACK_FAILED', 'REVIEW_IN_PROGRESS', null, 'SOMETHING_NEW']) {
+      assert.equal(ownershipFor(status), 'exists-not-owned', String(status));
+    }
+  });
+
+  it('doctor: a managed resource whose stack is DELETE_IN_PROGRESS blocks', async () => {
+    const world = managedStack(readyWorld(), 'app-deploy', { type: 'AWS::IAM::Role', tags: SSD_STACK_TAGS });
+    const key = Object.keys(world).find((k) => k.startsWith('cloudformation describe-stacks'));
+    const doc = JSON.parse(world[key].stdout);
+    doc.Stacks[0].StackStatus = 'DELETE_IN_PROGRESS';
+    world[key] = ok(doc);
+    const { check, report } = await run(world, { delivery: { environment: 'production', roles: { deployOwnership: 'managed' } } });
+    assert.deepEqual([check('ownership.deploy-role').ownership, check('ownership.deploy-role').status], ['exists-not-owned', 'FAIL']);
+    assert.equal(report.outcome, 'BLOCKED');
+  });
+});
+
+describe('M4: the fake AWS harness is strict', () => {
+  it('an unrecorded call fails the run loudly instead of degrading to NOT VERIFIED', async () => {
+    const world = readyWorld();
+    delete world[`ec2 describe-instances --instance-ids ${INSTANCE}`];
+    const f = fakeAws(world);
+    await assert.rejects(awsDoctor({ config: config(ECR, { delivery: { environment: 'production' } }), exec: f.exec, env: {} }), (error) => error instanceof FakeAwsError && /UNRECORDED/.test(error.message));
+    assert.deepEqual(f.unexpected, [`ec2 describe-instances --instance-ids ${INSTANCE}`]);
+  });
+
+  it('a mutating or non-allowlisted argv that bypasses readOnlyAws is refused by the fake itself', async () => {
+    const f = fakeAws({ 'ecr put-image --repository-name app': ok({}) });
+    const suffix = ['--region', REGION, '--output', 'json', '--no-cli-pager'];
+    await assert.rejects(f.exec(['ecr', 'put-image', '--repository-name', 'app', ...suffix]), (error) => error instanceof FakeAwsError && /non-allowlisted/.test(error.message));
+    await assert.rejects(f.exec(['iam', 'get-role', '--role-name', 'x', '--endpoint-url', 'https://evil.example', ...suffix]), FakeAwsError);
+    await assert.rejects(f.exec(['sts', 'get-caller-identity']), (error) => /wrapper suffix/.test(error.message));
+    await assert.rejects(f.exec(['sts', 'get-caller-identity', '--region', REGION, '--output', 'text', '--no-cli-pager']), (error) => /wrapper suffix/.test(error.message));
   });
 });

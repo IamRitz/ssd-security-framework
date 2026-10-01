@@ -797,7 +797,9 @@ What exists, and where it refines D.1–D.6:
   `templates/` do not exist yet.
 - **Allowlist (refines D.1).** Not verb prefixes: an explicit map of
   `service → operation → permitted flags`. Every flag takes exactly one value
-  that must not look like an option; lists are passed as one JSON argv element.
+  that must not look like an option, nor begin with `file://`, `fileb://` or
+  `http(s)://` (AWS CLI parameter indirection; no operation opts in); lists are
+  passed as one JSON argv element.
   The wrapper appends `--region <r> --output json --no-cli-pager` itself and sets
   `AWS_PAGER=''`, `AWS_CLI_AUTO_PROMPT=off`, `AWS_IGNORE_CONFIGURED_ENDPOINT_URLS=true`.
   `cloudformation create-change-set` / `validate-template` are **not** allowed

@@ -4,9 +4,13 @@
 //   - documents are normalized to arrays (Statement, Action, Resource, values);
 //   - action names match case-insensitively with IAM `*`/`?` wildcards;
 //     resource ARNs match case-sensitively with the same wildcards;
-//   - NotAction / NotResource / NotPrincipal are not evaluated: a statement
-//     using them is `unsupported`, and callers treat unsupported as "cannot be
-//     bounded", never as "grants nothing".
+//   - NotAction / NotResource / NotPrincipal are listed in `unsupported` (the
+//     trust evaluator refuses to bound them). For identity-policy permissions,
+//     grants() matches NotAction / NotResource by their IAM meaning but never
+//     counts a match through them as PROOF of a grant (`conditional`), while it
+//     always counts as a POSSIBLE grant;
+//   - Conditions are not evaluated: a conditional Allow is a possible grant,
+//     never proof; a conditional Deny may not apply, so it hides nothing.
 // This is POLICY DOCUMENT ANALYSIS. It does not see SCPs, permission
 // boundaries, resource policies, session policies or VPC endpoint policies.
 
@@ -57,9 +61,10 @@ export function statements(document) {
   const doc = parseDocument(document);
   return list(doc.Statement).map((raw, index) => {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
-      return { sid: `#${index}`, effect: null, principal: null, actions: [], resources: [], condition: {}, unsupported: ['statement is not an object'] };
+      return { sid: `#${index}`, effect: null, principal: null, actions: [], resources: [], notActions: [], notResources: [], condition: {}, unsupported: ['statement is not an object'], malformed: ['statement is not an object'] };
     }
     const unsupported = [];
+    const malformed = [];
     for (const key of ['NotAction', 'NotResource', 'NotPrincipal']) {
       if (raw[key] !== undefined) {
         unsupported.push(`${key} is not evaluated offline`);
@@ -68,10 +73,12 @@ export function statements(document) {
     const effect = raw.Effect === 'Allow' || raw.Effect === 'Deny' ? raw.Effect : null;
     if (!effect) {
       unsupported.push(`Effect '${String(raw.Effect)}' is not Allow or Deny`);
+      malformed.push(`Effect '${String(raw.Effect)}' is not Allow or Deny`);
     }
     const condition = raw.Condition === undefined ? {} : raw.Condition;
     if (!condition || typeof condition !== 'object' || Array.isArray(condition)) {
       unsupported.push('Condition is not an object');
+      malformed.push('Condition is not an object');
     }
     return {
       sid: typeof raw.Sid === 'string' ? raw.Sid : `#${index}`,
@@ -79,8 +86,11 @@ export function statements(document) {
       principal: raw.Principal ?? null,
       actions: list(raw.Action).map(String),
       resources: list(raw.Resource).map(String),
+      notActions: list(raw.NotAction).map(String),
+      notResources: list(raw.NotResource).map(String),
       condition: condition && typeof condition === 'object' && !Array.isArray(condition) ? condition : {},
-      unsupported
+      unsupported,
+      malformed
     };
   });
 }
@@ -145,29 +155,39 @@ export function conditionEntries(condition) {
 }
 
 // Does this set of identity-policy statements grant `action` on `resource`?
-//   'allowed'      an unconditional Allow matches and no Deny matches
-//   'conditional'  only an Allow carrying a Condition matches (not evaluated)
-//   'denied'       an explicit Deny matches (conditions ignored: conservative)
-//   'unsupported'  a statement that could matter uses NotAction/NotResource
+//   'denied'       an UNCONDITIONAL Deny matches
+//   'unsupported'  a malformed statement exists (bad Effect / Condition)
+//   'allowed'      an unconditional Allow matches through Action AND Resource,
+//                  and no conditional Deny matches (it might apply)
+//   'conditional'  a POSSIBLE grant that is not proof: a conditional Allow, an
+//                  Allow matching only through NotAction / NotResource, or an
+//                  unconditional Allow shadowed by a conditional Deny
 //   'not-granted'  nothing matches
-// Returns { decision, by: [sid...] }.
+// Required permissions need 'allowed'; a forbidden permission is a problem on
+// anything but 'denied' / 'not-granted'. Returns { decision, by: [sid...] }.
 export function grants(stmts, action, resource) {
-  const matching = (s) => s.actions.some((a) => actionMatches(a, action)) && s.resources.some((r) => resourceMatches(r, resource));
-  const denies = stmts.filter((s) => s.effect === 'Deny' && s.unsupported.length === 0 && matching(s));
-  if (denies.length > 0) {
-    return { decision: 'denied', by: denies.map((s) => s.sid) };
+  const actionPart = (s) => (s.actions.length > 0 ? s.actions.some((a) => actionMatches(a, action)) : s.notActions.length > 0 && !s.notActions.some((a) => actionMatches(a, action)));
+  const resourcePart = (s) => (s.resources.length > 0 ? s.resources.some((r) => resourceMatches(r, resource)) : s.notResources.length > 0 && !s.notResources.some((r) => resourceMatches(r, resource)));
+  const usable = stmts.filter((s) => s.malformed.length === 0);
+  const matching = usable.filter((s) => actionPart(s) && resourcePart(s));
+  const conditional = (s) => Object.keys(s.condition).length > 0;
+  const direct = (s) => s.actions.length > 0 && s.resources.length > 0;
+  const denies = matching.filter((s) => s.effect === 'Deny');
+  const hardDenies = denies.filter((s) => !conditional(s));
+  if (hardDenies.length > 0) {
+    return { decision: 'denied', by: hardDenies.map((s) => s.sid) };
   }
-  const unsupported = stmts.filter((s) => s.unsupported.length > 0);
-  const allows = stmts.filter((s) => s.effect === 'Allow' && s.unsupported.length === 0 && matching(s));
-  const unconditional = allows.filter((s) => Object.keys(s.condition).length === 0);
-  if (unconditional.length > 0 && unsupported.length === 0) {
-    return { decision: 'allowed', by: unconditional.map((s) => s.sid) };
+  const malformed = stmts.filter((s) => s.malformed.length > 0);
+  if (malformed.length > 0) {
+    return { decision: 'unsupported', by: malformed.map((s) => s.sid) };
   }
-  if (unsupported.length > 0) {
-    return { decision: 'unsupported', by: unsupported.map((s) => s.sid) };
+  const allows = matching.filter((s) => s.effect === 'Allow');
+  const proof = allows.filter((s) => !conditional(s) && direct(s));
+  if (proof.length > 0 && denies.length === 0) {
+    return { decision: 'allowed', by: proof.map((s) => s.sid) };
   }
   if (allows.length > 0) {
-    return { decision: 'conditional', by: allows.map((s) => s.sid) };
+    return { decision: 'conditional', by: [...allows, ...denies].map((s) => s.sid) };
   }
   return { decision: 'not-granted', by: [] };
 }
