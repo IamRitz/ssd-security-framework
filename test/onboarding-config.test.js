@@ -73,6 +73,15 @@ describe('the config schema is closed', () => {
     assert.ok(errorPaths(result).includes('rollout.gateMod'));
   });
 
+  it('delivery.registryScanning is existing | managed, default existing (Phase 2B)', () => {
+    assert.equal(config('container-ecr-framework-gated').delivery.registryScanning, 'existing');
+    assert.equal(config('container-ecr-framework-gated', { delivery: { registryScanning: 'managed' } }).delivery.registryScanning, 'managed');
+    for (const bad of ['adopt', 'import', 'MANAGED']) {
+      assert.ok(errorPaths(validateConfig(rawConfig('container-ecr-framework-gated', { delivery: { registryScanning: bad } }))).includes('delivery.registryScanning'), bad);
+    }
+    assert.ok(errorPaths(validateConfig(rawConfig('container-ecr-framework-gated', { delivery: { registryScaning: 'managed' } }))).includes('delivery.registryScaning'), 'typo is an error');
+  });
+
   it('refuses an unknown schema version', () => {
     assert.ok(errorPaths(validateConfig(rawConfig('source-only', { schemaVersion: '2' }))).includes('schemaVersion'));
   });

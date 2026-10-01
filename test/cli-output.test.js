@@ -349,7 +349,8 @@ describe('machine output and exit codes are untouched', () => {
     assert.equal((await cli(root, ['inspect'])).code, 0);
     assert.equal((await cli(root, ['doctor'])).code, 1, 'no config: runtime error');
     assert.equal((await cli(root, ['validate', '--bogus'])).code, 2, 'usage error');
-    assert.equal((await cli(root, ['aws', 'plan'])).code, 2, 'not implemented');
+    assert.equal((await cli(root, ['aws', 'apply'])).code, 2, 'not implemented');
+    assert.equal((await cli(root, ['aws', 'plan'])).code, 1, 'no config: configuration error, AWS not contacted');
     assert.equal((await cli(root, ['aws', 'doctor'])).code, 1, 'no config: configuration error, AWS not contacted');
     write(root, '.ssd/onboarding.yml', serializeConfig(config('source-only')));
     assert.equal((await cli(root, ['render', '--check'])).code, 1, 'drift: nothing rendered yet');

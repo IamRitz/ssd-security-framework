@@ -164,9 +164,9 @@ describe('aws doctor: exit codes', () => {
     assert.deepEqual(f.calls, []);
   });
 
-  it('plan, apply and verify are not implemented: exit 2, nothing contacted', async (t) => {
+  it('apply and verify are not implemented: exit 2, nothing contacted', async (t) => {
     const root = consumer(t);
-    for (const sub of ['plan', 'apply', 'verify']) {
+    for (const sub of ['apply', 'verify']) {
       const result = await cli(root, ['aws', sub]);
       assert.equal(result.code, 2);
       assert.match(result.err, /not implemented/);
@@ -270,16 +270,35 @@ describe('trust boundary', () => {
     assert.equal((read('onboarding/cli.mjs').match(/import\('\.\/aws\/cli\.mjs'\)/g) ?? []).length, 1, 'one dynamic import, in the aws branch');
   });
 
-  it('only aws-cli.mjs runs a process, and nothing under onboarding/aws writes files or calls gh', () => {
+  it('only aws-cli.mjs runs a process; only plan/record.mjs writes files (the plan directory); nothing calls gh', () => {
+    // The ONE writer under onboarding/aws: the `aws plan` record, confined to
+    // .ssd/aws-plans/ through safe-path (test/aws-plan.test.js).
+    const WRITER = join('onboarding', 'aws', 'plan', 'record.mjs');
     for (const file of walk('onboarding/aws')) {
       const imports = importsOf(file);
       if (!file.endsWith('aws-cli.mjs')) {
         assert.ok(!imports.includes('node:child_process'), `${file} runs a process`);
       }
-      for (const forbidden of ['node:fs', 'node:fs/promises', '../lib/files.mjs', '../lib/safe-path.mjs', '../lib/baseline.mjs', '../lib/render.mjs']) {
-        assert.ok(!imports.includes(forbidden), `${file} imports ${forbidden}`);
+      const forbidden = file === WRITER
+        ? ['../../lib/files.mjs', '../../lib/baseline.mjs', '../../lib/render.mjs']
+        : ['node:fs', 'node:fs/promises', '../lib/files.mjs', '../lib/safe-path.mjs', '../../lib/safe-path.mjs', '../lib/baseline.mjs', '../lib/render.mjs'];
+      for (const specifier of forbidden) {
+        assert.ok(!imports.includes(specifier), `${file} imports ${specifier}`);
       }
       assert.doesNotMatch(read(file), /['"]gh['"]/, `${file} mentions the gh executable`);
+    }
+    assert.doesNotMatch(read(WRITER), /\b(?:rm|unlink|rename|safeRemove|writeFile)\s*\(/, 'the plan record never removes, renames or truncating-writes');
+    // doctor's module graph never reaches the planner or its writer.
+    const seen = new Set();
+    const visit = (path) => {
+      if (seen.has(path)) return;
+      seen.add(path);
+      importsOf(path).filter((s) => s.startsWith('.')).forEach((s) => visit(join(dirname(path), s)));
+    };
+    visit(join('onboarding', 'aws', 'doctor.mjs'));
+    for (const path of seen) {
+      assert.ok(!path.startsWith(join('onboarding', 'aws', 'plan')), `doctor reaches ${path}`);
+      assert.ok(!path.includes('safe-path'), `doctor reaches ${path}`);
     }
     assert.match(read('onboarding/aws/aws-cli.mjs'), /execFile\(\s*'aws',/);
     assert.match(read('onboarding/aws/aws-cli.mjs'), /shell: false/);

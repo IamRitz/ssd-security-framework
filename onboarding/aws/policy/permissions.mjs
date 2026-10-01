@@ -188,3 +188,50 @@ export function proposedInstancePolicy(target) {
     ]
   };
 }
+
+// --- builder (Phase 2B) --------------------------------------------------------------
+
+// Readable statement ids for the resources roleRequirements() names.
+const SID_BY_ARN_KEY = { repository: 'ConfiguredRepository', instance: 'ConfiguredInstance', runShellScript: 'RunShellScriptDocument' };
+
+// The identity policy ssd-onboard generates for a delivery role, built from
+// roleRequirements().required — the SAME list `aws doctor` checks a role
+// against, so there is no second definition of what the role may do. One
+// statement per resource, in requirement order. `enhanced` must be decided
+// (true/false): a possibly-needed permission is never generated.
+// The document must PASS analyzePermissions() (sufficient AND not too broad)
+// or nothing is generated.
+export function rolePolicyDocument(role, target, { enhanced }) {
+  if (role !== 'push' && role !== 'deploy') {
+    throw new Error(`no generated policy for role intent '${role}'`);
+  }
+  if (enhanced !== true && enhanced !== false) {
+    throw new Error('rolePolicyDocument: the registry scan type must be known (BASIC or ENHANCED)');
+  }
+  const a = arns(target);
+  const byResource = new Map();
+  for (const r of roleRequirements(role, target, { enhanced }).required) {
+    if (!byResource.has(r.resource)) {
+      byResource.set(r.resource, []);
+    }
+    if (!byResource.get(r.resource).includes(r.action)) {
+      byResource.get(r.resource).push(r.action);
+    }
+  }
+  const sidOf = (resource) => (resource === '*' ? 'AccountLevel' : SID_BY_ARN_KEY[Object.keys(SID_BY_ARN_KEY).find((key) => a[key] === resource)] ?? null);
+  const document = {
+    Version: '2012-10-17',
+    Statement: [...byResource].map(([resource, actions]) => {
+      const sid = sidOf(resource);
+      if (!sid) {
+        throw new Error(`no statement id for resource ${resource}`);
+      }
+      return { Sid: sid, Effect: 'Allow', Action: actions, Resource: resource };
+    })
+  };
+  const analysis = analyzePermissions(role, target, { policies: [{ name: 'generated', document }], complete: true, enhanced });
+  if (analysis.status !== 'PASS') {
+    throw new Error(`the generated ${role} policy does not pass the permission analysis: ${analysis.findings.map((f) => `${f.severity} ${f.kind}: ${f.message}`).join('; ')}`);
+  }
+  return document;
+}

@@ -76,10 +76,13 @@ Repository commands (edit files in the consumer repository only; no AWS, no GitH
                           move log-only -> enforce (requires an accepted baseline)
 
 Cloud commands (Phase 2 — a separate trust boundary: the operator's ambient AWS CLI
-credentials, never a repository file write; see \`aws --help\`):
+credentials; see \`aws --help\`):
   aws doctor [--region <r>] [--json]
                           READ-ONLY AWS readiness: identity, OIDC, ECR, IAM, SSM, ownership
-  aws plan|apply|verify   designed, not implemented
+  aws plan [--scope repo|shared] [--region <r>] [--json]
+                          UNEXECUTED CloudFormation change sets + .ssd/aws-plans/<plan-id>/
+                          (its only repository write); never executes them
+  aws apply|verify        designed, not implemented
 
 Common options:
   --repo <dir>            consumer repository root (default: current directory)

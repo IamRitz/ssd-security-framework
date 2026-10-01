@@ -305,3 +305,54 @@ export function evaluateTrust(document, { account, partition = 'aws', slug, cont
   const verdict = findings.some((f) => f.severity === 'FAIL') ? 'rejected' : findings.length > 0 ? 'accepted-with-warnings' : 'accepted';
   return { verdict, findings, subjects, format: formats.length === 1 ? formats[0] : formats.length > 1 ? 'mixed' : null, reachable };
 }
+
+// --- builder (Phase 2B) --------------------------------------------------------------
+
+export class TrustBuildError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TrustBuildError';
+  }
+}
+
+// The ONE trust policy ssd-onboard generates for a delivery role:
+//   Principal.Federated   exactly this account's GitHub OIDC provider
+//   Action                sts:AssumeRoleWithWebIdentity
+//   Condition             StringEquals aud = sts.amazonaws.com
+//                         StringEquals sub = repo:<slug>:<intended context>
+// Exact legacy subjects only: the immutable-ID format needs IDs this command
+// cannot prove without the GitHub API, so it is never generated. No StringLike,
+// no wildcard. The result must be ACCEPTED, without a single warning, by
+// evaluateTrust() above — the same evaluator `aws doctor` applies — or nothing
+// is generated.
+export function buildTrustPolicy(role, { account, partition = 'aws', slug, defaultBranch, environment }) {
+  const contexts = intendedContexts(role, { defaultBranch, environment });
+  const subjects = contexts.map((context) => `repo:${slug}:${context}`);
+  for (const value of [slug, ...subjects]) {
+    if (hasWildcard(value)) {
+      throw new TrustBuildError(`refusing to generate a trust policy with a wildcard subject ('${value}')`);
+    }
+  }
+  const document = {
+    Version: '2012-10-17',
+    Statement: [
+      {
+        Sid: 'GitHubActionsOidc',
+        Effect: 'Allow',
+        Principal: { Federated: providerArn(account, partition) },
+        Action: WEB_IDENTITY,
+        Condition: {
+          StringEquals: {
+            [AUD_KEY]: STS_AUDIENCE,
+            [SUB_KEY]: subjects.length === 1 ? subjects[0] : subjects
+          }
+        }
+      }
+    ]
+  };
+  const evaluation = evaluateTrust(document, { account, partition, slug, contexts });
+  if (evaluation.verdict !== 'accepted') {
+    throw new TrustBuildError(`the generated ${role} trust policy is not accepted by the trust evaluator: ${evaluation.findings.map((f) => `${f.severity} ${f.kind}`).join(', ')}`);
+  }
+  return document;
+}

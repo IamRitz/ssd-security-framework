@@ -183,7 +183,12 @@ describe('read-only allowlist', () => {
         assert.doesNotMatch(operation, MUTATING, `${service} ${operation}`);
       }
     }
-    assert.deepEqual(Object.keys(awsCli).sort(), ['AwsCliError', 'DEFAULT_DEADLINE_MS', 'DEFAULT_MAX_BUFFER', 'DEFAULT_TIMEOUT_MS', 'READ_ONLY_OPERATIONS', 'assertReadOnly', 'classifyFailure', 'execAws', 'readOnlyAws', 'redact']);
+    // The only factories are the read-only one (doctor) and the planning one
+    // (aws plan, test/aws-plan-wrapper.test.js); there is no mutating wrapper.
+    assert.deepEqual(Object.keys(awsCli).sort(), [
+      'AwsCliError', 'DEFAULT_DEADLINE_MS', 'DEFAULT_MAX_BUFFER', 'DEFAULT_TIMEOUT_MS', 'MAX_TEMPLATE_BODY', 'PLANNING_OPERATIONS', 'READ_ONLY_OPERATIONS',
+      'assertPlanning', 'assertReadOnly', 'classifyFailure', 'execAws', 'planningAws', 'readOnlyAws', 'redact'
+    ]);
   });
 
   it('no wrapper exists without an explicit region', () => {

@@ -611,10 +611,10 @@ describe('doctor: command behaviour', () => {
     assert.match(result.err, /Usage:/);
   });
 
-  it('`aws plan` is still Phase 2B: not implemented, contacts nothing', async (t) => {
+  it('`aws apply` is still Phase 2C: not implemented, contacts nothing', async (t) => {
     const root = await consumer(t);
     const before = shimCalls().length;
-    const result = await cli(root, ['aws', 'plan']);
+    const result = await cli(root, ['aws', 'apply']);
     assert.equal(result.code, 2);
     assert.match(result.err, /not implemented/);
     assert.deepEqual(shimCalls().slice(before), []);

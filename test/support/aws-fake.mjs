@@ -6,7 +6,9 @@
 // injectable executor that records every argv it receives (exactly as
 // execFile would get it). It is STRICT, independently of the code under test:
 //   - every argv must end in exactly the wrapper suffix and its call part must
-//     pass the read-only allowlist, so a path that bypasses readOnlyAws() fails;
+//     pass the read-only allowlist (or, for `aws plan` tests, the allowlist the
+//     test names — fakeAws(world, { allowlist: assertPlanning })), so a path
+//     that bypasses the wrapper fails;
 //   - an UNRECORDED call throws a plain Error (FakeAwsError), which no doctor
 //     code treats as an AWS answer, so the test fails instead of degrading the
 //     call to NOT VERIFIED.
@@ -198,7 +200,8 @@ function lookup(world, key) {
   return prefix ? world[prefix] : undefined;
 }
 
-export function fakeAws(world) {
+export function fakeAws(world, { allowlist = assertReadOnly } = {}) {
+  const check = allowlist;
   const calls = [];
   const unexpected = [];
   const exec = async (argv, options) => {
@@ -210,7 +213,7 @@ export function fakeAws(world) {
     }
     const call = argv.slice(0, at);
     try {
-      assertReadOnly(call);
+      check(call);
     } catch (error) {
       throw new FakeAwsError(`a non-allowlisted argv reached the executor: ${call.join(' ')} (${error.message})`);
     }
