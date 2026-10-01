@@ -1,17 +1,22 @@
 // Ownership: EXISTENCE IS NOT OWNERSHIP.
 //
 // A resource is `managed` only when ALL of these hold:
-//   - CloudFormation reports it as a physical resource of a stack, of the
-//     expected resource type;
+//   - CloudFormation reports it as a physical resource, of the expected
+//     resource type, of THE expected stack — the exact derived name from
+//     stack-names.mjs, in delivery.aws.region. Another ssd-onboard stack, even
+//     a correctly tagged one, is not this repository's or scope's owner;
 //   - that stack is in a settled, successful state (CREATE_COMPLETE,
 //     UPDATE_COMPLETE, UPDATE_ROLLBACK_COMPLETE, IMPORT_COMPLETE,
 //     IMPORT_ROLLBACK_COMPLETE) and its
 //     stack tags carry ssd:framework=ssd-security-framework,
-//     ssd:managed-by=ssd-onboard, ssd:environment=production|synthetic and, for
-//     per-repository resources, ssd:consumer-repository=<owner>/<repo>;
+//     ssd:managed-by=ssd-onboard, ssd:environment=production and, for
+//     per-repository resources, ssd:consumer-repository=<canonical owner/repo>;
 //   - the resource's own tags, when readable, do not name another consumer.
-// A resource with the right name — or even the right tags — but no such stack
-// is `exists-not-owned`. Nothing is ever adopted, or inferred, by name or ARN.
+// The stack name LOCATES the owner; it never proves ownership on its own. A
+// resource with the right name — or even the right tags — but not in the
+// expected stack is `exists-not-owned`. Nothing is adopted, or inferred, by
+// name or ARN.
+import { DELIVERY_ENVIRONMENT, STACK_NAME, canonicalSlug } from '../stack-names.mjs';
 import { tagList } from './oidc-provider.mjs';
 import { read } from './result.mjs';
 
@@ -21,7 +26,6 @@ export const SSD_TAGS = Object.freeze({
   consumer: 'ssd:consumer-repository',
   environment: 'ssd:environment'
 });
-const ENVIRONMENTS = ['production', 'synthetic'];
 // Only settled, successful stack states. Anything else — in progress, failed,
 // rolled back after create, being deleted — proves no ownership.
 const LIVE = new Set(['CREATE_COMPLETE', 'UPDATE_COMPLETE', 'UPDATE_ROLLBACK_COMPLETE', 'IMPORT_COMPLETE', 'IMPORT_ROLLBACK_COMPLETE']);
@@ -48,7 +52,11 @@ const tagValue = (tags, key) => tags.find((t) => t.key === key)?.value;
 
 // Pure. -> { ownership: 'managed'|'exists-not-owned'|'unverified', reasons[], stack }
 // scope 'repo' requires the consumer tag; 'shared' must not be tied to one.
-export function evaluateOwnership({ discovered, resourceTags = null, expectedType, slug, scope }) {
+// expectedStackName is mandatory: without it no ownership can be concluded.
+export function evaluateOwnership({ discovered, resourceTags = null, expectedType, slug, scope, expectedStackName }) {
+  if (typeof expectedStackName !== 'string' || !STACK_NAME.test(expectedStackName)) {
+    throw new Error('evaluateOwnership: an expected stack name is required');
+  }
   const { stackResource, stack } = discovered;
   const reasons = [];
   const ssdTagged = resourceTags && resourceTags.some((t) => t.key.startsWith('ssd:'));
@@ -73,6 +81,9 @@ export function evaluateOwnership({ discovered, resourceTags = null, expectedTyp
     return { ownership: 'exists-not-owned', reasons: [...reasons, `stack ${sr.stackName} was not returned`], stack: sr };
   }
   const st = stack.value;
+  if (sr.stackName !== expectedStackName || st.name !== expectedStackName) {
+    reasons.push(`it belongs to stack '${sr.stackName}', not the expected stack '${expectedStackName}'`);
+  }
   if (!LIVE.has(st.status)) {
     reasons.push(`stack ${st.name} is ${st.status ?? 'in an unknown state'} (not a settled, successful state)`);
   }
@@ -82,16 +93,17 @@ export function evaluateOwnership({ discovered, resourceTags = null, expectedTyp
     }
   }
   const environment = tagValue(st.tags, SSD_TAGS.environment);
-  if (!ENVIRONMENTS.includes(environment)) {
-    reasons.push(`stack tag ${SSD_TAGS.environment} is ${environment === undefined ? 'missing' : `'${environment}'`} (expected production or synthetic)`);
+  if (environment !== DELIVERY_ENVIRONMENT) {
+    reasons.push(`stack tag ${SSD_TAGS.environment} is ${environment === undefined ? 'missing' : `'${environment}'`} (expected '${DELIVERY_ENVIRONMENT}')`);
   }
+  const canonical = canonicalSlug(slug);
   const consumer = tagValue(st.tags, SSD_TAGS.consumer);
-  if (scope === 'repo' && consumer !== slug) {
-    reasons.push(`stack tag ${SSD_TAGS.consumer} is ${consumer === undefined ? 'missing' : `'${consumer}'`} (expected '${slug}')`);
+  if (scope === 'repo' && consumer !== canonical) {
+    reasons.push(`stack tag ${SSD_TAGS.consumer} is ${consumer === undefined ? 'missing' : `'${consumer}'`} (expected '${canonical}')`);
   }
   const resourceConsumer = resourceTags ? tagValue(resourceTags, SSD_TAGS.consumer) : undefined;
-  if (scope === 'repo' && resourceConsumer !== undefined && resourceConsumer !== slug) {
-    reasons.push(`the resource's own ${SSD_TAGS.consumer} tag is '${resourceConsumer}' (expected '${slug}')`);
+  if (scope === 'repo' && resourceConsumer !== undefined && resourceConsumer.toLowerCase() !== canonical) {
+    reasons.push(`the resource's own ${SSD_TAGS.consumer} tag is '${resourceConsumer}' (expected '${canonical}')`);
   }
   if (reasons.length > 0) {
     return { ownership: 'exists-not-owned', reasons, stack: { ...sr, status: st.status } };

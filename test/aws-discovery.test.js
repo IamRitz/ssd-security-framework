@@ -7,6 +7,8 @@ import { describe, it } from 'node:test';
 import { awsDoctor, exitCodeOf } from '../onboarding/aws/doctor.mjs';
 import { scanningCoverage, wildcardFilterMatches } from '../onboarding/aws/discover/ecr.mjs';
 import { evaluateOwnership } from '../onboarding/aws/discover/stacks.mjs';
+import { SHARED_STACKS, STACK_NAME, canonicalRepository, canonicalSlug, repoStackName } from '../onboarding/aws/stack-names.mjs';
+import { createHash } from 'node:crypto';
 import { grants, statements } from '../onboarding/aws/policy/evaluate.mjs';
 import { analyzePermissions } from '../onboarding/aws/policy/permissions.mjs';
 import { config } from './support/onboarding-fixtures.mjs';
@@ -25,6 +27,7 @@ import {
   REPOSITORY,
   REPO_ARN,
   SLUG,
+  EXPECTED_STACK,
   SSD_STACK_TAGS,
   accessDenied,
   awsError,
@@ -487,7 +490,7 @@ describe('ownership: existence is not ownership', () => {
   });
 
   it('ssd:* tags without a stack relationship are NOT ownership', () => {
-    const result = evaluateOwnership({ discovered: { stackResource: { state: 'absent', code: 'ValidationError' }, stack: null }, resourceTags: roleTags(SSD_STACK_TAGS), expectedType: 'AWS::IAM::Role', slug: SLUG, scope: 'repo' });
+    const result = evaluateOwnership({ discovered: { stackResource: { state: 'absent', code: 'ValidationError' }, stack: null }, resourceTags: roleTags(SSD_STACK_TAGS), expectedType: 'AWS::IAM::Role', slug: SLUG, scope: 'repo', expectedStackName: EXPECTED_STACK });
     assert.equal(result.ownership, 'exists-not-owned');
   });
 
@@ -509,10 +512,10 @@ describe('ownership: existence is not ownership', () => {
 
   it('a stack without ssd:managed-by, of the wrong type, or deleted is not managed', () => {
     const base = (stackTags, type = 'AWS::IAM::Role', status = 'CREATE_COMPLETE') => ({
-      stackResource: { state: 'present', value: { stackName: 's', stackId: 's', logicalId: 'R', type } },
-      stack: { state: 'present', value: { name: 's', status, tags: roleTags(stackTags) } }
+      stackResource: { state: 'present', value: { stackName: EXPECTED_STACK, stackId: 's', logicalId: 'R', type } },
+      stack: { state: 'present', value: { name: EXPECTED_STACK, status, tags: roleTags(stackTags) } }
     });
-    const evaluate = (discovered) => evaluateOwnership({ discovered, resourceTags: null, expectedType: 'AWS::IAM::Role', slug: SLUG, scope: 'repo' }).ownership;
+    const evaluate = (discovered) => evaluateOwnership({ discovered, resourceTags: null, expectedType: 'AWS::IAM::Role', slug: SLUG, scope: 'repo', expectedStackName: EXPECTED_STACK }).ownership;
     assert.equal(evaluate(base(SSD_STACK_TAGS)), 'managed');
     assert.equal(evaluate(base(SSD_STACK_TAGS.filter((t) => t.Key !== 'ssd:managed-by'))), 'exists-not-owned');
     assert.equal(evaluate(base(SSD_STACK_TAGS, 'AWS::IAM::Policy')), 'exists-not-owned');
@@ -522,11 +525,12 @@ describe('ownership: existence is not ownership', () => {
 
   it('a resource tag naming another consumer overrides matching stack tags', () => {
     const result = evaluateOwnership({
-      discovered: { stackResource: { state: 'present', value: { stackName: 's', stackId: 's', logicalId: 'R', type: 'AWS::IAM::Role' } }, stack: { state: 'present', value: { name: 's', status: 'CREATE_COMPLETE', tags: roleTags(SSD_STACK_TAGS) } } },
+      discovered: { stackResource: { state: 'present', value: { stackName: EXPECTED_STACK, stackId: 's', logicalId: 'R', type: 'AWS::IAM::Role' } }, stack: { state: 'present', value: { name: EXPECTED_STACK, status: 'CREATE_COMPLETE', tags: roleTags(SSD_STACK_TAGS) } } },
       resourceTags: [{ key: 'ssd:consumer-repository', value: 'acme/other' }],
       expectedType: 'AWS::IAM::Role',
       slug: SLUG,
-      scope: 'repo'
+      scope: 'repo',
+      expectedStackName: EXPECTED_STACK
     });
     assert.equal(result.ownership, 'exists-not-owned');
   });
@@ -718,10 +722,10 @@ describe('H1 + M2: permission conclusions fail closed', () => {
 
 describe('L1: only settled, successful stack states prove ownership', () => {
   const discovered = (status) => ({
-    stackResource: { state: 'present', value: { stackName: 's', stackId: 's', logicalId: 'R', type: 'AWS::IAM::Role' } },
-    stack: { state: 'present', value: { name: 's', status, tags: SSD_STACK_TAGS.map((t) => ({ key: t.Key, value: t.Value })) } }
+    stackResource: { state: 'present', value: { stackName: EXPECTED_STACK, stackId: 's', logicalId: 'R', type: 'AWS::IAM::Role' } },
+    stack: { state: 'present', value: { name: EXPECTED_STACK, status, tags: SSD_STACK_TAGS.map((t) => ({ key: t.Key, value: t.Value })) } }
   });
-  const ownershipFor = (status) => evaluateOwnership({ discovered: discovered(status), resourceTags: null, expectedType: 'AWS::IAM::Role', slug: SLUG, scope: 'repo' }).ownership;
+  const ownershipFor = (status) => evaluateOwnership({ discovered: discovered(status), resourceTags: null, expectedType: 'AWS::IAM::Role', slug: SLUG, scope: 'repo', expectedStackName: EXPECTED_STACK }).ownership;
 
   it('the five live states are managed', () => {
     for (const status of ['CREATE_COMPLETE', 'UPDATE_COMPLETE', 'UPDATE_ROLLBACK_COMPLETE', 'IMPORT_COMPLETE', 'IMPORT_ROLLBACK_COMPLETE']) {
@@ -763,5 +767,95 @@ describe('M4: the fake AWS harness is strict', () => {
     await assert.rejects(f.exec(['iam', 'get-role', '--role-name', 'x', '--endpoint-url', 'https://evil.example', ...suffix]), FakeAwsError);
     await assert.rejects(f.exec(['sts', 'get-caller-identity']), (error) => /wrapper suffix/.test(error.message));
     await assert.rejects(f.exec(['sts', 'get-caller-identity', '--region', REGION, '--output', 'text', '--no-cli-pager']), (error) => /wrapper suffix/.test(error.message));
+  });
+});
+
+describe('ownership binds to the exact derived stack', () => {
+  const ownerDiscovered = ({ stackName = EXPECTED_STACK, tags = SSD_STACK_TAGS, type = 'AWS::IAM::Role' } = {}) => ({
+    stackResource: { state: 'present', value: { stackName, stackId: 's', logicalId: 'R', type } },
+    stack: { state: 'present', value: { name: stackName, status: 'CREATE_COMPLETE', tags: tags.map((t) => ({ key: t.Key, value: t.Value })) } }
+  });
+  const ownership = (discovered, { slug = SLUG, scope = 'repo', expectedStackName = EXPECTED_STACK, type = 'AWS::IAM::Role' } = {}) =>
+    evaluateOwnership({ discovered, resourceTags: null, expectedType: type, slug, scope, expectedStackName });
+
+  it('derivation: deterministic, valid, hash over the canonical repository identity', () => {
+    const name = repoStackName('acme/app');
+    assert.equal(name, repoStackName('acme/app'));
+    assert.equal(name, `ssd-delivery-acme-app-${createHash('sha256').update('github.com/acme/app').digest('hex').slice(0, 8)}`);
+    assert.equal(canonicalRepository('Acme/App'), 'github.com/acme/app');
+    assert.equal(canonicalSlug('Acme/My.App'), 'acme/my.app');
+    assert.match(name, STACK_NAME);
+  });
+
+  it('derivation: case is one repository; display-name collisions still get different names', () => {
+    assert.equal(repoStackName('Acme/My-App'), repoStackName('acme/my-app'), 'GitHub names are case-insensitive');
+    const collide = [['acme/my.app', 'acme/my-app'], ['acme/my_app', 'acme/my-app'], ['a-b/c', 'a/b-c']];
+    for (const [x, y] of collide) {
+      assert.equal(repoStackName(x).slice(0, -9), repoStackName(y).slice(0, -9), `${x} and ${y} share a display name`);
+      assert.notEqual(repoStackName(x), repoStackName(y), `${x} and ${y} must not share a stack`);
+    }
+  });
+
+  it('derivation: long and unusual slugs stay valid CloudFormation names; bad slugs are refused', () => {
+    for (const slug of [`a${'b'.repeat(38)}/${'c.'.repeat(50)}`, 'x/.github', 'A1/_-_', 'owner/...']) {
+      const name = repoStackName(slug);
+      assert.match(name, STACK_NAME, slug);
+      assert.ok(name.length <= 128, slug);
+    }
+    for (const bad of ['', 'noslash', 'a/b/c', null]) {
+      assert.throws(() => repoStackName(bad));
+    }
+  });
+
+  it('a correctly tagged ssd-onboard stack with ANOTHER name is not the owner', () => {
+    const other = repoStackName('acme/other');
+    const result = ownership(ownerDiscovered({ stackName: other }));
+    assert.equal(result.ownership, 'exists-not-owned');
+    assert.ok(result.reasons.some((r) => r.includes(`'${other}', not the expected stack '${EXPECTED_STACK}'`)));
+  });
+
+  it('doctor: a managed resource in another correctly tagged ssd stack blocks', async () => {
+    const world = managedStack(readyWorld(), 'app-deploy', { type: 'AWS::IAM::Role', tags: SSD_STACK_TAGS, stackName: 'ssd-delivery-acme-app-00000000' });
+    const { check, report } = await run(world, { delivery: { environment: 'production', roles: { deployOwnership: 'managed' } } });
+    assert.deepEqual([check('ownership.deploy-role').ownership, check('ownership.deploy-role').status], ['exists-not-owned', 'FAIL']);
+    assert.equal(report.outcome, 'BLOCKED');
+    assert.ok(check('ownership.deploy-role').expected[0].includes(EXPECTED_STACK));
+  });
+
+  it('the name alone is not proof: right name with missing managed-by, wrong consumer, or synthetic is not managed', () => {
+    const without = (key) => SSD_STACK_TAGS.filter((t) => t.Key !== key);
+    const withValue = (key, value) => SSD_STACK_TAGS.map((t) => (t.Key === key ? { ...t, Value: value } : t));
+    assert.equal(ownership(ownerDiscovered({ tags: without('ssd:managed-by') })).ownership, 'exists-not-owned');
+    assert.equal(ownership(ownerDiscovered({ tags: withValue('ssd:consumer-repository', 'acme/other') })).ownership, 'exists-not-owned');
+    assert.equal(ownership(ownerDiscovered({ tags: withValue('ssd:environment', 'synthetic') })).ownership, 'exists-not-owned');
+    assert.equal(ownership(ownerDiscovered({ tags: withValue('ssd:environment', 'Production') })).ownership, 'exists-not-owned');
+    assert.equal(ownership(ownerDiscovered()).ownership, 'managed');
+  });
+
+  it('the consumer tag is the canonical (lower-cased) slug, whatever case the config uses', () => {
+    const name = repoStackName('Acme/App');
+    assert.equal(ownership(ownerDiscovered({ stackName: name, tags: SSD_STACK_TAGS }), { slug: 'Acme/App', expectedStackName: name }).ownership, 'managed');
+    const mixed = SSD_STACK_TAGS.map((t) => (t.Key === 'ssd:consumer-repository' ? { ...t, Value: 'Acme/App' } : t));
+    assert.equal(ownership(ownerDiscovered({ stackName: name, tags: mixed }), { slug: 'Acme/App', expectedStackName: name }).ownership, 'exists-not-owned');
+  });
+
+  it('shared scope binds to the exact shared stack name', () => {
+    const sharedTags = SSD_STACK_TAGS.filter((t) => t.Key !== 'ssd:consumer-repository');
+    const opts = { scope: 'shared', expectedStackName: SHARED_STACKS.githubOidc, type: 'AWS::IAM::OIDCProvider' };
+    assert.equal(ownership(ownerDiscovered({ stackName: SHARED_STACKS.githubOidc, tags: sharedTags, type: 'AWS::IAM::OIDCProvider' }), opts).ownership, 'managed');
+    assert.equal(ownership(ownerDiscovered({ stackName: EXPECTED_STACK, tags: sharedTags, type: 'AWS::IAM::OIDCProvider' }), opts).ownership, 'exists-not-owned');
+    assert.equal(ownership(ownerDiscovered({ stackName: SHARED_STACKS.ecrScanning, tags: sharedTags, type: 'AWS::IAM::OIDCProvider' }), opts).ownership, 'exists-not-owned');
+  });
+
+  it('doctor: the OIDC provider is managed only by ssd-shared-github-oidc', async () => {
+    const sharedTags = SSD_STACK_TAGS.filter((t) => t.Key !== 'ssd:consumer-repository');
+    const managed = await run(managedStack(readyWorld(), PROVIDER, { type: 'AWS::IAM::OIDCProvider', tags: sharedTags, stackName: SHARED_STACKS.githubOidc }), { delivery: { environment: 'production', oidcProvider: 'managed' } });
+    assert.equal(managed.check('ownership.oidc-provider').status, 'PASS');
+    const wrong = await run(managedStack(readyWorld(), PROVIDER, { type: 'AWS::IAM::OIDCProvider', tags: sharedTags }), { delivery: { environment: 'production', oidcProvider: 'managed' } });
+    assert.equal(wrong.check('ownership.oidc-provider').status, 'FAIL');
+  });
+
+  it('no expected stack name, no conclusion: evaluateOwnership refuses to run without one', () => {
+    assert.throws(() => evaluateOwnership({ discovered: ownerDiscovered(), resourceTags: null, expectedType: 'AWS::IAM::Role', slug: SLUG, scope: 'repo' }), /expected stack name/);
   });
 });

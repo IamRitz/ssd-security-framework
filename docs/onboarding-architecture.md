@@ -665,9 +665,13 @@ reach a non-allowlisted verb.
 | **shared** (account/region) | GitHub OIDC provider; ECR registry scanning configuration; Inspector enablement; break-glass broker stacks (prod and synthetic) | discover, validate, report | `aws plan --scope shared` + `aws apply` of that plan |
 | **per repository** | ECR repository; push+scan role; deploy role; break-glass invoker role; GitHub secret | `existing` (validate) or `managed` (stack) | `aws plan` + `aws apply` |
 
-A resource is **managed** only if it is a physical resource of a CloudFormation
-stack whose stack tags carry `ssd:managed-by=ssd-onboard` and, for per-repo
-stacks, `ssd:consumer-repository=<owner>/<repo>`. A resource that merely has the
+A resource is **managed** only if it is a physical resource of **the expected
+CloudFormation stack** — the exact derived name (`ssd-delivery-<owner>-<repo>-<h8>`
+per repository; `ssd-shared-github-oidc` / `ssd-shared-ecr-scanning` shared; see
+D.10) in `delivery.aws.region` — whose stack tags carry `ssd:managed-by=ssd-onboard`,
+`ssd:environment=production` and, for per-repo stacks,
+`ssd:consumer-repository=<owner>/<repo>`. The name locates the owner; the tags
+and state prove it. Phase 2B creates stacks only under these names. A resource that merely has the
 expected name is reported `exists, not owned` and is never modified; the owner
 chooses `existing` mode (validate only) or a CloudFormation **import** change set
 that names it explicitly.
@@ -820,9 +824,15 @@ What exists, and where it refines D.1–D.6:
 - **Scanning mode.** No config field declares BASIC vs ENHANCED; the registry's
   own `scanType` decides whether Inspector is checked and whether the push role
   needs the `inspector2` statement. No schema change was needed for Phase 2A.
-- **`ssd:environment` (D.2)** is the stack's `production|synthetic` class, not
-  `delivery.environment` (the GitHub environment); ownership requires one of the
-  two values but cannot match it to config (no field records it).
+- **Stack names (D.2)** are derived in `aws/stack-names.mjs`, not configured:
+  `ssd-delivery-<display>-<h8>` with `<h8>` = sha256 of the canonical
+  `github.com/<owner>/<repo>` (lower-cased: GitHub names are case-insensitive),
+  and the two fixed shared names. Ownership binds to the exact name; another
+  correctly tagged ssd stack is not the owner.
+- **`ssd:environment` (D.2)** is the stack's class, not `delivery.environment`
+  (the GitHub environment). Phase 2 delivery stacks are `production`, and
+  ownership requires exactly that; `synthetic` is the Phase 3 break-glass test
+  stack (E.4).
 - **SSM (D.6).** The instance role is found through `ec2 describe-instances` →
   instance profile → its single role, never by name. `Online` is runtime proof
   of SSM core; ECR login + pull on the repository is analysed, and a missing

@@ -379,12 +379,24 @@ endpoint policies can still deny.
 that specific call makes a resource `absent`; a denial, throttle, timeout or
 malformed response is NOT VERIFIED.
 
-**Ownership: existence is not ownership.** A resource is reported `managed`
-only if CloudFormation lists it as a physical resource of a stack in a settled,
-successful state (`CREATE_COMPLETE`, `UPDATE_COMPLETE`, `UPDATE_ROLLBACK_COMPLETE`,
-`IMPORT_COMPLETE`, `IMPORT_ROLLBACK_COMPLETE`), of the expected type, whose tags are `ssd:framework=ssd-security-framework`,
-`ssd:managed-by=ssd-onboard`, `ssd:environment=production|synthetic` and (per
-repository) `ssd:consumer-repository=<owner>/<repo>`. Anything else that exists
+**Ownership: existence is not ownership.** ssd-onboard's stacks have derived
+names (never configured):
+
+| Scope | Stack name |
+| --- | --- |
+| per repository | `ssd-delivery-<owner>-<repo>-<h8>` — lower-cased, other characters → `-`; `<h8>` = first 8 hex of sha256(`github.com/<owner>/<repo>` lower-cased), so `acme/my.app` and `acme/my-app` differ while `Acme/App` and `acme/app` (one GitHub repository) agree |
+| shared: GitHub OIDC provider | `ssd-shared-github-oidc` |
+| shared: ECR registry scanning | `ssd-shared-ecr-scanning` |
+
+The name only **locates** the owner; it is not proof. A resource is reported
+`managed` only if CloudFormation, in `delivery.aws.region`, lists it as a
+physical resource of the expected type of **exactly that stack**, the stack is
+in a settled, successful state (`CREATE_COMPLETE`, `UPDATE_COMPLETE`,
+`UPDATE_ROLLBACK_COMPLETE`, `IMPORT_COMPLETE`, `IMPORT_ROLLBACK_COMPLETE`), and
+its tags are `ssd:framework=ssd-security-framework`, `ssd:managed-by=ssd-onboard`,
+`ssd:environment=production` and (per repository)
+`ssd:consumer-repository=<owner>/<repo>` lower-cased. A correctly tagged
+ssd-onboard stack with any other name is not the owner. Anything else that exists
 is `exists, not owned` — expected for `existing`, a **FAIL** for `managed` (it
 will never be adopted by name). A resource owned by an ssd-onboard stack but
 configured `existing` is a WARN.

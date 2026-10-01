@@ -13,6 +13,7 @@
 // A key ending in ' *' matches every call that starts with the text before it
 // (exact keys win).
 import { assertReadOnly } from '../../onboarding/aws/aws-cli.mjs';
+import { repoStackName } from '../../onboarding/aws/stack-names.mjs';
 import { ACCOUNT, DEPLOY_ROLE, PUSH_ROLE } from './onboarding-fixtures.mjs';
 
 export { ACCOUNT, DEPLOY_ROLE, PUSH_ROLE };
@@ -25,6 +26,8 @@ export const REPO_ARN = `arn:aws:ecr:${REGION}:${ACCOUNT}:repository/${REPOSITOR
 export const INSTANCE_ARN = `arn:aws:ec2:${REGION}:${ACCOUNT}:instance/${INSTANCE}`;
 export const PROFILE_ARN = `arn:aws:iam::${ACCOUNT}:instance-profile/app-instance`;
 export const INSTANCE_ROLE = `arn:aws:iam::${ACCOUNT}:role/app-instance`;
+// The derived per-repository stack for SLUG (stack-names.mjs).
+export const EXPECTED_STACK = repoStackName('acme/app');
 export const CALLER = `arn:aws:sts::${ACCOUNT}:assumed-role/ssd-operator/alice`;
 const SSM_CORE_ARN = 'arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore';
 const PULL_ARN = `arn:aws:iam::${ACCOUNT}:policy/app-pull`;
@@ -160,7 +163,7 @@ export function readyWorld() {
 }
 
 // A managed stack relationship for one physical id.
-export function managedStack(world, physicalId, { type, tags, stackName = 'ssd-app-delivery' }) {
+export function managedStack(world, physicalId, { type, tags, stackName = EXPECTED_STACK }) {
   const stackId = `arn:aws:cloudformation:${REGION}:${ACCOUNT}:stack/${stackName}/1`;
   world[`cloudformation describe-stack-resources --physical-resource-id ${physicalId}`] = ok({
     StackResources: [{ StackName: stackName, StackId: stackId, LogicalResourceId: 'Resource', PhysicalResourceId: physicalId, ResourceType: type, ResourceStatus: 'CREATE_COMPLETE' }]

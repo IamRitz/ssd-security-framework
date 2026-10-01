@@ -26,6 +26,7 @@ import { discoverOidcProvider } from './discover/oidc-provider.mjs';
 import { describeError } from './discover/result.mjs';
 import { discoverInstance, discoverInstanceProfile, discoverManagedInstance } from './discover/ssm.mjs';
 import { discoverStack, evaluateOwnership } from './discover/stacks.mjs';
+import { SHARED_STACKS, repoStackName } from './stack-names.mjs';
 import { principals, statements } from './policy/evaluate.mjs';
 import { analyzePermissions, proposedInstancePolicy, simulationGroups } from './policy/permissions.mjs';
 import { GITHUB_OIDC_HOST, STS_AUDIENCE, evaluateTrust, intendedContexts, providerArn } from './policy/trust.mjs';
@@ -403,11 +404,15 @@ export function instanceRoleCheck({ instance, profile, analysis, online, target 
   };
 }
 
-export function ownershipCheck({ label, id, mode, evaluation, resourceState }) {
+export function ownershipCheck({ label, id, mode, evaluation, resourceState, stackName }) {
   const c = check(id, 'Ownership', label, {
     required: mode === 'managed',
     basis: 'runtime',
-    expected: [mode === 'managed' ? 'managed: a physical resource of an ssd-onboard stack tagged for this repository' : 'existing: validated in place; never modified or adopted by name']
+    expected: [
+      mode === 'managed'
+        ? `managed: a physical resource of stack ${stackName} (exact name, this region), tagged ssd:managed-by=ssd-onboard and ssd:environment=production`
+        : `existing: validated in place; never modified or adopted by name (an ssd-onboard owner would be stack ${stackName})`
+    ]
   });
   if (resourceState !== 'present') {
     return { ...c, status: NOT_VERIFIED, ownership: 'unverified', observed: ['resource not available'], findings: [{ severity: NOT_VERIFIED, kind: 'prerequisite-missing', message: 'ownership is only evaluated for a resource that exists' }] };
@@ -533,13 +538,13 @@ export async function awsDoctor({ config, region: explicitRegion = null, exec, e
   // Ownership (discovery of the stack relationship, for resources that exist).
   const owned = [];
   const ownershipTargets = [
-    { id: 'ownership.oidc-provider', label: 'OIDC provider (shared)', mode: d.oidcProvider, state: oidc.state, physicalId: oidc.state === 'present' ? oidc.value.arn : null, type: 'AWS::IAM::OIDCProvider', scope: 'shared', tags: oidc.state === 'present' ? oidc.value.tags : null },
-    { id: 'ownership.ecr-repository', label: 'ECR repository', mode: d.ecr.ownership, state: repo.state, physicalId: d.ecr.repository, type: 'AWS::ECR::Repository', scope: 'repo', tags: repo.state === 'present' && repo.value.tags.state === 'present' ? repo.value.tags.value : null },
-    ...roles.map((r) => ({ id: `ownership.${r.key}-role`, label: `${r.label} role`, mode: r.key === 'push' ? d.roles.pushScanOwnership : d.roles.deployOwnership, state: r.role.state === 'present' && r.role.value.arn === r.arn ? 'present' : 'unavailable', physicalId: r.role.state === 'present' ? r.role.value.name : null, type: 'AWS::IAM::Role', scope: 'repo', tags: r.role.state === 'present' ? r.role.value.tags : null }))
+    { id: 'ownership.oidc-provider', label: 'OIDC provider (shared)', mode: d.oidcProvider, state: oidc.state, physicalId: oidc.state === 'present' ? oidc.value.arn : null, type: 'AWS::IAM::OIDCProvider', scope: 'shared', stackName: SHARED_STACKS.githubOidc, tags: oidc.state === 'present' ? oidc.value.tags : null },
+    { id: 'ownership.ecr-repository', label: 'ECR repository', mode: d.ecr.ownership, state: repo.state, physicalId: d.ecr.repository, type: 'AWS::ECR::Repository', scope: 'repo', stackName: repoStackName(slug), tags: repo.state === 'present' && repo.value.tags.state === 'present' ? repo.value.tags.value : null },
+    ...roles.map((r) => ({ id: `ownership.${r.key}-role`, label: `${r.label} role`, mode: r.key === 'push' ? d.roles.pushScanOwnership : d.roles.deployOwnership, state: r.role.state === 'present' && r.role.value.arn === r.arn ? 'present' : 'unavailable', physicalId: r.role.state === 'present' ? r.role.value.name : null, type: 'AWS::IAM::Role', scope: 'repo', stackName: repoStackName(slug), tags: r.role.state === 'present' ? r.role.value.tags : null }))
   ];
   for (const o of ownershipTargets) {
-    const evaluation = o.state === 'present' ? evaluateOwnership({ discovered: await discoverStack(aws, o.physicalId), resourceTags: o.tags, expectedType: o.type, slug, scope: o.scope }) : null;
-    owned.push(ownershipCheck({ label: o.label, id: o.id, mode: o.mode, evaluation, resourceState: o.state }));
+    const evaluation = o.state === 'present' ? evaluateOwnership({ discovered: await discoverStack(aws, o.physicalId), resourceTags: o.tags, expectedType: o.type, slug, scope: o.scope, expectedStackName: o.stackName }) : null;
+    owned.push(ownershipCheck({ label: o.label, id: o.id, mode: o.mode, evaluation, resourceState: o.state, stackName: o.stackName }));
   }
 
   // Checks.
