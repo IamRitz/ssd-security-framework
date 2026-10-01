@@ -444,7 +444,7 @@ export function validateConfig(raw, { today = new Date() } = {}) {
 
   let delivery = null;
   if (isEcrProfile(profile)) {
-    const d = section(c, root.delivery, 'delivery', ['aws', 'ecr', 'oidcProvider', 'roles', 'ssm', 'environment']) ?? {};
+    const d = section(c, root.delivery, 'delivery', ['aws', 'ecr', 'oidcProvider', 'registryScanning', 'roles', 'ssm', 'environment']) ?? {};
     const awsRaw = section(c, d.aws, 'delivery.aws', ['accountId', 'region']) ?? {};
     const ecrRaw = section(c, d.ecr, 'delivery.ecr', ['repository', 'ownership']) ?? {};
     const rolesRaw = section(c, d.roles, 'delivery.roles', ['pushScanRoleArn', 'pushScanOwnership', 'deployRoleArn', 'deployOwnership']) ?? {};
@@ -459,6 +459,9 @@ export function validateConfig(raw, { today = new Date() } = {}) {
         ownership: str(c, ecrRaw.ownership, 'delivery.ecr.ownership', { oneOf: OWNERSHIP, fallback: 'existing' })
       },
       oidcProvider: str(c, d.oidcProvider, 'delivery.oidcProvider', { oneOf: OWNERSHIP, fallback: 'existing' }),
+      // The account's ECR registry scanning configuration (shared scope).
+      // existing: discovered, validated and reported; never planned.
+      registryScanning: str(c, d.registryScanning, 'delivery.registryScanning', { oneOf: OWNERSHIP, fallback: 'existing' }),
       roles: {
         pushScanRoleArn: str(c, rolesRaw.pushScanRoleArn, 'delivery.roles.pushScanRoleArn', { re: RE.roleArn, required: false }),
         pushScanOwnership: str(c, rolesRaw.pushScanOwnership, 'delivery.roles.pushScanOwnership', { oneOf: OWNERSHIP, fallback: 'existing' }),

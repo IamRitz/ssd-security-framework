@@ -631,15 +631,23 @@ Both are Phase 2 concerns (D.4, D.5).
 
 ## Part D — Phase 2: `aws doctor / plan / apply / verify`
 
-Not implemented. `ssd-onboard aws …` currently exits with status 2 and a pointer
-here. This is the reviewed design.
+| Phase | Command | Status |
+| --- | --- | --- |
+| 2A | `aws doctor` | **implemented** — [D.10](#d10-phase-2a-as-implemented), [onboarding-cli.md § AWS readiness](onboarding-cli.md#aws-readiness-aws-doctor-phase-2a) |
+| 2B | `aws plan` | **implemented** — [D.11](#d11-phase-2b-as-implemented), [onboarding-cli.md § AWS plans](onboarding-cli.md#aws-plans-aws-plan-phase-2b) |
+| 2C | `aws apply` | designed, **not implemented** (exit 2, contacts nothing) |
+| 2D | `aws verify` | designed, **not implemented** (exit 2, contacts nothing) |
+| 2E | `github …` | designed, **not implemented** |
+
+D.1–D.9 are the reviewed design; D.10 and D.11 record where the implementation
+refines it.
 
 ### D.1 Command contract
 
 | Command | Mutates | Requires |
 | --- | --- | --- |
 | `aws doctor` | nothing | ambient AWS CLI credentials |
-| `aws plan [--scope repo\|shared]` | writes `.ssd/aws-plans/<plan-id>/` locally; creates **unexecuted** CloudFormation change sets | same |
+| `aws plan [--scope repo\|shared]` | writes `.ssd/aws-plans/<plan-id>/` locally; creates **unexecuted** CloudFormation change sets (a `CREATE` also leaves a `REVIEW_IN_PROGRESS` placeholder stack) | same, plus a clean framework checkout at `framework.ref` (D.11) |
 | `aws apply --plan-id <id> --account <id> --region <r>` | executes exactly that change set | interactive typed confirmation of account **and** region, or `--yes` plus both flags; refuses on any mismatch |
 | `aws verify` | nothing (plus explicitly listed controlled invocations) | same |
 
@@ -653,7 +661,8 @@ credentials come only from the AWS CLI's own chain. All AWS calls go through one
 `sts get-caller-identity`, `cloudformation create-change-set` /
 `describe-change-set` / `validate-template`) used by doctor/plan/verify; only
 `apply` receives the mutating wrapper. A test asserts doctor/plan/verify cannot
-reach a non-allowlisted verb.
+reach a non-allowlisted verb. *(Refined in D.10/D.11: doctor's allowlist is
+strictly read-only and plan has its own, separate planning allowlist.)*
 
 ### D.2 Ownership model
 
@@ -662,9 +671,13 @@ reach a non-allowlisted verb.
 | **shared** (account/region) | GitHub OIDC provider; ECR registry scanning configuration; Inspector enablement; break-glass broker stacks (prod and synthetic) | discover, validate, report | `aws plan --scope shared` + `aws apply` of that plan |
 | **per repository** | ECR repository; push+scan role; deploy role; break-glass invoker role; GitHub secret | `existing` (validate) or `managed` (stack) | `aws plan` + `aws apply` |
 
-A resource is **managed** only if it is a physical resource of a CloudFormation
-stack whose stack tags carry `ssd:managed-by=ssd-onboard` and, for per-repo
-stacks, `ssd:consumer-repository=<owner>/<repo>`. A resource that merely has the
+A resource is **managed** only if it is a physical resource of **the expected
+CloudFormation stack** — the exact derived name (`ssd-delivery-<owner>-<repo>-<h8>`
+per repository; `ssd-shared-github-oidc` / `ssd-shared-ecr-scanning` shared; see
+D.10) in `delivery.aws.region` — whose stack tags carry `ssd:managed-by=ssd-onboard`,
+`ssd:environment=production` and, for per-repo stacks,
+`ssd:consumer-repository=<owner>/<repo>`. The name locates the owner; the tags
+and state prove it. Phase 2B creates stacks only under these names. A resource that merely has the
 expected name is reported `exists, not owned` and is never modified; the owner
 chooses `existing` mode (validate only) or a CloudFormation **import** change set
 that names it explicitly.
@@ -680,8 +693,8 @@ onboarding/aws/
   cli.mjs                    aws doctor|plan|apply|verify dispatch
   identity.mjs               sts get-caller-identity, account/region/caller checks
   aws-cli.mjs                execFile wrapper; read-only vs mutating allowlists
-  plan.mjs                   plan id, change-set creation, change classification
-  apply.mjs                  confirmation, re-verification, execute, wait
+  plan.mjs                   plan id, change-set creation, change classification   (2B: implemented, D.11)
+  apply.mjs                  confirmation, re-verification, execute, wait          (2C: not implemented)
   discover/
     oidc-provider.mjs        exists? thumbprints/audiences
     ecr.mjs                  repository, tag immutability, scan config coverage
@@ -778,6 +791,187 @@ recorded responses; managed-vs-existing (name-only matches are never managed); n
 repo-scope plan touches registry scanning; trust policies are repo/branch/
 environment scoped (evaluator); invoker least privilege via recorded
 `simulate-principal-policy` results; no secret values in templates, plans or logs.
+
+### D.10 Phase 2A as implemented
+
+What exists, and where it refines D.1–D.6:
+
+- **Dispatch.** `cli.mjs` routes `aws` before any repository option parsing,
+  through a *dynamic* import of `onboarding/aws/cli.mjs`. The static module graph
+  of every repository command therefore contains no AWS code (asserted by
+  `test/aws-doctor.test.js`).
+- **Modules.** `aws/aws-cli.mjs` (the only process execution), `identity.mjs`,
+  `doctor.mjs` (orchestration + pure checks), `report.mjs` (presentation through
+  `lib/output.mjs`), `discover/{oidc-provider,ecr,inspector,iam-role,ssm,stacks,result}.mjs`,
+  `policy/{evaluate,trust,permissions}.mjs`. (`plan.mjs` and `templates/` were
+  added in Phase 2B, D.11; `apply.mjs` does not exist yet.)
+- **Allowlist (refines D.1).** Not verb prefixes: an explicit map of
+  `service → operation → permitted flags`. Every flag takes exactly one value
+  that must not look like an option, nor begin with `file://`, `fileb://` or
+  `http(s)://` (AWS CLI parameter indirection; no operation opts in); lists are
+  passed as one JSON argv element.
+  The wrapper appends `--region <r> --output json --no-cli-pager` itself and sets
+  `AWS_PAGER=''`, `AWS_CLI_AUTO_PROMPT=off`, `AWS_IGNORE_CONFIGURED_ENDPOINT_URLS=true`.
+  `cloudformation create-change-set` / `validate-template` are **not** in this
+  allowlist; Phase 2B added a separate planning allowlist rather than widening
+  doctor's (D.11).
+- **Time and failures that end a run.** Each call gets min(60 s, the run's
+  remaining 300 s budget). A timed-out call is `unverified`; a spent budget
+  (`deadline`), an authentication failure (including an expired IAM Identity
+  Center session or any error from the SSO credential operations), a missing CLI
+  or an allowlist refusal ends the run as `ERROR`.
+- **Discovery results** are `present | absent | unverified`; `absent` requires
+  the specific not-found code for that call (e.g. `NoSuchEntity`,
+  `RepositoryNotFoundException`, CloudFormation's `Stack for … does not exist`).
+- **Outcomes.** `BLOCKED` (any FAIL) and `NOT_VERIFIED` (a check with
+  `required: true` could not be proven) exit 1; `READY_WITH_WARNINGS` (WARN, or
+  NOT VERIFIED only on `required: false` checks) and `READY` exit 0; `ERROR`
+  (could not run) exits 1. Advisory checks are only the subject format, tag
+  immutability and `existing`-mode ownership; human output labels them
+  "(advisory)". Checks name their basis: `runtime`, `configuration`,
+  `policy-document`, `policy-document+simulation`, `policy-document+runtime`.
+- **Subject format (D.4).** Always NOT VERIFIED and not `required`: doctor makes
+  no GitHub call. The trust evaluator accepts the legacy format by exact match
+  and the immutable format only with a WARN that the IDs are unverified.
+- **Scanning mode.** No config field declares BASIC vs ENHANCED; the registry's
+  own `scanType` decides whether Inspector is checked and whether the push role
+  needs the `inspector2` statement. No schema change was needed for Phase 2A.
+- **Stack names (D.2)** are derived in `aws/stack-names.mjs`, not configured:
+  `ssd-delivery-<display>-<h8>` with `<h8>` = sha256 of the canonical
+  `github.com/<owner>/<repo>` (lower-cased: GitHub names are case-insensitive),
+  and the two fixed shared names. Ownership binds to the exact name; another
+  correctly tagged ssd stack is not the owner.
+- **`ssd:environment` (D.2)** is the stack's class, not `delivery.environment`
+  (the GitHub environment). Phase 2 delivery stacks are `production`, and
+  ownership requires exactly that; `synthetic` is the Phase 3 break-glass test
+  stack (E.4).
+- **SSM (D.6).** The instance role is found through `ec2 describe-instances` →
+  instance profile → its single role, never by name. `Online` is runtime proof
+  of SSM core; ECR login + pull on the repository is analysed, and a missing
+  grant prints a proposed policy for the role owner.
+
+
+### D.11 Phase 2B as implemented
+
+What exists, and where it refines D.1–D.7:
+
+- **Modules.** `aws/plan.mjs` (orchestration), `aws/plan/scope.mjs` (the
+  repo/shared boundary), `aws/plan/change-set.mjs` (validate, create, poll,
+  classify), `aws/plan/record.mjs` (plan id, persisted-secret check, plan
+  directory), `aws/policy/diff.mjs` (semantic IAM diff),
+  `aws/templates/{common,repo-ecr-delivery,shared-github-oidc}.mjs`,
+  `aws/plan-report.mjs`. Builders were added beside the evaluators they must
+  satisfy: `buildTrustPolicy` in `policy/trust.mjs`, `rolePolicyDocument` in
+  `policy/permissions.mjs`, `mergeScanningRules` in `discover/ecr.mjs`,
+  `discoverStackByName` / `discoverStackResources` / `planStack` in
+  `discover/stacks.mjs`. `plan/record.mjs` is the only module under
+  `onboarding/aws` that writes a file; doctor's module graph never reaches it
+  (asserted).
+- **Two allowlists (refines D.1).** `readOnlyAws()` keeps the Phase 2A table
+  byte for byte. `planningAws()` is the read-only table plus
+  `cloudformation validate-template`, `create-change-set`,
+  `describe-change-set` and `describe-stack-resources --stack-name`. Planning
+  flags whose value matters are checked by value: change-set type
+  `CREATE|UPDATE`, derived stack names, `ssd-plan-<64 hex>` change-set names,
+  only `CAPABILITY_NAMED_IAM`, only SSD tags, inline JSON template bodies of at
+  most 51,200 bytes. There is no `execute-change-set`, no stack create/update/
+  delete, no `delete-change-set`, no import (`IMPORT`, `--resources-to-import`,
+  `--import-existing-resources`), no `--template-url`/`--role-arn`/
+  `--notification-arns`. The template reaches the CLI as one argv element,
+  never as a file reference; the `file://`/`fileb://`/`http(s)://` refusal
+  stays in force for every value.
+- **Framework binding.** `aws plan` refuses unless `frameworkProblems()`
+  (`lib/framework.mjs`, the `render` rule) is empty: a clean checkout whose
+  origin is `framework.repository` at exactly `framework.ref`. Templates are
+  code, so this is what makes "same config + same framework commit →
+  byte-identical template" meaningful.
+- **Templates (refines D.3).** JSON rendered by code, not static YAML: the
+  policies come from the canonical builders, which refuse to return a document
+  the doctor's evaluators would not accept (trust: `accepted` with no warning;
+  permissions: `PASS`). No CloudFormation parameters, outputs, conditions or
+  transforms. Every resource is `DeletionPolicy: Retain` /
+  `UpdateReplacePolicy: Retain` and SSD-tagged. **No lifecycle policy** (D.3
+  listed one; none is designed or configurable, and an implicit retention
+  policy could expire a rollback image). The OIDC provider has no thumbprint
+  (`ThumbprintList` is optional in the CloudFormation schema).
+- **Stacks.** One plan id = one stack = one change set; `--scope shared` can
+  produce several independent plans. Phase 2B plans `ssd-delivery-…` (repo)
+  and `ssd-shared-github-oidc` (shared). `ssd-shared-ecr-scanning` has a
+  reserved name but **no template**: see the next item.
+- **Registry scanning (refines D.2, D.5).** New closed-schema field
+  `delivery.registryScanning: existing | managed` (default `existing`).
+  `existing`: discovered, validated and reported, with the D.5 proposal
+  (current rules + one filter, scan type unchanged) shown but never planned.
+  `managed` **blocks** in Phase 2B. Verified against the CloudFormation
+  resource schema and the ECR API: `AWS::ECR::RegistryScanningConfiguration`
+  exists, is keyed by the registry id, and create/update call
+  `PutRegistryScanningConfiguration`, which replaces the whole configuration;
+  but its `ScanFrequency` cannot express `MANUAL` (an existing MANUAL rule
+  would be lost), its handlers hold `inspector2:Enable`/`Disable` (a change
+  can toggle Inspector), it is not taggable, its create behaviour on an
+  already configured registry is undocumented, and its provider source is not
+  public. That is not safe to plan.
+- **Inspector (refines D.2).** No CloudFormation resource type enables
+  Inspector v2; it is reported as a prerequisite of ENHANCED scanning, never
+  planned.
+- **Ownership and change-set type.** The D.2/D.10 ownership model, reused
+  (`evaluateOwnership`; the stack-tag half is shared as `stackTagProblems`).
+  `planStack` decides the type from the exact expected stack: absent →
+  `CREATE`; an SSD-tagged `REVIEW_IN_PROGRESS` placeholder (left by an earlier
+  unexecuted `CREATE`) → `CREATE`; settled, successful, SSD-tagged → `UPDATE`;
+  anything else blocks. A managed resource that exists but is not a physical
+  resource of the expected stack, under the expected logical id, blocks
+  (`exists-not-owned`; a future import flow is needed). Push and deploy role
+  names equal case-insensitively, or a live role matching only
+  case-insensitively, block. A stack holding an unexpected resource blocks. A
+  stack-owned `managed` role with any policy the stack does not represent — a
+  managed policy attached directly, or an inline policy other than the stack's
+  `ssd-push-scan` / `ssd-deploy` — blocks (`unmanaged-policy`, naming the ARN or
+  name): its effective permissions would differ from the reviewed change set.
+  An incompletely readable policy list blocks too (`policies-unverified`).
+  Nothing is detached. Every block happens before any change set is created.
+- **Plan id (refines D.7).** sha256 of canonical JSON over account, region,
+  scope, stack kind and name, change-set type, base stack (`{state: absent}` or
+  `{state: present, stackId, stackStatus, lastUpdatedTime}`), template /
+  parameters / tags sha256, capabilities, framework repository and ref, and the
+  consumer repository. The caller ARN is **recorded** in `plan.json` but is
+  not part of the id (D.7 included it; a session name is incidental). The
+  change-set name is `ssd-plan-<plan id>`; a change set of that name that
+  already exists (its local directory lost) is refused, never replaced.
+  Executing any change set removes a stack's other change sets, so a later plan
+  of the same inputs can be recreated after an apply.
+- **Change-set lifecycle.** `validate-template` (no transforms, no
+  parameters, capabilities ⊆ named IAM) → `create-change-set` →
+  `describe-change-set` polled with 1/2/3/5/8/10 s backoff inside the run's
+  300 s budget, at most 60 polls. `CREATE_COMPLETE` + `AVAILABLE` is a plan;
+  `FAILED` with CloudFormation's documented no-change reason is
+  `outcome: no-changes` (recorded, never applicable); anything else fails. The
+  described document must be exactly the created change set (name, id, stack,
+  tags, capabilities, no parameters, no nested stacks, no
+  `ImportExistingResources`, no `NextToken`). `Add`→CREATE, `Remove`→DELETE,
+  `Modify` with `Replacement` `True`/`Conditional`→REPLACE, `False`→UPDATE;
+  `Dynamic`, `Import` and anything else fail closed. DELETE and REPLACE are
+  destructive and counted separately; the scope boundary is asserted on the
+  template and again on the described changes.
+- **Plan directory (refines D.7).** `.ssd/aws-plans/<plan-id>/` holds
+  `template.json`, `parameters.json`, `change-set.json`, `policies.json`
+  (IAM before/after + semantic diff) and `plan.json` (written **last**,
+  carrying every other file's sha256). Created through `lib/safe-path.mjs`
+  (no `..`, no symbolic link anywhere), exclusively, files `O_EXCL|O_NOFOLLOW`.
+  The slot is proven free before any AWS object is created. All five files
+  are checked for credential shapes before the directory is created; a match
+  refuses the plan, nothing is redacted and kept. `inspectPlanDirectory()` is
+  the local half of a future apply's check: a directory without a consistent
+  `plan.json`, with a file whose hash differs, or with `outcome: no-changes` is
+  never applicable.
+- **OIDC subjects (refines D.4).** No GitHub API call: generated trust uses
+  exact legacy subjects only; the subject format remains NOT VERIFIED, as in
+  doctor. `delivery.oidc.subjectFormat` / `observedSubject` were not added.
+- **Residual.** A `CREATE` change set leaves a `REVIEW_IN_PROGRESS` placeholder
+  stack, and no-change change sets remain `FAILED` objects, until deleted
+  outside ssd-onboard (plan has no delete permission by design). The base
+  revision binds `LastUpdatedTime`, which AWS sets; apply (2C) must re-describe
+  the stack and refuse a stale plan.
 
 ---
 

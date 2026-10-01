@@ -8,11 +8,24 @@ hand-editing YAML.
 Design record and gap analysis: [onboarding-architecture.md](onboarding-architecture.md).
 The manual procedure it automates: [onboarding.md](onboarding.md).
 
-> **Phase 1 boundary.** `ssd-onboard` edits files in the consumer repository and
-> nothing else. It makes **no AWS calls** and **no GitHub mutations**: it runs
-> `git` read-only and, for `baseline prepare --run`, `gh api` (GET) and
-> `gh run download` behind an allowlist. The `aws` and `github` commands are
-> designed (architecture doc, Parts D–E) but not implemented, and exit 2.
+> **Phase 1 boundary.** The repository commands edit files in the consumer
+> repository and nothing else. They make **no AWS calls** and **no GitHub
+> mutations**: they run `git` read-only and, for `baseline prepare --run`,
+> `gh api` (GET) and `gh run download` behind an allowlist.
+>
+> **Phase 2 boundary.** The `aws` commands are a separate trust boundary that
+> talks to AWS with the operator's own AWS CLI credentials and makes no GitHub
+> call.
+>
+> | Phase | Command | Status |
+> | --- | --- | --- |
+> | 2A | `aws doctor` | **implemented** — read-only ([§ AWS readiness](#aws-readiness-aws-doctor-phase-2a)) |
+> | 2B | `aws plan` | **implemented** — writes `.ssd/aws-plans/<plan-id>/` and creates **unexecuted** CloudFormation change sets ([§ AWS plans](#aws-plans-aws-plan-phase-2b)) |
+> | 2C | `aws apply` | not implemented (exit 2) |
+> | 2D | `aws verify` | not implemented (exit 2) |
+>
+> The `github` commands (Part E of the architecture doc) are not implemented
+> either.
 
 ## Obtaining ssd-onboard
 
@@ -114,6 +127,8 @@ the tools for everything after first onboarding.
 | `baseline prepare [--run <id>]` | `.ssd/candidates/` | print the bootstrap dispatch command, or fetch and verify its candidate |
 | `baseline accept` | baseline, config, workflow | accept the reviewed candidate (explicit confirmation) |
 | `promote --enforce` | config, workflows | log-only → enforce (requires an accepted baseline) |
+| `aws doctor [--region <r>] [--json]` | nothing (no AWS change either) | Phase 2A: read-only AWS readiness of the configured delivery (§ AWS readiness) |
+| `aws plan [--scope repo\|shared] [--region <r>] [--json]` | `.ssd/aws-plans/<plan-id>/`; an **unexecuted** CloudFormation change set | Phase 2B: a reviewable infrastructure plan (§ AWS plans) |
 
 `--repo <dir>` points at the consumer repository (default: the current directory).
 Nothing is ever committed; every change is a diff for a pull request.
@@ -122,7 +137,7 @@ Nothing is ever committed; every change is a diff for a pull request.
 
 Human-readable output is presentation only: its layout may change between
 versions, and nothing should parse it. Scripts use `--json` (`inspect`,
-`validate`, `doctor`) and the exit code.
+`validate`, `doctor`, `aws doctor`) and the exit code.
 
 - **Color** is used only when the stream is an interactive terminal. Redirected
   or piped output, CI logs and `--json` are plain text. Color is also off when
@@ -178,8 +193,9 @@ typo cannot silently leave a repository in log-only. All scalars except
 | `trufflehog.excludePathsFile` | `''` | `''` = no exclusions; a path = newline-separated regexes |
 | `container.dockerfile` / `.context` / `.imageName` | detected / `.` / repo name | container profiles |
 | `delivery.aws.accountId` / `.region` | — | ECR profile |
-| `delivery.ecr.repository` / `.ownership` | image name / `existing` | `managed` is Phase 2 |
-| `delivery.oidcProvider` | `existing` | recorded for Phase 2 |
+| `delivery.ecr.repository` / `.ownership` | image name / `existing` | `managed` is Phase 2; `aws doctor` reports actual ownership |
+| `delivery.oidcProvider` | `existing` | ownership mode of the shared GitHub OIDC provider; `aws doctor` reports actual ownership; `managed`: planned by `aws plan --scope shared` |
+| `delivery.registryScanning` | `existing` | ownership mode of the account's ECR registry scanning configuration (shared). `existing`: discovered, validated and reported. `managed`: refused by Phase 2B (§ AWS plans) |
 | `delivery.roles.pushScanRoleArn` / `deployRoleArn` | — | must differ; both in `accountId` |
 | `delivery.roles.*Ownership` | `existing` | `managed` is Phase 2 (the ARN is still required to render) |
 | `delivery.ssm.instanceId` / `.appPort` / `.containerName` | — / `3000` / image name | strict alphabets (they reach a root shell on the instance) |
@@ -283,7 +299,7 @@ it re-implements none of it — reported as one check per concern:
 | Semgrep / secret scanning / dependency coverage / container | the corresponding `validate` errors | WARN for its warnings |
 | CODEOWNERS coverage | | WARN on a missing file or path; otherwise **NOT VERIFIED** |
 | GitHub merge governance | | always **NOT VERIFIED** |
-| AWS delivery prerequisites (ECR profile), Slack secret (if enabled) | | always **NOT VERIFIED** |
+| AWS delivery prerequisites (ECR profile), Slack secret (if enabled) | | always **NOT VERIFIED** (for AWS, run `aws doctor`) |
 
 Every `validate` error appears as a FAIL of some check (an unknown one in
 "Other validation problems"), and doctor adds no FAIL of its own. **NOT
@@ -310,6 +326,323 @@ Remediation links to GitHub settings are shown only when origin is exactly
 `github.com` and names `repository.slug`; for any other host (GitHub
 Enterprise included) doctor gives the host-neutral steps (*repository
 settings → Rules → Rulesets*) without a link.
+
+## AWS readiness: `aws doctor` (Phase 2A)
+
+`doctor` never contacts AWS. `aws doctor` is the separately authenticated,
+**read-only** check of the AWS side of a `container-ecr-framework-gated`
+delivery. It reads `.ssd/onboarding.yml` (`delivery.*`, `repository.*`) and
+nothing else from the repository, writes nothing, and makes no GitHub call.
+
+```sh
+AWS_PROFILE=<operator-profile> node ssd-framework/onboarding/cli.mjs aws doctor --repo <consumer-repo>
+```
+
+**Credentials** come only from the AWS CLI's provider chain (profile, SSO,
+role credentials…). There is no option that takes a key; error text is reduced
+to the AWS error code and message with credential-shaped values redacted (access
+key IDs, secret keys, session and container-credential tokens, JWTs), and a
+credential failure — including a missing or expired IAM Identity Center (SSO)
+session — prints no provider output at all.
+
+**Time**: each AWS call has a 60 s timeout, and the whole run a 300 s budget;
+each call gets whichever is smaller. A call that times out is NOT VERIFIED for
+its check; a spent budget ends the run as `ERROR` (`deadline`).
+
+**Region**: `--region` if given, else `delivery.aws.region` — never the AWS
+CLI's default. A `--region` that differs from `delivery.aws.region` blocks
+before AWS is contacted.
+
+**Order**: `sts get-caller-identity` first. A caller in another account, or the
+account **root** user, blocks before any resource is read.
+
+**Read-only by construction**: every call goes through one wrapper
+(`execFile`, argv array, no shell) whose allowlist names each permitted
+`service operation` and its permitted parameters explicitly; anything else —
+every mutating verb, an unlisted read, `--endpoint-url`, `--profile`,
+`--debug`, `--cli-input-json`, and any parameter **value** beginning with
+`file://`, `fileb://`, `http://` or `https://` (which the AWS CLI would resolve
+by reading a local file or a URL) — is refused before it runs. There is no mutating
+wrapper in this version.
+
+| Section | Check | FAIL when | NOT VERIFIED when |
+| --- | --- | --- | --- |
+| Identity | Caller account / principal / region | wrong account; root user; `--region` ≠ config | |
+| GitHub OIDC | Provider | absent; another account; audience list lacks `sts.amazonaws.com` (WARN: extra audiences) | the provider cannot be read |
+| | Subject format | | **always** (not required): legacy vs immutable customization needs the GitHub API |
+| ECR | Repository | absent; public repository policy | cannot be read |
+| | Tag immutability | | (WARN when MUTABLE: deploys pin digests, but a tag can be repointed) |
+| | Registry scanning coverage | no rule scans the repository automatically (MANUAL is not coverage) | the configuration cannot be read, the scan type is missing or not BASIC/ENHANCED, or an unevaluated rule could matter |
+| | Inspector (only with ENHANCED) | Inspector ECR scanning not ENABLED; repository coverage INACTIVE | account status cannot be read |
+| IAM | Push/scan and deploy role | absent; same name at another path | cannot be read |
+| | … trust | any trust path beyond this repository + the role's context: wildcard or missing `sub`, org-wide, other repo/branch/environment, `pull_request`, wrong/missing audience, wrong provider, `*` or cross-account principal, unsupported operator (WARN: exact `StringLike`, immutable-format IDs unverified, narrowing extra conditions) | the role is unavailable |
+| | … permissions | a needed action not granted, or granted but denied by simulation; a forbidden one granted **or possibly granted** — conditionally, through `NotAction`/`NotResource`, or despite a conditional Deny (push role reaching SSM, deploy role writing ECR, other repository/instance, `iam:PassRole`); `*:*`, or `Allow` + `NotAction` on every resource (possible administrator) | a policy cannot be read; a needed action is granted only conditionally or through `NotAction`/`NotResource`; with an unknown scan type, the Inspector statement is missing |
+| SSM | Instance | absent; another account; not running | cannot be read |
+| | Managed instance Online | not managed by SSM; PingStatus ≠ Online | cannot be read |
+| | Instance role (ECR pull) | no profile; profile in another account or without exactly one role; no ECR login/pull on the repository (a **proposed** policy is printed, never attached) | cannot be read |
+| Ownership | per resource | configured `managed`, but the resource exists and is not owned | the stack lookup is denied |
+
+Role contexts: push+scan trusts only `ref:refs/heads/<repository.defaultBranch>`;
+deploy trusts only `environment:<delivery.environment>` (with no environment it
+trusts the default branch, and WARNs that no reviewer can gate it). Trust and
+permission results are **policy-document analysis**; where the operator may call
+`iam simulate-principal-policy`, simulation is consulted too and the basis says
+so. Neither is runtime proof: SCPs, resource policies, session policies and VPC
+endpoint policies can still deny.
+
+**Access denied is never absence.** Only the not-found code AWS returns for
+that specific call makes a resource `absent`; a denial, throttle, timeout or
+malformed response is NOT VERIFIED.
+
+**Ownership: existence is not ownership.** ssd-onboard's stacks have derived
+names (never configured):
+
+| Scope | Stack name |
+| --- | --- |
+| per repository | `ssd-delivery-<owner>-<repo>-<h8>` — lower-cased, other characters → `-`; `<h8>` = first 8 hex of sha256(`github.com/<owner>/<repo>` lower-cased), so `acme/my.app` and `acme/my-app` differ while `Acme/App` and `acme/app` (one GitHub repository) agree |
+| shared: GitHub OIDC provider | `ssd-shared-github-oidc` |
+| shared: ECR registry scanning | `ssd-shared-ecr-scanning` |
+
+The name only **locates** the owner; it is not proof. Stacks are regional while
+IAM roles and the OIDC provider are global; ssd-onboard's stacks live in
+`delivery.aws.region`, only that region is searched, and every ownership
+conclusion names it. A resource is reported
+`managed` only if CloudFormation, in `delivery.aws.region`, lists it as a
+physical resource of the expected type of **exactly that stack**, the stack is
+in a settled, successful state (`CREATE_COMPLETE`, `UPDATE_COMPLETE`,
+`UPDATE_ROLLBACK_COMPLETE`, `IMPORT_COMPLETE`, `IMPORT_ROLLBACK_COMPLETE`), and
+its tags are `ssd:framework=ssd-security-framework`, `ssd:managed-by=ssd-onboard`,
+`ssd:environment=production` and (per repository)
+`ssd:consumer-repository=<owner>/<repo>` lower-cased. A correctly tagged
+ssd-onboard stack with any other name is not the owner. Anything else that exists
+is `exists, not owned` — expected for `existing`, a **FAIL** for `managed` (it
+will never be adopted by name). A resource owned by an ssd-onboard stack but
+configured `existing` is a WARN.
+
+Outcomes and exit codes. Every check carries `required` (in JSON); the human
+output appends **(advisory)** to a non-PASS check whose `required` is false, and
+the result line splits NOT VERIFIED into required and advisory:
+
+| Condition | Outcome | Exit |
+| --- | --- | --- |
+| any FAIL | `BLOCKED` | 1 |
+| a **required** check is NOT VERIFIED | `NOT VERIFIED` | 1 |
+| only WARN and/or **advisory** NOT VERIFIED | `READY WITH WARNINGS` | 0 |
+| everything PASS | `READY` | 0 |
+| cannot start (no config, non-ECR profile, no AWS CLI, no credentials, timeout) | `ERROR` | 1 |
+| usage error | — | 2 |
+
+Advisory checks are exactly: *Subject format* (cannot be proven from AWS),
+*Tag immutability* (informational; the repository itself is required), and
+*Ownership* of a resource configured `existing`. Ownership of a `managed`
+resource, and every other check — identity, OIDC provider, ECR repository,
+scanning coverage, Inspector, roles, trust, permissions, SSM — is required, so
+an access denial on any of them exits 1.
+
+```
+GitHub OIDC
+  ✓ PASS          Provider
+  ? NOT VERIFIED  Subject format (advisory)
+…
+Result
+  ! READY WITH WARNINGS  0 FAIL · 0 WARN · 1 NOT VERIFIED (0 required, 1 advisory) · 20 PASS
+```
+
+`--json` prints one document:
+
+```json
+{
+  "schemaVersion": 1,
+  "command": "aws doctor",
+  "target": { "repository": "acme/app", "account": "012345678901", "region": "us-east-1", "regionSource": "config",
+              "caller": { "account": "012345678901", "arn": "arn:aws:sts::012345678901:assumed-role/ops/alice", "userId": "…", "kind": "assumed-role", "partition": "aws" } },
+  "outcome": "READY_WITH_WARNINGS",
+  "counts": { "PASS": 20, "WARN": 0, "FAIL": 0, "NOT VERIFIED": 1 },
+  "checks": [ { "id": "identity.account", "section": "Identity", "title": "Caller account", "status": "PASS", "required": true,
+                "basis": "runtime", "observed": ["…"], "expected": ["…"], "findings": [], "remediation": [] } ],
+  "skipped": null,
+  "awsCalls": ["sts get-caller-identity", "iam list-open-id-connect-providers", "…"]
+}
+```
+
+or, when it cannot run, `{"schemaVersion": 1, "command": "aws doctor",
+"target": …, "outcome": "ERROR", "error": {"kind": "configuration" |
+"command-unavailable" | "authentication" | "timeout" | "deadline" | "malformed-json" | …,
+"code": …, "message": …}}`.
+
+The operator needs read access only: `sts:GetCallerIdentity`,
+`iam:List/GetOpenIDConnectProvider(s)`, `iam:GetRole`, `iam:List/GetRolePolicy`,
+`iam:ListAttachedRolePolicies`, `iam:GetPolicy(Version)`,
+`iam:GetInstanceProfile`, optionally `iam:SimulatePrincipalPolicy`,
+`ecr:DescribeRepositories`, `ecr:GetLifecyclePolicy`, `ecr:GetRepositoryPolicy`,
+`ecr:ListTagsForResource`, `ecr:GetRegistryScanningConfiguration`,
+`inspector2:BatchGetAccountStatus`, `inspector2:ListCoverage`,
+`ssm:DescribeInstanceInformation`, `ec2:DescribeInstances`,
+`cloudformation:DescribeStackResources`, `cloudformation:DescribeStacks`. A
+missing one makes the affected check NOT VERIFIED, never FAIL-as-absent.
+
+## AWS plans: `aws plan` (Phase 2B)
+
+`aws plan` turns the configuration into a **reviewable plan**: it discovers the
+current state, renders a deterministic CloudFormation template, validates it,
+creates an **unexecuted** change set, describes exactly that change set and
+records everything locally. It creates plans, not infrastructure.
+
+```sh
+AWS_PROFILE=<operator-profile> node ssd-framework/onboarding/cli.mjs aws plan --repo <consumer-repo>
+AWS_PROFILE=<operator-profile> node ssd-framework/onboarding/cli.mjs aws plan --scope shared --repo <consumer-repo>
+```
+
+**What it changes.**
+
+| Mutated | Not mutated |
+| --- | --- |
+| `.ssd/aws-plans/<plan-id>/` in the consumer repository (its only repository write) | `.ssd/onboarding.yml`, workflows, any other repository file |
+| an **unexecuted** CloudFormation change set per planned stack | stacks, IAM roles, the OIDC provider, ECR repositories, registry scanning, Inspector, SSM, Secrets Manager, GitHub |
+| for a `CREATE`, a **`REVIEW_IN_PROGRESS` placeholder stack** with no resources, which CloudFormation creates to hold the change set; it stays until the change set is executed (Phase 2C) or someone deletes it | |
+
+`aws plan` cannot execute a change set: its AWS wrapper has a separate
+**planning allowlist** — the read-only operations of `aws doctor` plus exactly
+`cloudformation validate-template`, `create-change-set`, `describe-change-set`
+and `describe-stack-resources --stack-name`. `execute-change-set`,
+`create/update/delete-stack`, `delete-change-set` and every IAM/ECR/Inspector/
+SSM/Secrets Manager mutation are refused before anything runs. On
+`create-change-set` the values are checked too: the type is `CREATE` or
+`UPDATE` (never `IMPORT`), the stack name is one of the derived names, the
+change-set name is `ssd-plan-<plan-id>`, the capability is only
+`CAPABILITY_NAMED_IAM`, the tags are only the SSD ownership tags, and the
+template is inline JSON (`--template-body`, never a path or URL).
+`--resources-to-import`, `--import-existing-resources`, `--template-url`,
+`--role-arn` and `--notification-arns` cannot be sent. `aws doctor` keeps the
+Phase 2A read-only allowlist unchanged.
+
+**Order** (each step blocks the next):
+
+1. the framework checkout must be **clean**, at **exactly** `framework.ref`,
+   with origin `framework.repository` (the rule `render` uses) — otherwise AWS
+   is not contacted;
+2. region: `--region` or `delivery.aws.region`, never the CLI default; a
+   disagreeing `--region` blocks before AWS is contacted;
+3. `sts get-caller-identity`: the configured account, never the root user —
+   otherwise nothing else is read and no change set is created;
+4. discovery and ownership for each stack; **any FAIL blocks the whole run
+   before any change set is created**;
+5. render, assert the scope boundary on the template, derive the plan id and
+   prove `.ssd/aws-plans/<plan-id>/` free and confinable;
+6. `validate-template`, `create-change-set`, poll `describe-change-set`
+   (1 s, 2 s, 3 s, 5 s, 8 s, then 10 s, within the run's 300 s budget);
+   classify the changes and assert the scope boundary again;
+7. write the plan directory.
+
+**Scopes.** One plan id = one stack = one change set.
+
+| Scope | Stack | Contains | Never contains |
+| --- | --- | --- | --- |
+| `repo` (default) | `ssd-delivery-<display>-<h8>` | the ECR repository, the push+scan role, the deploy role — **only** those configured `managed` | the OIDC provider, registry scanning, Inspector, break-glass |
+| `shared` | `ssd-shared-github-oidc` | the GitHub OIDC provider, when `delivery.oidcProvider: managed` | any ECR repository or IAM role |
+
+`--scope shared` reports the registry scanning configuration but never plans
+it in Phase 2B. With `delivery.registryScanning: existing` the plan shows
+coverage for this repository and, when it is missing, the proposed
+configuration: **current rules + one filter** for this repository (scan type
+unchanged; existing rules and filters kept in order). With `managed` the run
+blocks: `AWS::ECR::RegistryScanningConfiguration` is a registry-wide singleton
+that replaces the whole configuration, cannot express `MANUAL` rules, may
+enable or disable Inspector as a side effect, cannot be tagged, and has
+undocumented create semantics on an already configured registry. Inspector
+enablement has no CloudFormation resource type: it is reported as a
+prerequisite, never planned.
+
+**Ownership.** The Phase 2A model, unchanged: a resource is ssd-onboard's only
+as a physical resource of the exact expected stack, in `delivery.aws.region`,
+settled and SSD-tagged. A resource that exists but is not owned — by name, ARN
+or SSD-looking tags alone — **blocks** the plan (`exists-not-owned`); nothing
+is adopted, and a future CloudFormation import flow would be needed. The change
+set type is:
+
+| Expected stack | Change set |
+| --- | --- |
+| absent | `CREATE` |
+| `REVIEW_IN_PROGRESS`, SSD-tagged (an earlier unexecuted plan's placeholder) | `CREATE` |
+| settled and successful, SSD-tagged | `UPDATE` |
+| anything else (untagged, another consumer, failed, in progress) | blocked — never `UPDATE` |
+
+An `existing` resource is discovered but never in the template. If the stack
+still holds it (switched from `managed`), the plan shows a `DELETE`.
+
+**Unmanaged policies on an owned role block.** A `managed` role that the stack
+already owns may carry exactly one policy: the stack's own inline policy
+(`ssd-push-scan` / `ssd-deploy`). A managed policy attached directly to the
+role, or any other inline policy, means its effective permissions differ from
+the reviewed template and change set, so planning is **refused** and each
+policy is named (ARN for a managed policy, name for an inline one). A policy
+list that cannot be read completely is refused the same way. ssd-onboard never
+detaches or edits anything: remove the attachment manually, or adopt/model it
+explicitly in a future workflow.
+
+**Templates** are JSON, deterministic (same configuration + framework commit →
+byte-identical; no timestamp, caller, host or user), and every resource carries
+`DeletionPolicy: Retain` and `UpdateReplacePolicy: Retain` plus the SSD tags
+(`ssd:framework`, `ssd:managed-by`, `ssd:environment=production`, and
+`ssd:consumer-repository` per repository). A `DELETE` therefore removes the
+resource from the stack but keeps it, and a `REPLACE` keeps the old one — both
+are still classified and shown as **destructive**. The ECR repository is
+`IMMUTABLE` with repository-level scan-on-push and no lifecycle policy. Role
+trust is built by `policy/trust.mjs` (exact `StringEquals` subject
+`repo:<owner>/<repo>:ref:refs/heads/<default branch>` for push+scan,
+`…:environment:<delivery.environment>` for deploy, `aud = sts.amazonaws.com`,
+this account's provider) and must be **accepted without a warning** by the same
+evaluator `aws doctor` uses; with no `delivery.environment` the deploy role
+trusts the default branch (a WARN, as in doctor). Permissions are built from
+the same requirement list `aws doctor` checks and must **PASS** its analysis.
+The subject format GitHub issues is NOT VERIFIED (no GitHub call); immutable-ID
+subjects are never generated.
+
+**Change sets.** `CREATE_COMPLETE` is a plan; `FAILED` with CloudFormation's
+no-change reason is recorded as `outcome: no-changes` (exit 0, never
+applicable); any other `FAILED`, an unexpected status, a `Dynamic`/`Import`/
+unknown action, or a described change set that is not exactly the one created
+(name, id, tags, capabilities, no parameters, no nested stacks, no import of
+existing resources, no pagination) fails the run. A conditional replacement is
+counted as `REPLACE`. Human output lists `+ CREATE`, `~ UPDATE`, `- DELETE`,
+`! REPLACE`, and a separate **Destructive** section with the exact count. IAM
+roles get a semantic diff (principals, subjects, audiences, actions,
+resources, and grants an action/resource list would hide), not raw JSON.
+
+**Plan id** = sha256 of the canonical JSON of: account, region, scope, stack
+kind and name, change-set type, **base stack** (`{"state":"absent"}` or
+`{"state":"present","stackId","stackStatus","lastUpdatedTime"}`), template,
+parameter and tag sha256s, capabilities, `framework.repository`/`framework.ref`
+and the consumer repository. No timestamp of ours, random value, caller session
+or host. The same plan against a newer stack revision is a different plan.
+
+**Plan directory** `.ssd/aws-plans/<plan-id>/`: `template.json`,
+`parameters.json` (`[]`: templates take no parameters), `change-set.json`
+(the `describe-change-set` document), `policies.json` (IAM before/after and the
+semantic diff), and `plan.json` (account, region, caller ARN, stack, change-set
+ARN, base stack, hashes, framework, `createdFromConfigDigest`, changes, counts,
+destructive count, the plan-id input and every file's sha256). It is created
+through the same confinement as every other write (no `..`, no symbolic link),
+**exclusively** — an existing directory is never overwritten — and `plan.json`
+is written **last**: a directory without a consistent `plan.json` is
+incomplete and never applicable. Before anything is written, every file is
+checked for credential shapes (AWS keys, session tokens, JWTs, Slack webhooks,
+GitHub tokens, PEM keys, the values of the credential environment variables);
+a match refuses the plan — nothing is redacted and kept.
+
+| Condition | Outcome | Exit |
+| --- | --- | --- |
+| change sets created | `PLANNED` | 0 |
+| every change set reported no changes | `NO_CHANGES` | 0 |
+| nothing in the scope is managed | `NOTHING_TO_PLAN` | 0 |
+| a precondition failed (framework, region, identity, ownership, collision, …) | `BLOCKED` | 1 |
+| run-ending failure (credentials, deadline, malformed AWS output, template rejected, scope violation, unsafe path, credential-like data, plan exists) | `ERROR` | 1 |
+
+In addition to `aws doctor`'s read access, the operator needs
+`cloudformation:ValidateTemplate`, `cloudformation:CreateChangeSet`,
+`cloudformation:DescribeChangeSet` and `cloudformation:DescribeStacks`/
+`DescribeStackResources`. CloudFormation computes a change set without creating
+the resources it describes; executing it (Phase 2C) needs those permissions.
 
 ## The rollout, end to end
 

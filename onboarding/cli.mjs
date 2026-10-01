@@ -1,10 +1,15 @@
 #!/usr/bin/env node
 // ssd-onboard — configuration-driven consumer onboarding (Phase 1).
 //
-// TRUST BOUNDARY: this program edits files in the consumer repository only. It
-// makes no AWS calls and no GitHub mutations. The only external programs it runs
-// are `git` (read-only) and, for `baseline prepare --run`, `gh api` (GET) and
-// `gh run download` — enforced by the allowlist in ghReadOnly().
+// TRUST BOUNDARY: the repository commands edit files in the consumer repository
+// only. They make no AWS calls and no GitHub mutations. The only external
+// programs they run are `git` (read-only) and, for `baseline prepare --run`,
+// `gh api` (GET) and `gh run download` — enforced by the allowlist in
+// ghReadOnly().
+//
+// `aws …` is a SEPARATE trust boundary (Phase 2): it is dispatched before any
+// repository option parsing, through a dynamic import of ./aws/cli.mjs, so no
+// repository command's module graph contains the AWS executor.
 import { execFile } from 'node:child_process';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -70,8 +75,14 @@ Repository commands (edit files in the consumer repository only; no AWS, no GitH
   promote --enforce [--yes]
                           move log-only -> enforce (requires an accepted baseline)
 
-Cloud commands (Phase 2/3 — designed, not implemented):
-  aws doctor|plan|apply|verify
+Cloud commands (Phase 2 — a separate trust boundary: the operator's ambient AWS CLI
+credentials; see \`aws --help\`):
+  aws doctor [--region <r>] [--json]
+                          READ-ONLY AWS readiness: identity, OIDC, ECR, IAM, SSM, ownership
+  aws plan [--scope repo|shared] [--region <r>] [--json]
+                          UNEXECUTED CloudFormation change sets + .ssd/aws-plans/<plan-id>/
+                          (its only repository write); never executes them
+  aws apply|verify        designed, not implemented
 
 Common options:
   --repo <dir>            consumer repository root (default: current directory)
@@ -859,6 +870,10 @@ export async function main(argv, io = {}) {
   const { out, err } = context;
   try {
     const [command, ...args] = argv;
+    if (command === 'aws') {
+      const { awsMain } = await import('./aws/cli.mjs');
+      return await awsMain(args, context);
+    }
     const { values, positionals } = parseArgs({ args, options: OPTIONS, allowPositionals: true, strict: true });
     if (!command || values.help || command === 'help') {
       out(USAGE);
@@ -883,11 +898,10 @@ export async function main(argv, io = {}) {
         return await cmdBaseline(root, positionals[0], values, context);
       case 'promote':
         return await cmdPromote(root, values, context);
-      case 'aws':
       case 'github':
         err(
-          `'ssd-onboard ${command}' is Phase ${command === 'aws' ? '2/3' : '2'} and is not implemented in this version.\n` +
-            'Its reviewed design is in docs/onboarding-architecture.md (Parts D and E). Nothing was contacted.'
+          "'ssd-onboard github' is Phase 2E and is not implemented in this version.\n" +
+            'Its reviewed design is in docs/onboarding-architecture.md (Part D.8). Nothing was contacted.'
         );
         return 2;
       default:

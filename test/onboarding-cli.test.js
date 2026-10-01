@@ -698,14 +698,17 @@ describe('Phase 1 makes no AWS calls and no GitHub mutations', () => {
     assert.deepEqual(shimCalls().slice(before), []);
   });
 
-  it('the aws and github commands are not implemented and contact nothing', async (t) => {
+  it('aws apply/verify and the github commands are not implemented and contact nothing', async (t) => {
     const before = shimCalls().length;
     const root = makeRepo(t, PY_REPO);
-    for (const args of [['aws', 'doctor'], ['aws', 'apply'], ['github', 'apply']]) {
+    for (const args of [['aws', 'apply'], ['aws', 'verify'], ['github', 'apply']]) {
       const result = await cli(root, args);
       assert.equal(result.code, 2);
       assert.match(result.err, /not implemented/);
     }
+    // aws plan (Phase 2B) exists; without a configuration it stops before AWS.
+    const plan = await cli(root, ['aws', 'plan']);
+    assert.equal(plan.code, 1);
     assert.deepEqual(shimCalls().slice(before), []);
   });
 
