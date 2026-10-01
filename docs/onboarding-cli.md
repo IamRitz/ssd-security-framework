@@ -8,11 +8,17 @@ hand-editing YAML.
 Design record and gap analysis: [onboarding-architecture.md](onboarding-architecture.md).
 The manual procedure it automates: [onboarding.md](onboarding.md).
 
-> **Phase 1 boundary.** `ssd-onboard` edits files in the consumer repository and
-> nothing else. It makes **no AWS calls** and **no GitHub mutations**: it runs
-> `git` read-only and, for `baseline prepare --run`, `gh api` (GET) and
-> `gh run download` behind an allowlist. The `aws` and `github` commands are
-> designed (architecture doc, Parts D–E) but not implemented, and exit 2.
+> **Phase 1 boundary.** The repository commands edit files in the consumer
+> repository and nothing else. They make **no AWS calls** and **no GitHub
+> mutations**: they run `git` read-only and, for `baseline prepare --run`,
+> `gh api` (GET) and `gh run download` behind an allowlist.
+>
+> **Phase 2 boundary.** `aws doctor` is a separate, **read-only** command that
+> talks to AWS with the operator's own AWS CLI credentials
+> ([§ AWS readiness](#aws-readiness-aws-doctor-phase-2a)). It writes no
+> repository file and makes no GitHub call. `aws plan|apply|verify` and the
+> `github` commands are designed (architecture doc, Parts D–E) but not
+> implemented, and exit 2.
 
 ## Obtaining ssd-onboard
 
@@ -114,6 +120,7 @@ the tools for everything after first onboarding.
 | `baseline prepare [--run <id>]` | `.ssd/candidates/` | print the bootstrap dispatch command, or fetch and verify its candidate |
 | `baseline accept` | baseline, config, workflow | accept the reviewed candidate (explicit confirmation) |
 | `promote --enforce` | config, workflows | log-only → enforce (requires an accepted baseline) |
+| `aws doctor [--region <r>] [--json]` | nothing (no AWS change either) | Phase 2A: read-only AWS readiness of the configured delivery (§ AWS readiness) |
 
 `--repo <dir>` points at the consumer repository (default: the current directory).
 Nothing is ever committed; every change is a diff for a pull request.
@@ -122,7 +129,7 @@ Nothing is ever committed; every change is a diff for a pull request.
 
 Human-readable output is presentation only: its layout may change between
 versions, and nothing should parse it. Scripts use `--json` (`inspect`,
-`validate`, `doctor`) and the exit code.
+`validate`, `doctor`, `aws doctor`) and the exit code.
 
 - **Color** is used only when the stream is an interactive terminal. Redirected
   or piped output, CI logs and `--json` are plain text. Color is also off when
@@ -178,8 +185,8 @@ typo cannot silently leave a repository in log-only. All scalars except
 | `trufflehog.excludePathsFile` | `''` | `''` = no exclusions; a path = newline-separated regexes |
 | `container.dockerfile` / `.context` / `.imageName` | detected / `.` / repo name | container profiles |
 | `delivery.aws.accountId` / `.region` | — | ECR profile |
-| `delivery.ecr.repository` / `.ownership` | image name / `existing` | `managed` is Phase 2 |
-| `delivery.oidcProvider` | `existing` | recorded for Phase 2 |
+| `delivery.ecr.repository` / `.ownership` | image name / `existing` | `managed` is Phase 2; `aws doctor` reports actual ownership |
+| `delivery.oidcProvider` | `existing` | ownership mode of the shared GitHub OIDC provider; `aws doctor` reports actual ownership |
 | `delivery.roles.pushScanRoleArn` / `deployRoleArn` | — | must differ; both in `accountId` |
 | `delivery.roles.*Ownership` | `existing` | `managed` is Phase 2 (the ARN is still required to render) |
 | `delivery.ssm.instanceId` / `.appPort` / `.containerName` | — / `3000` / image name | strict alphabets (they reach a root shell on the instance) |
@@ -283,7 +290,7 @@ it re-implements none of it — reported as one check per concern:
 | Semgrep / secret scanning / dependency coverage / container | the corresponding `validate` errors | WARN for its warnings |
 | CODEOWNERS coverage | | WARN on a missing file or path; otherwise **NOT VERIFIED** |
 | GitHub merge governance | | always **NOT VERIFIED** |
-| AWS delivery prerequisites (ECR profile), Slack secret (if enabled) | | always **NOT VERIFIED** |
+| AWS delivery prerequisites (ECR profile), Slack secret (if enabled) | | always **NOT VERIFIED** (for AWS, run `aws doctor`) |
 
 Every `validate` error appears as a FAIL of some check (an unknown one in
 "Other validation problems"), and doctor adds no FAIL of its own. **NOT
@@ -310,6 +317,135 @@ Remediation links to GitHub settings are shown only when origin is exactly
 `github.com` and names `repository.slug`; for any other host (GitHub
 Enterprise included) doctor gives the host-neutral steps (*repository
 settings → Rules → Rulesets*) without a link.
+
+## AWS readiness: `aws doctor` (Phase 2A)
+
+`doctor` never contacts AWS. `aws doctor` is the separately authenticated,
+**read-only** check of the AWS side of a `container-ecr-framework-gated`
+delivery. It reads `.ssd/onboarding.yml` (`delivery.*`, `repository.*`) and
+nothing else from the repository, writes nothing, and makes no GitHub call.
+
+```sh
+AWS_PROFILE=<operator-profile> node ssd-framework/onboarding/cli.mjs aws doctor --repo <consumer-repo>
+```
+
+**Credentials** come only from the AWS CLI's provider chain (profile, SSO,
+role credentials…). There is no option that takes a key; error text is reduced
+to the AWS error code and message with credential-shaped values redacted, and a
+credential failure prints no provider output at all.
+
+**Region**: `--region` if given, else `delivery.aws.region` — never the AWS
+CLI's default. A `--region` that differs from `delivery.aws.region` blocks
+before AWS is contacted.
+
+**Order**: `sts get-caller-identity` first. A caller in another account, or the
+account **root** user, blocks before any resource is read.
+
+**Read-only by construction**: every call goes through one wrapper
+(`execFile`, argv array, no shell) whose allowlist names each permitted
+`service operation` and its permitted parameters explicitly; anything else —
+every mutating verb, an unlisted read, `--endpoint-url`, `--profile`,
+`--debug`, `--cli-input-json` — is refused before it runs. There is no mutating
+wrapper in this version.
+
+| Section | Check | FAIL when | NOT VERIFIED when |
+| --- | --- | --- | --- |
+| Identity | Caller account / principal / region | wrong account; root user; `--region` ≠ config | |
+| GitHub OIDC | Provider | absent; another account; audience list lacks `sts.amazonaws.com` (WARN: extra audiences) | the provider cannot be read |
+| | Subject format | | **always** (not required): legacy vs immutable customization needs the GitHub API |
+| ECR | Repository | absent; public repository policy | cannot be read |
+| | Tag immutability | | (WARN when MUTABLE: deploys pin digests, but a tag can be repointed) |
+| | Registry scanning coverage | no rule scans the repository automatically (MANUAL is not coverage) | the configuration cannot be read, or an unevaluated rule could matter |
+| | Inspector (only with ENHANCED) | Inspector ECR scanning not ENABLED; repository coverage INACTIVE | account status cannot be read |
+| IAM | Push/scan and deploy role | absent; same name at another path | cannot be read |
+| | … trust | any trust path beyond this repository + the role's context: wildcard or missing `sub`, org-wide, other repo/branch/environment, `pull_request`, wrong/missing audience, wrong provider, `*` or cross-account principal, unsupported operator (WARN: exact `StringLike`, immutable-format IDs unverified, narrowing extra conditions) | the role is unavailable |
+| | … permissions | a needed action not granted, or granted but denied by simulation; a forbidden one granted (push role reaching SSM, deploy role writing ECR, other repository/instance, `iam:PassRole`, `*:*`) | a policy cannot be read |
+| SSM | Instance | absent; another account; not running | cannot be read |
+| | Managed instance Online | not managed by SSM; PingStatus ≠ Online | cannot be read |
+| | Instance role (ECR pull) | no profile; profile in another account or without exactly one role; no ECR login/pull on the repository (a **proposed** policy is printed, never attached) | cannot be read |
+| Ownership | per resource | | the stack lookup is denied |
+
+Role contexts: push+scan trusts only `ref:refs/heads/<repository.defaultBranch>`;
+deploy trusts only `environment:<delivery.environment>` (with no environment it
+trusts the default branch, and WARNs that no reviewer can gate it). Trust and
+permission results are **policy-document analysis**; where the operator may call
+`iam simulate-principal-policy`, simulation is consulted too and the basis says
+so. Neither is runtime proof: SCPs, resource policies, session policies and VPC
+endpoint policies can still deny.
+
+**Access denied is never absence.** Only the not-found code AWS returns for
+that specific call makes a resource `absent`; a denial, throttle, timeout or
+malformed response is NOT VERIFIED.
+
+**Ownership: existence is not ownership.** A resource is reported `managed`
+only if CloudFormation lists it as a physical resource of a live stack, of the
+expected type, whose tags are `ssd:framework=ssd-security-framework`,
+`ssd:managed-by=ssd-onboard`, `ssd:environment=production|synthetic` and (per
+repository) `ssd:consumer-repository=<owner>/<repo>`. Anything else that exists
+is `exists, not owned` — expected for `existing`, a WARN for `managed` (it will
+never be adopted by name).
+
+Outcomes and exit codes. Every check carries `required` (in JSON); the human
+output appends **(advisory)** to a non-PASS check whose `required` is false, and
+the result line splits NOT VERIFIED into required and advisory:
+
+| Condition | Outcome | Exit |
+| --- | --- | --- |
+| any FAIL | `BLOCKED` | 1 |
+| a **required** check is NOT VERIFIED | `NOT VERIFIED` | 1 |
+| only WARN and/or **advisory** NOT VERIFIED | `READY WITH WARNINGS` | 0 |
+| everything PASS | `READY` | 0 |
+| cannot start (no config, non-ECR profile, no AWS CLI, no credentials, timeout) | `ERROR` | 1 |
+| usage error | — | 2 |
+
+Advisory checks are exactly: *Subject format* (cannot be proven from AWS),
+*Tag immutability* (informational; the repository itself is required), and
+*Ownership* of a resource configured `existing`. Ownership of a `managed`
+resource, and every other check — identity, OIDC provider, ECR repository,
+scanning coverage, Inspector, roles, trust, permissions, SSM — is required, so
+an access denial on any of them exits 1.
+
+```
+GitHub OIDC
+  ✓ PASS          Provider
+  ? NOT VERIFIED  Subject format (advisory)
+…
+Result
+  ! READY WITH WARNINGS  0 FAIL · 0 WARN · 1 NOT VERIFIED (0 required, 1 advisory) · 20 PASS
+```
+
+`--json` prints one document:
+
+```json
+{
+  "schemaVersion": 1,
+  "command": "aws doctor",
+  "target": { "repository": "acme/app", "account": "012345678901", "region": "us-east-1", "regionSource": "config",
+              "caller": { "account": "012345678901", "arn": "arn:aws:sts::012345678901:assumed-role/ops/alice", "userId": "…", "kind": "assumed-role", "partition": "aws" } },
+  "outcome": "READY_WITH_WARNINGS",
+  "counts": { "PASS": 20, "WARN": 0, "FAIL": 0, "NOT VERIFIED": 1 },
+  "checks": [ { "id": "identity.account", "section": "Identity", "title": "Caller account", "status": "PASS", "required": true,
+                "basis": "runtime", "observed": ["…"], "expected": ["…"], "findings": [], "remediation": [] } ],
+  "skipped": null,
+  "awsCalls": ["sts get-caller-identity", "iam list-open-id-connect-providers", "…"]
+}
+```
+
+or, when it cannot run, `{"schemaVersion": 1, "command": "aws doctor",
+"target": …, "outcome": "ERROR", "error": {"kind": "configuration" |
+"command-unavailable" | "authentication" | "timeout" | "malformed-json" | …,
+"code": …, "message": …}}`.
+
+The operator needs read access only: `sts:GetCallerIdentity`,
+`iam:List/GetOpenIDConnectProvider(s)`, `iam:GetRole`, `iam:List/GetRolePolicy`,
+`iam:ListAttachedRolePolicies`, `iam:GetPolicy(Version)`,
+`iam:GetInstanceProfile`, optionally `iam:SimulatePrincipalPolicy`,
+`ecr:DescribeRepositories`, `ecr:GetLifecyclePolicy`, `ecr:GetRepositoryPolicy`,
+`ecr:ListTagsForResource`, `ecr:GetRegistryScanningConfiguration`,
+`inspector2:BatchGetAccountStatus`, `inspector2:ListCoverage`,
+`ssm:DescribeInstanceInformation`, `ec2:DescribeInstances`,
+`cloudformation:DescribeStackResources`, `cloudformation:DescribeStacks`. A
+missing one makes the affected check NOT VERIFIED, never FAIL-as-absent.
 
 ## The rollout, end to end
 

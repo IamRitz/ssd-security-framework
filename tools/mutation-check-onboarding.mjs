@@ -27,7 +27,12 @@ const TESTS = [
   'test/onboard.test.js',
   'test/onboarding-codeowners.test.js',
   'test/dependency-roots.test.js',
-  'test/cli-output.test.js'
+  'test/cli-output.test.js',
+  'test/aws-cli.test.js',
+  'test/aws-identity.test.js',
+  'test/aws-trust.test.js',
+  'test/aws-discovery.test.js',
+  'test/aws-doctor.test.js'
 ];
 
 // [invariant, file, search, replace]
@@ -162,7 +167,25 @@ const MUTATIONS = [
   ['output: an unknown status never looks like a pass', 'onboarding/lib/output.mjs', "const statusOf = (word) => STATUS[word] ?? { symbol: '?', tone: 'red' };", 'const statusOf = (word) => STATUS[word] ?? STATUS.PASS;'],
   ['output: a blocking issue is never rendered as a warning', 'onboarding/lib/report.mjs', "`Blocking issues (${result.errors.length})`, problemRows(result.errors, 'FAIL')", "`Blocking issues (${result.errors.length})`, problemRows(result.errors, 'WARN')"],
   ['output: --json never passes through the human renderer', 'onboarding/cli.mjs', "    json: (value) => rawOut(`${JSON.stringify(value, null, 2)}\\n`)", '    json: (value) => rawOut(format(dim(JSON.stringify(value, null, 2)), outStyle))'],
-  ['output: the prompter sanitizes what it echoes', 'onboarding/lib/prompt.mjs', '      output.write(`${sanitize(text)}\\n`);', '      output.write(`${text}\\n`);']
+  ['output: the prompter sanitizes what it echoes', 'onboarding/lib/prompt.mjs', '      output.write(`${sanitize(text)}\\n`);', '      output.write(`${text}\\n`);'],
+  // Phase 2A: aws doctor (read-only AWS readiness).
+  ['an AWS root principal is never accepted', 'onboarding/aws/identity.mjs', "const root = caller.kind === 'root';", 'const root = false;'],
+  ['an account mismatch cannot PASS', 'onboarding/aws/identity.mjs', 'const ok = caller.account === expectedAccount;', 'const ok = true;'],
+  ['a region mismatch cannot PASS', 'onboarding/aws/identity.mjs', 'const mismatch = resolved.source === \'flag\' && resolved.configured && resolved.configured !== resolved.region;', 'const mismatch = false;'],
+  ['a region mismatch contacts no AWS', 'onboarding/aws/doctor.mjs', '  if (regionC.status === FAIL) {', '  if (false) {'],
+  ['an identity failure stops the run before discovery', 'onboarding/aws/doctor.mjs', '  if (identity.some((c) => c.status === FAIL)) {', '  if (false) {'],
+  ['a mutating AWS call cannot pass the read-only allowlist', 'onboarding/aws/aws-cli.mjs', '    assertReadOnly(argv);\n', ''],
+  ['a caller cannot add unlisted AWS CLI parameters (endpoint, profile, debug)', 'onboarding/aws/aws-cli.mjs', '    if (!Object.hasOwn(flags, flag) || WRAPPER_FLAGS.includes(flag)) {', '    if (WRAPPER_FLAGS.includes(flag)) {'],
+  ['a wildcard OIDC subject is never accepted', 'onboarding/aws/policy/trust.mjs', "  return { severity: 'FAIL', kind, message: `subject pattern", "  return { severity: 'WARN', kind, message: `subject pattern"],
+  ['a wrong trust audience is never accepted', 'onboarding/aws/policy/trust.mjs', "(value) => (value === STS_AUDIENCE ? [] :", '(value) => (true ? [] :'],
+  ['an OIDC provider without the sts audience cannot PASS', 'onboarding/aws/doctor.mjs', '  if (!p.clientIds.includes(STS_AUDIENCE)) {', '  if (false) {'],
+  ['a name-only resource is never managed', 'onboarding/aws/discover/stacks.mjs', "    return { ownership: 'exists-not-owned', reasons, stack: null };", "    return { ownership: 'managed', reasons, stack: null };"],
+  ['a stack for another consumer is never managed', 'onboarding/aws/discover/stacks.mjs', "  if (scope === 'repo' && consumer !== slug) {", '  if (false) {'],
+  ['access denied is never resource-absent', 'onboarding/aws/discover/result.mjs', "    if (error.kind === 'not-found' && notFound.includes(error.code)) {", "    if (error.kind === 'not-found' || error.kind === 'authorization') {"],
+  ['an Offline SSM node cannot PASS', 'onboarding/aws/doctor.mjs', "  const online = result.value.pingStatus === 'Online';", '  const online = true;'],
+  ['a required NOT VERIFIED check blocks readiness', 'onboarding/aws/doctor.mjs', '  if (checks.some((c) => c.status === NOT_VERIFIED && c.required)) {', '  if (false) {'],
+  ['an AWS prerequisite is required unless explicitly advisory', 'onboarding/aws/doctor.mjs', "  return { id, section, title, status: PASS, required: true,", "  return { id, section, title, status: PASS, required: false,"],
+  ['a registry rule for another repository does not cover it', 'onboarding/aws/discover/ecr.mjs', '      if (!wildcardFilterMatches(f.filter, repository)) {', '      if (false) {'],
 ];
 
 // Temp-workspace lifecycle

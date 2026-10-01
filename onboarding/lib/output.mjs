@@ -85,13 +85,15 @@ export const STATUS = Object.freeze({
 });
 const STATUS_WIDTH = Math.max(...Object.keys(STATUS).map((word) => word.length));
 
-// Overall results. The doctor outcomes are its JSON `outcome` values, verbatim.
+// Overall results. The doctor outcomes are its JSON `outcome` values, verbatim;
+// `aws doctor` maps its JSON outcomes onto these words (aws/report.mjs).
 export const OUTCOME = Object.freeze({
   READY: 'PASS',
   'READY WITH WARNINGS': 'WARN',
   BLOCKED: 'FAIL',
   'READY (LOCAL CHECKS)': 'PASS',
-  'NOT READY': 'FAIL'
+  'NOT READY': 'FAIL',
+  'NOT VERIFIED': 'NOT VERIFIED'
 });
 
 // Generated-file plan actions (files.mjs) and stale files.

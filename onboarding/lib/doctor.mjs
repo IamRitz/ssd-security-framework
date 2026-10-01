@@ -437,7 +437,7 @@ function awsCheck(config) {
   const d = config.delivery;
   return check('aws-delivery', 'AWS delivery prerequisites', {
     status: NOT_VERIFIED,
-    observed: ['not checked: doctor makes no AWS calls (`ssd-onboard aws doctor` is Phase 2 and not implemented)'],
+    observed: ['not checked: doctor makes no AWS calls (run `ssd-onboard aws doctor` with separately authenticated AWS credentials)'],
     expected: [
       `GitHub OIDC provider in account ${d.aws.accountId} (${d.oidcProvider})`,
       `ECR repository ${d.ecr.repository} in ${d.aws.region}`,
@@ -446,7 +446,7 @@ function awsCheck(config) {
       `SSM-managed instance ${d.ssm.instanceId}`
     ],
     why: 'the delivery workflow assumes these exist and trust only this repository; a missing or over-trusting role breaks delivery or its isolation.',
-    remediation: ['Verify each resource and its trust policy in the AWS account (docs/aws-setup.md).']
+    remediation: ['Run `ssd-onboard aws doctor` (read-only) as an operator authenticated to the account, or verify each resource and its trust policy by hand (docs/aws-setup.md).']
   });
 }
 

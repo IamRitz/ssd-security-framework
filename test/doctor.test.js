@@ -611,11 +611,13 @@ describe('doctor: command behaviour', () => {
     assert.match(result.err, /Usage:/);
   });
 
-  it('`aws doctor` is still Phase 2: not implemented, contacts nothing', async (t) => {
+  it('`aws plan` is still Phase 2B: not implemented, contacts nothing', async (t) => {
     const root = await consumer(t);
-    const result = await cli(root, ['aws', 'doctor']);
+    const before = shimCalls().length;
+    const result = await cli(root, ['aws', 'plan']);
     assert.equal(result.code, 2);
     assert.match(result.err, /not implemented/);
+    assert.deepEqual(shimCalls().slice(before), []);
   });
 
   it('doctor imports no write-side helper and no filesystem or process API', () => {

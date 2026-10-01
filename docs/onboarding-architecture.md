@@ -631,8 +631,11 @@ Both are Phase 2 concerns (D.4, D.5).
 
 ## Part D — Phase 2: `aws doctor / plan / apply / verify`
 
-Not implemented. `ssd-onboard aws …` currently exits with status 2 and a pointer
-here. This is the reviewed design.
+**Phase 2A (`aws doctor`) is implemented** — see [D.10](#d10-phase-2a-as-implemented)
+and [onboarding-cli.md § AWS readiness](onboarding-cli.md#aws-readiness-aws-doctor-phase-2a).
+`aws plan`, `aws apply`, `aws verify` and the `github` commands are **designed,
+not implemented**: they exit with status 2 and contact nothing. This is the
+reviewed design.
 
 ### D.1 Command contract
 
@@ -778,6 +781,50 @@ recorded responses; managed-vs-existing (name-only matches are never managed); n
 repo-scope plan touches registry scanning; trust policies are repo/branch/
 environment scoped (evaluator); invoker least privilege via recorded
 `simulate-principal-policy` results; no secret values in templates, plans or logs.
+
+### D.10 Phase 2A as implemented
+
+What exists, and where it refines D.1–D.6:
+
+- **Dispatch.** `cli.mjs` routes `aws` before any repository option parsing,
+  through a *dynamic* import of `onboarding/aws/cli.mjs`. The static module graph
+  of every repository command therefore contains no AWS code (asserted by
+  `test/aws-doctor.test.js`).
+- **Modules.** `aws/aws-cli.mjs` (the only process execution), `identity.mjs`,
+  `doctor.mjs` (orchestration + pure checks), `report.mjs` (presentation through
+  `lib/output.mjs`), `discover/{oidc-provider,ecr,inspector,iam-role,ssm,stacks,result}.mjs`,
+  `policy/{evaluate,trust,permissions}.mjs`. `plan.mjs`, `apply.mjs` and
+  `templates/` do not exist yet.
+- **Allowlist (refines D.1).** Not verb prefixes: an explicit map of
+  `service → operation → permitted flags`. Every flag takes exactly one value
+  that must not look like an option; lists are passed as one JSON argv element.
+  The wrapper appends `--region <r> --output json --no-cli-pager` itself and sets
+  `AWS_PAGER=''`, `AWS_CLI_AUTO_PROMPT=off`, `AWS_IGNORE_CONFIGURED_ENDPOINT_URLS=true`.
+  `cloudformation create-change-set` / `validate-template` are **not** allowed
+  yet; Phase 2B adds a separate plan allowlist rather than widening doctor's.
+- **Discovery results** are `present | absent | unverified`; `absent` requires
+  the specific not-found code for that call (e.g. `NoSuchEntity`,
+  `RepositoryNotFoundException`, CloudFormation's `Stack for … does not exist`).
+- **Outcomes.** `BLOCKED` (any FAIL) and `NOT_VERIFIED` (a check with
+  `required: true` could not be proven) exit 1; `READY_WITH_WARNINGS` (WARN, or
+  NOT VERIFIED only on `required: false` checks) and `READY` exit 0; `ERROR`
+  (could not run) exits 1. Advisory checks are only the subject format, tag
+  immutability and `existing`-mode ownership; human output labels them
+  "(advisory)". Checks name their basis: `runtime`, `configuration`,
+  `policy-document`, `policy-document+simulation`, `policy-document+runtime`.
+- **Subject format (D.4).** Always NOT VERIFIED and not `required`: doctor makes
+  no GitHub call. The trust evaluator accepts the legacy format by exact match
+  and the immutable format only with a WARN that the IDs are unverified.
+- **Scanning mode.** No config field declares BASIC vs ENHANCED; the registry's
+  own `scanType` decides whether Inspector is checked and whether the push role
+  needs the `inspector2` statement. No schema change was needed for Phase 2A.
+- **`ssd:environment` (D.2)** is the stack's `production|synthetic` class, not
+  `delivery.environment` (the GitHub environment); ownership requires one of the
+  two values but cannot match it to config (no field records it).
+- **SSM (D.6).** The instance role is found through `ec2 describe-instances` →
+  instance profile → its single role, never by name. `Online` is runtime proof
+  of SSM core; ECR login + pull on the repository is analysed, and a missing
+  grant prints a proposed policy for the role owner.
 
 ---
 

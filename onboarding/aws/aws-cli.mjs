@@ -1,0 +1,286 @@
+// The ONE way ssd-onboard runs the AWS CLI.
+//
+// TRUST BOUNDARY (Phase 2A): every call here is READ-ONLY by construction.
+//
+//   - there is no mutating wrapper in this milestone: readOnlyAws() is the only
+//     factory, and it refuses — BEFORE anything is executed — any argv that is
+//     not an explicitly listed (service, operation) pair called with only that
+//     operation's listed flags. Nothing is allowed by verb prefix, so a
+//     `get-`/`list-`/`describe-` name that mutates cannot slip through, and an
+//     unlisted read is refused as firmly as a write;
+//   - global options that change where, how or as whom a call runs
+//     (--endpoint-url, --profile, --debug, --no-verify-ssl, --cli-input-json …)
+//     are never accepted from a caller. The wrapper itself appends exactly
+//     `--region <r> --output json --no-cli-pager`;
+//   - execFile with an argv array and shell: false: repository- and
+//     AWS-controlled strings are separate argv elements and never reach a shell;
+//   - bounded output buffer and a deterministic timeout;
+//   - credentials come only from the AWS CLI's own provider chain. Nothing here
+//     reads, accepts or prints an access key; error text is reduced to the AWS
+//     error code and message, with credential-shaped values and the values of
+//     the credential environment variables redacted, and authentication
+//     failures carry NO provider output at all (a credential_process may print
+//     anything).
+import { execFile } from 'node:child_process';
+
+// service -> operation -> the flags it may be called with. A flag listed with
+// `true` takes a value; `false` is a bare switch. Anything absent is refused.
+export const READ_ONLY_OPERATIONS = Object.freeze({
+  sts: {
+    'get-caller-identity': {}
+  },
+  iam: {
+    'list-open-id-connect-providers': {},
+    'get-open-id-connect-provider': { '--open-id-connect-provider-arn': true },
+    'get-role': { '--role-name': true },
+    'list-role-policies': { '--role-name': true },
+    'get-role-policy': { '--role-name': true, '--policy-name': true },
+    'list-attached-role-policies': { '--role-name': true },
+    'get-policy': { '--policy-arn': true },
+    'get-policy-version': { '--policy-arn': true, '--version-id': true },
+    'get-instance-profile': { '--instance-profile-name': true },
+    'simulate-principal-policy': { '--policy-source-arn': true, '--action-names': true, '--resource-arns': true }
+  },
+  ecr: {
+    'describe-repositories': { '--registry-id': true, '--repository-names': true },
+    'get-lifecycle-policy': { '--registry-id': true, '--repository-name': true },
+    'get-repository-policy': { '--registry-id': true, '--repository-name': true },
+    'get-registry-scanning-configuration': {},
+    'list-tags-for-resource': { '--resource-arn': true }
+  },
+  inspector2: {
+    'batch-get-account-status': { '--account-ids': true },
+    'list-coverage': { '--filter-criteria': true }
+  },
+  ssm: {
+    'describe-instance-information': { '--filters': true }
+  },
+  ec2: {
+    'describe-instances': { '--instance-ids': true }
+  },
+  cloudformation: {
+    'describe-stack-resources': { '--physical-resource-id': true },
+    'describe-stacks': { '--stack-name': true }
+  }
+});
+
+// Appended by the wrapper, so never accepted from a caller.
+const WRAPPER_FLAGS = ['--region', '--output', '--no-cli-pager'];
+
+export const DEFAULT_TIMEOUT_MS = 60_000;
+export const DEFAULT_MAX_BUFFER = 16 * 1024 * 1024;
+
+// --- errors ------------------------------------------------------------------------
+
+// kind is the machine taxonomy the doctor decides from:
+//   refused              the allowlist rejected the argv; nothing was executed
+//   command-unavailable  no `aws` executable
+//   authentication       no/expired/invalid credentials
+//   authorization        the caller is not allowed to make this call
+//   not-found            AWS says the named resource does not exist
+//   malformed-json       the CLI exited 0 but did not print one JSON document
+//   timeout              the call did not finish in time
+//   output-too-large     the CLI printed more than the buffer allows
+//   aws-error            any other AWS/CLI failure (code kept when parseable)
+export class AwsCliError extends Error {
+  constructor(kind, message, { code = null, operation = null } = {}) {
+    super(message);
+    this.name = 'AwsCliError';
+    this.kind = kind;
+    this.code = code;
+    this.operation = operation;
+  }
+}
+
+// AWS error codes, by kind. Anything unlisted stays `aws-error`.
+const AUTHENTICATION_CODES = new Set([
+  'ExpiredToken',
+  'ExpiredTokenException',
+  'InvalidClientTokenId',
+  'SignatureDoesNotMatch',
+  'UnrecognizedClientException',
+  'InvalidAccessKeyId',
+  'AuthFailure',
+  'RequestExpired',
+  'IncompleteSignature'
+]);
+const AUTHORIZATION_CODES = new Set(['AccessDenied', 'AccessDeniedException', 'UnauthorizedOperation', 'UnauthorizedException', 'AuthorizationError']);
+const NOT_FOUND_CODES = new Set([
+  'NoSuchEntity',
+  'RepositoryNotFoundException',
+  'LifecyclePolicyNotFoundException',
+  'RepositoryPolicyNotFoundException',
+  'InvalidInstanceID.NotFound',
+  'ResourceNotFoundException'
+]);
+// Local CLI messages printed before any request is made.
+const NO_CREDENTIALS = [/Unable to locate credentials/i, /Error when retrieving credentials/i, /The SSO session .* has expired/i, /Token has expired and refresh failed/i, /could not be found in the credentials/i, /The config profile .* could not be found/i];
+
+// `An error occurred (Code) when calling the Operation operation: message`
+const AWS_ERROR = /An error occurred \(([^)]{1,128})\)(?: \(reached max retries: \d+\))? when calling the (\w{1,128}) operation(?:: ([\s\S]*))?/;
+
+// CloudFormation reports "no stack owns this physical id" as a ValidationError.
+const NOT_IN_STACK = /^Stack for .* does not exist$/;
+
+// Credential-shaped values (config.mjs refuses the same shapes in the config).
+const SECRET_SHAPES = [
+  /\b(?:AKIA|ASIA|AROA|AIDA)[A-Z0-9]{16}\b/g,
+  /aws_secret_access_key\s*[=:]\s*\S+/gi,
+  /aws_session_token\s*[=:]\s*\S+/gi,
+  /\b[A-Za-z0-9/+]{40}\b/g
+];
+const CREDENTIAL_ENV = ['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN', 'AWS_SECURITY_TOKEN', 'AWS_WEB_IDENTITY_TOKEN_FILE'];
+const MAX_MESSAGE = 500;
+
+// Text safe to record: no credential-shaped value, no credential env value,
+// bounded length. Terminal controls are the presentation layer's job.
+export function redact(message, env = process.env) {
+  let out = String(message ?? '');
+  for (const name of CREDENTIAL_ENV) {
+    const value = env[name];
+    if (typeof value === 'string' && value.length >= 8) {
+      out = out.split(value).join('[REDACTED]');
+    }
+  }
+  for (const shape of SECRET_SHAPES) {
+    out = out.replace(shape, '[REDACTED]');
+  }
+  out = out.trim();
+  return out.length > MAX_MESSAGE ? `${out.slice(0, MAX_MESSAGE)}…` : out;
+}
+
+// A failed execution -> AwsCliError. `result` is { stderr, exitCode, error }.
+export function classifyFailure({ stderr = '', error = null } = {}, env = process.env) {
+  if (error?.code === 'ENOENT') {
+    return new AwsCliError('command-unavailable', 'the `aws` command was not found on PATH (install AWS CLI v2)');
+  }
+  if (error?.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') {
+    return new AwsCliError('output-too-large', 'the AWS CLI printed more output than ssd-onboard accepts');
+  }
+  if (error?.killed || error?.code === 'ETIMEDOUT') {
+    return new AwsCliError('timeout', 'the AWS CLI did not finish before the timeout');
+  }
+  const text = String(stderr ?? '');
+  const parsed = AWS_ERROR.exec(text);
+  if (parsed) {
+    const [, code, operation, rest = ''] = parsed;
+    const message = redact(rest.split('\n')[0], env);
+    if (AUTHENTICATION_CODES.has(code)) {
+      return new AwsCliError('authentication', `AWS rejected the credentials (${code})`, { code, operation });
+    }
+    if (AUTHORIZATION_CODES.has(code)) {
+      return new AwsCliError('authorization', message || `not authorized (${code})`, { code, operation });
+    }
+    if (NOT_FOUND_CODES.has(code) || (code === 'ValidationError' && NOT_IN_STACK.test(rest.trim()))) {
+      return new AwsCliError('not-found', message || code, { code, operation });
+    }
+    return new AwsCliError('aws-error', message || code, { code, operation });
+  }
+  if (NO_CREDENTIALS.some((pattern) => pattern.test(text))) {
+    // Deliberately WITHOUT the CLI's text: it can quote provider output.
+    return new AwsCliError('authentication', 'no usable AWS credentials were found by the AWS CLI provider chain');
+  }
+  return new AwsCliError('aws-error', redact(text.split('\n').find((line) => line.trim()) ?? 'the AWS CLI failed without an error message', env));
+}
+
+// --- the allowlist ------------------------------------------------------------------
+
+// Throws AwsCliError('refused') unless argv is a listed read operation called
+// only with its listed flags. Checked before the executor is ever reached.
+export function assertReadOnly(argv) {
+  if (!Array.isArray(argv) || argv.length < 2 || !argv.every((arg) => typeof arg === 'string')) {
+    throw new AwsCliError('refused', 'refusing an AWS CLI call that is not an argv array of strings');
+  }
+  const [service, operation, ...rest] = argv;
+  const flags = Object.hasOwn(READ_ONLY_OPERATIONS, service) && Object.hasOwn(READ_ONLY_OPERATIONS[service], operation) ? READ_ONLY_OPERATIONS[service][operation] : null;
+  if (!flags) {
+    throw new AwsCliError('refused', `refusing 'aws ${service} ${operation}': not in the read-only allowlist (ssd-onboard aws doctor makes no AWS changes)`, {
+      operation: `${service} ${operation}`
+    });
+  }
+  const seen = new Set();
+  for (let index = 0; index < rest.length; index += 1) {
+    const flag = rest[index];
+    if (!Object.hasOwn(flags, flag) || WRAPPER_FLAGS.includes(flag)) {
+      throw new AwsCliError('refused', `refusing 'aws ${service} ${operation}' with '${flag}': not an allowed parameter of this read operation`, {
+        operation: `${service} ${operation}`
+      });
+    }
+    if (seen.has(flag)) {
+      throw new AwsCliError('refused', `refusing 'aws ${service} ${operation}': '${flag}' given twice`, { operation: `${service} ${operation}` });
+    }
+    seen.add(flag);
+    if (flags[flag]) {
+      const value = rest[index + 1];
+      // A value that looks like an option would be parsed as one by the CLI.
+      if (value === undefined || value === '' || value.startsWith('-')) {
+        throw new AwsCliError('refused', `refusing 'aws ${service} ${operation}': '${flag}' needs a value that is not an option`, {
+          operation: `${service} ${operation}`
+        });
+      }
+      index += 1;
+    }
+  }
+}
+
+// --- execution ----------------------------------------------------------------------
+
+// The real executor: execFile, argv array, no shell. Resolves with
+// { stdout, stderr, exitCode, error } and never rejects, so classification
+// has one path.
+export function execAws(argv, { timeoutMs = DEFAULT_TIMEOUT_MS, maxBuffer = DEFAULT_MAX_BUFFER, env = process.env } = {}) {
+  return new Promise((resolvePromise) => {
+    execFile(
+      'aws',
+      argv,
+      {
+        shell: false,
+        timeout: timeoutMs,
+        killSignal: 'SIGTERM',
+        maxBuffer,
+        windowsHide: true,
+        env: {
+          ...env,
+          // Never an interactive pager or prompt; never an endpoint from config.
+          AWS_PAGER: '',
+          AWS_CLI_AUTO_PROMPT: 'off',
+          AWS_IGNORE_CONFIGURED_ENDPOINT_URLS: 'true'
+        }
+      },
+      (error, stdout, stderr) => {
+        resolvePromise({ stdout: String(stdout ?? ''), stderr: String(stderr ?? ''), exitCode: error ? (typeof error.code === 'number' ? error.code : null) : 0, error });
+      }
+    );
+  });
+}
+
+// readOnlyAws({ region, exec }) -> async (argv) => parsed JSON.
+//   region  the resolved region; appended to every call (never the CLI default)
+//   exec    injectable executor (tests); defaults to execAws
+//   onCall  observer of every argv actually executed (audit/tests)
+export function readOnlyAws({ region, exec = execAws, env = process.env, timeoutMs = DEFAULT_TIMEOUT_MS, onCall = () => {} } = {}) {
+  if (typeof region !== 'string' || region === '') {
+    throw new AwsCliError('refused', 'refusing to create an AWS CLI wrapper without an explicit region');
+  }
+  return async function aws(argv) {
+    assertReadOnly(argv);
+    const full = [...argv, '--region', region, '--output', 'json', '--no-cli-pager'];
+    onCall(full);
+    const result = await exec(full, { timeoutMs, env });
+    const operation = `${argv[0]} ${argv[1]}`;
+    if (result.error || result.exitCode !== 0) {
+      const failure = classifyFailure(result, env);
+      failure.operation = operation;
+      throw failure;
+    }
+    try {
+      const parsed = JSON.parse(result.stdout);
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        throw new Error('not a JSON object');
+      }
+      return parsed;
+    } catch {
+      throw new AwsCliError('malformed-json', `'aws ${operation}' did not return a JSON object`, { operation });
+    }
+  };
+}
