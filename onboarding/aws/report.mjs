@@ -82,6 +82,7 @@ const ERROR_TITLE = {
   authentication: 'AWS authentication failed',
   authorization: 'AWS authorization denied',
   timeout: 'AWS CLI timed out',
+  deadline: 'AWS doctor ran out of time',
   'malformed-json': 'Malformed AWS output',
   malformed: 'Malformed AWS output',
   'output-too-large': 'AWS output too large',

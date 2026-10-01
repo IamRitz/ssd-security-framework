@@ -183,7 +183,7 @@ describe('read-only allowlist', () => {
         assert.doesNotMatch(operation, MUTATING, `${service} ${operation}`);
       }
     }
-    assert.deepEqual(Object.keys(awsCli).sort(), ['AwsCliError', 'DEFAULT_MAX_BUFFER', 'DEFAULT_TIMEOUT_MS', 'READ_ONLY_OPERATIONS', 'assertReadOnly', 'classifyFailure', 'execAws', 'readOnlyAws', 'redact']);
+    assert.deepEqual(Object.keys(awsCli).sort(), ['AwsCliError', 'DEFAULT_DEADLINE_MS', 'DEFAULT_MAX_BUFFER', 'DEFAULT_TIMEOUT_MS', 'READ_ONLY_OPERATIONS', 'assertReadOnly', 'classifyFailure', 'execAws', 'readOnlyAws', 'redact']);
   });
 
   it('no wrapper exists without an explicit region', () => {
@@ -269,5 +269,76 @@ describe('results and errors', () => {
     const failure = classifyFailure({ stderr: 'An error occurred (AccessDenied) when calling the GetRole operation: super-secret-value-123' }, env);
     assert.ok(!failure.message.includes('super-secret-value-123'));
     assert.ok(redact('x'.repeat(2000)).length <= 501, 'bounded');
+  });
+});
+
+describe('L5: overall run deadline', () => {
+  const clock = (start = 1_000) => {
+    let t = start;
+    return { now: () => t, advance: (ms) => (t += ms) };
+  };
+
+  it('each call gets min(per-call timeout, remaining budget)', async () => {
+    const c = clock();
+    const f = fakeAws({ 'sts get-caller-identity': ok({}) });
+    const aws = readOnlyAws({ region: 'us-east-1', exec: f.exec, timeoutMs: 60_000, deadlineMs: 100_000, now: c.now });
+    await aws(['sts', 'get-caller-identity']);
+    c.advance(70_000);
+    await aws(['sts', 'get-caller-identity']);
+    assert.deepEqual(f.calls.map((call) => call.options.timeoutMs), [60_000, 30_000]);
+  });
+
+  it('once the budget is spent, a call fails as `deadline` before anything is spawned', async () => {
+    const c = clock();
+    const f = fakeAws({ 'sts get-caller-identity': ok({}) });
+    const aws = readOnlyAws({ region: 'us-east-1', exec: f.exec, deadlineMs: 5_000, now: c.now });
+    c.advance(5_000);
+    await assert.rejects(aws(['sts', 'get-caller-identity']), (error) => error.kind === 'deadline' && error.operation === 'sts get-caller-identity');
+    assert.deepEqual(f.calls, []);
+  });
+
+  it('a call cut short by the remaining budget is `deadline`; one that used its own full timeout is `timeout`', async () => {
+    const killed = { stdout: '', stderr: '', exitCode: null, error: Object.assign(new Error('killed'), { killed: true, signal: 'SIGTERM' }) };
+    const short = readOnlyAws({ region: 'us-east-1', exec: async () => killed, timeoutMs: 60_000, deadlineMs: 10_000, now: clock().now });
+    await assert.rejects(short(['sts', 'get-caller-identity']), (error) => error.kind === 'deadline');
+    const full = readOnlyAws({ region: 'us-east-1', exec: async () => killed, timeoutMs: 60_000, deadlineMs: 300_000, now: clock().now });
+    await assert.rejects(full(['sts', 'get-caller-identity']), (error) => error.kind === 'timeout');
+  });
+});
+
+describe('L3: IAM Identity Center (SSO) failures are authentication', () => {
+  const run = (response) => readOnlyAws({ region: 'us-east-1', exec: async () => response, env: {} })(['sts', 'get-caller-identity']);
+
+  it('a missing or expired SSO token is `authentication`, with no CLI text', async () => {
+    for (const stderr of [
+      '\nError loading SSO Token: Token for my-sso-session does not exist\n',
+      '\nThe SSO session associated with this profile has expired or is otherwise invalid. To refresh this SSO session run aws sso login with the corresponding profile.\n',
+      '\nUnable to refresh SSO token: secret-ish-detail\n'
+    ]) {
+      await assert.rejects(run({ stdout: '', stderr, exitCode: 255 }), (error) => error.kind === 'authentication' && /aws sso login/.test(error.message) && !/my-sso-session|secret-ish-detail/.test(error.message), stderr);
+    }
+  });
+
+  it('an error from the SSO credential operations is `authentication`, not `authorization`', async () => {
+    await assert.rejects(run(awsError('UnauthorizedException', 'GetRoleCredentials', 'Session token not found or invalid')), (error) => error.kind === 'authentication' && error.code === 'UnauthorizedException');
+    await assert.rejects(run(awsError('ForbiddenException', 'GetRoleCredentials', 'No access')), (error) => error.kind === 'authentication');
+    // The same code from a resource API is still an authorization answer.
+    await assert.rejects(run(awsError('UnauthorizedException', 'ListCoverage', 'no')), (error) => error.kind === 'authorization');
+  });
+});
+
+describe('L4: credential values in the environment and in token shapes', () => {
+  it('the container credential token and JWT-shaped tokens are redacted', () => {
+    const env = { AWS_CONTAINER_AUTHORIZATION_TOKEN: 'container-auth-token-value' };
+    const jwt = 'eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJyZXBvOmFjbWUvYXBwIn0.c2lnbmF0dXJlLXZhbHVl';
+    const message = redact(`failed with container-auth-token-value and ${jwt}`, env);
+    assert.ok(!message.includes('container-auth-token-value'));
+    assert.ok(!message.includes(jwt));
+    assert.ok(!message.includes('eyJzdWIi'));
+  });
+
+  it('variables that only name a file are not treated as secrets (and the file is never read)', () => {
+    const env = { AWS_WEB_IDENTITY_TOKEN_FILE: '/var/run/secrets/eks.amazonaws.com/serviceaccount/token' };
+    assert.equal(redact('see /var/run/secrets/eks.amazonaws.com/serviceaccount/token', env), 'see /var/run/secrets/eks.amazonaws.com/serviceaccount/token');
   });
 });

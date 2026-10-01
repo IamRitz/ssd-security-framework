@@ -77,6 +77,9 @@ const WRAPPER_FLAGS = ['--region', '--output', '--no-cli-pager'];
 const INDIRECT_VALUE = /^(?:file|fileb|https?):\/\//i;
 
 export const DEFAULT_TIMEOUT_MS = 60_000;
+// One run's total budget across every call (L5): ~30 sequential calls must not
+// be able to hold the operator for 30 × the per-call timeout.
+export const DEFAULT_DEADLINE_MS = 300_000;
 export const DEFAULT_MAX_BUFFER = 16 * 1024 * 1024;
 
 // --- errors ------------------------------------------------------------------------
@@ -89,6 +92,7 @@ export const DEFAULT_MAX_BUFFER = 16 * 1024 * 1024;
 //   not-found            AWS says the named resource does not exist
 //   malformed-json       the CLI exited 0 but did not print one JSON document
 //   timeout              the call did not finish in time
+//   deadline             the run's overall time budget is spent (ends the run)
 //   output-too-large     the CLI printed more than the buffer allows
 //   aws-error            any other AWS/CLI failure (code kept when parseable)
 export class AwsCliError extends Error {
@@ -123,7 +127,20 @@ const NOT_FOUND_CODES = new Set([
   'ResourceNotFoundException'
 ]);
 // Local CLI messages printed before any request is made.
-const NO_CREDENTIALS = [/Unable to locate credentials/i, /Error when retrieving credentials/i, /The SSO session .* has expired/i, /Token has expired and refresh failed/i, /could not be found in the credentials/i, /The config profile .* could not be found/i];
+const NO_CREDENTIALS = [/Unable to locate credentials/i, /Error when retrieving credentials/i, /could not be found in the credentials/i, /The config profile .* could not be found/i];
+// IAM Identity Center (SSO): a missing, expired or revoked session. These are
+// credential failures, not AWS answers about resources (L3).
+const SSO_SESSION = [
+  /Error loading SSO Token/i,
+  /The SSO session .* has expired/i,
+  /Token has expired and refresh failed/i,
+  /Unable to (?:load|refresh) (?:the )?SSO token/i,
+  /SSOTokenLoadError|UnauthorizedSSOTokenError|PendingAuthorizationExpiredError/
+];
+// Operations of the SSO portal / OIDC services the CLI calls on the operator's
+// behalf to mint credentials. Any error from them is an authentication failure.
+const SSO_OPERATIONS = new Set(['GetRoleCredentials', 'CreateToken', 'ListAccounts', 'ListAccountRoles']);
+const SSO_MESSAGE = 'the AWS IAM Identity Center (SSO) session is missing, expired or invalid (run `aws sso login` for this profile)';
 
 // `An error occurred (Code) when calling the Operation operation: message`
 const AWS_ERROR = /An error occurred \(([^)]{1,128})\)(?: \(reached max retries: \d+\))? when calling the (\w{1,128}) operation(?:: ([\s\S]*))?/;
@@ -136,9 +153,15 @@ const SECRET_SHAPES = [
   /\b(?:AKIA|ASIA|AROA|AIDA)[A-Z0-9]{16}\b/g,
   /aws_secret_access_key\s*[=:]\s*\S+/gi,
   /aws_session_token\s*[=:]\s*\S+/gi,
-  /\b[A-Za-z0-9/+]{40}\b/g
+  /\b[A-Za-z0-9/+]{40}\b/g,
+  // JWTs: web identity tokens and SSO access tokens (header.payload.signature).
+  /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g
 ];
-const CREDENTIAL_ENV = ['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN', 'AWS_SECURITY_TOKEN', 'AWS_WEB_IDENTITY_TOKEN_FILE'];
+// Environment variables whose VALUES are credentials (L4). Variables that only
+// name a file (AWS_WEB_IDENTITY_TOKEN_FILE, AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE,
+// AWS_SHARED_CREDENTIALS_FILE) hold paths, not secrets; ssd-onboard never reads
+// those files — a token read from one is caught by the JWT shape above.
+const CREDENTIAL_ENV = ['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN', 'AWS_SECURITY_TOKEN', 'AWS_CONTAINER_AUTHORIZATION_TOKEN'];
 const MAX_MESSAGE = 500;
 
 // Text safe to record: no credential-shaped value, no credential env value,
@@ -174,6 +197,9 @@ export function classifyFailure({ stderr = '', error = null } = {}, env = proces
   if (parsed) {
     const [, code, operation, rest = ''] = parsed;
     const message = redact(rest.split('\n')[0], env);
+    if (SSO_OPERATIONS.has(operation)) {
+      return new AwsCliError('authentication', SSO_MESSAGE, { code, operation });
+    }
     if (AUTHENTICATION_CODES.has(code)) {
       return new AwsCliError('authentication', `AWS rejected the credentials (${code})`, { code, operation });
     }
@@ -184,6 +210,10 @@ export function classifyFailure({ stderr = '', error = null } = {}, env = proces
       return new AwsCliError('not-found', message || code, { code, operation });
     }
     return new AwsCliError('aws-error', message || code, { code, operation });
+  }
+  if (SSO_SESSION.some((pattern) => pattern.test(text))) {
+    // Deliberately WITHOUT the CLI's text, as below.
+    return new AwsCliError('authentication', SSO_MESSAGE);
   }
   if (NO_CREDENTIALS.some((pattern) => pattern.test(text))) {
     // Deliberately WITHOUT the CLI's text: it can quote provider output.
@@ -269,23 +299,36 @@ export function execAws(argv, { timeoutMs = DEFAULT_TIMEOUT_MS, maxBuffer = DEFA
 }
 
 // readOnlyAws({ region, exec }) -> async (argv) => parsed JSON.
-//   region  the resolved region; appended to every call (never the CLI default)
-//   exec    injectable executor (tests); defaults to execAws
-//   onCall  observer of every argv actually executed (audit/tests)
-export function readOnlyAws({ region, exec = execAws, env = process.env, timeoutMs = DEFAULT_TIMEOUT_MS, onCall = () => {} } = {}) {
+//   region      the resolved region; appended to every call (never the CLI default)
+//   exec        injectable executor (tests); defaults to execAws
+//   timeoutMs   per call
+//   deadlineMs  for the whole run, measured from the wrapper's creation: each
+//               call gets min(timeoutMs, remaining); once spent, every further
+//               call fails with kind 'deadline', which ends the run
+//   now         injectable clock (tests)
+//   onCall      observer of every argv actually executed (audit/tests)
+export function readOnlyAws({ region, exec = execAws, env = process.env, timeoutMs = DEFAULT_TIMEOUT_MS, deadlineMs = DEFAULT_DEADLINE_MS, now = Date.now, onCall = () => {} } = {}) {
   if (typeof region !== 'string' || region === '') {
     throw new AwsCliError('refused', 'refusing to create an AWS CLI wrapper without an explicit region');
   }
+  const startedAt = now();
+  const spent = (operation) => new AwsCliError('deadline', `the run's overall AWS time budget (${Math.round(deadlineMs / 1000)}s) is spent`, { operation });
   return async function aws(argv) {
     assertReadOnly(argv);
+    const operation = `${argv[0]} ${argv[1]}`;
+    const remaining = deadlineMs - (now() - startedAt);
+    if (remaining <= 0) {
+      throw spent(operation);
+    }
+    const callTimeout = Math.min(timeoutMs, remaining);
     const full = [...argv, '--region', region, '--output', 'json', '--no-cli-pager'];
     onCall(full);
-    const result = await exec(full, { timeoutMs, env });
-    const operation = `${argv[0]} ${argv[1]}`;
+    const result = await exec(full, { timeoutMs: callTimeout, env });
     if (result.error || result.exitCode !== 0) {
       const failure = classifyFailure(result, env);
       failure.operation = operation;
-      throw failure;
+      // A call cut short by the remaining budget, not by its own timeout, is the deadline.
+      throw failure.kind === 'timeout' && callTimeout < timeoutMs ? spent(operation) : failure;
     }
     try {
       const parsed = JSON.parse(result.stdout);

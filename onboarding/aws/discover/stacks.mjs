@@ -53,18 +53,28 @@ const tagValue = (tags, key) => tags.find((t) => t.key === key)?.value;
 // Pure. -> { ownership: 'managed'|'exists-not-owned'|'unverified', reasons[], stack }
 // scope 'repo' requires the consumer tag; 'shared' must not be tied to one.
 // expectedStackName is mandatory: without it no ownership can be concluded.
-export function evaluateOwnership({ discovered, resourceTags = null, expectedType, slug, scope, expectedStackName }) {
+// region: where the lookup ran (delivery.aws.region). CloudFormation stacks are
+// regional while IAM roles and OIDC providers are global, so a conclusion names
+// the region it is about (L2).
+export function evaluateOwnership({ discovered, resourceTags = null, expectedType, slug, scope, expectedStackName, region = null }) {
   if (typeof expectedStackName !== 'string' || !STACK_NAME.test(expectedStackName)) {
     throw new Error('evaluateOwnership: an expected stack name is required');
   }
   const { stackResource, stack } = discovered;
   const reasons = [];
+  const where = region ? ` in ${region}` : '';
+  const globalNote = region && expectedType.startsWith('AWS::IAM::')
+    ? `IAM resources are global but stacks are regional: only ${region} (delivery.aws.region, where ssd-onboard's stacks live) was searched`
+    : null;
   const ssdTagged = resourceTags && resourceTags.some((t) => t.key.startsWith('ssd:'));
   if (stackResource.state === 'unverified') {
-    return { ownership: 'unverified', reasons: ['the owning CloudFormation stack could not be looked up'], stack: null, error: stackResource.error };
+    return { ownership: 'unverified', reasons: [`the owning CloudFormation stack could not be looked up${where}`], stack: null, error: stackResource.error };
   }
   if (stackResource.state === 'absent') {
-    reasons.push('not a physical resource of any CloudFormation stack');
+    reasons.push(`not a physical resource of any CloudFormation stack${where}`);
+    if (globalNote) {
+      reasons.push(globalNote);
+    }
     if (ssdTagged) {
       reasons.push('it carries ssd:* tags, but tags without a stack relationship do not prove ownership');
     }
@@ -82,7 +92,7 @@ export function evaluateOwnership({ discovered, resourceTags = null, expectedTyp
   }
   const st = stack.value;
   if (sr.stackName !== expectedStackName || st.name !== expectedStackName) {
-    reasons.push(`it belongs to stack '${sr.stackName}', not the expected stack '${expectedStackName}'`);
+    reasons.push(`it belongs to stack '${sr.stackName}'${where}, not the expected stack '${expectedStackName}'`);
   }
   if (!LIVE.has(st.status)) {
     reasons.push(`stack ${st.name} is ${st.status ?? 'in an unknown state'} (not a settled, successful state)`);
@@ -108,5 +118,5 @@ export function evaluateOwnership({ discovered, resourceTags = null, expectedTyp
   if (reasons.length > 0) {
     return { ownership: 'exists-not-owned', reasons, stack: { ...sr, status: st.status } };
   }
-  return { ownership: 'managed', reasons: [`physical resource ${sr.logicalId} of stack ${st.name} (${st.status}), tagged for ${scope === 'repo' ? slug : 'the shared scope'} (${environment})`], stack: { ...sr, status: st.status } };
+  return { ownership: 'managed', reasons: [`physical resource ${sr.logicalId} of stack ${st.name}${where} (${st.status}), tagged for ${scope === 'repo' ? slug : 'the shared scope'} (${environment})`], stack: { ...sr, status: st.status } };
 }

@@ -25,8 +25,8 @@ export async function read(aws, argv, { notFound = [] } = {}) {
     if (!(error instanceof AwsCliError)) {
       throw error;
     }
-    // Authentication failures and a missing CLI end the whole run.
-    if (error.kind === 'authentication' || error.kind === 'command-unavailable' || error.kind === 'refused') {
+    // Authentication failures, a missing CLI and a spent run deadline end the whole run.
+    if (error.kind === 'authentication' || error.kind === 'command-unavailable' || error.kind === 'refused' || error.kind === 'deadline') {
       throw error;
     }
     if (error.kind === 'not-found' && notFound.includes(error.code)) {

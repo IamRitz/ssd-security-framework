@@ -808,6 +808,11 @@ What exists, and where it refines D.1–D.6:
   `AWS_PAGER=''`, `AWS_CLI_AUTO_PROMPT=off`, `AWS_IGNORE_CONFIGURED_ENDPOINT_URLS=true`.
   `cloudformation create-change-set` / `validate-template` are **not** allowed
   yet; Phase 2B adds a separate plan allowlist rather than widening doctor's.
+- **Time and failures that end a run.** Each call gets min(60 s, the run's
+  remaining 300 s budget). A timed-out call is `unverified`; a spent budget
+  (`deadline`), an authentication failure (including an expired IAM Identity
+  Center session or any error from the SSO credential operations), a missing CLI
+  or an allowlist refusal ends the run as `ERROR`.
 - **Discovery results** are `present | absent | unverified`; `absent` requires
   the specific not-found code for that call (e.g. `NoSuchEntity`,
   `RepositoryNotFoundException`, CloudFormation's `Stack for … does not exist`).

@@ -404,14 +404,14 @@ export function instanceRoleCheck({ instance, profile, analysis, online, target 
   };
 }
 
-export function ownershipCheck({ label, id, mode, evaluation, resourceState, stackName }) {
+export function ownershipCheck({ label, id, mode, evaluation, resourceState, stackName, region }) {
   const c = check(id, 'Ownership', label, {
     required: mode === 'managed',
     basis: 'runtime',
     expected: [
       mode === 'managed'
-        ? `managed: a physical resource of stack ${stackName} (exact name, this region), tagged ssd:managed-by=ssd-onboard and ssd:environment=production`
-        : `existing: validated in place; never modified or adopted by name (an ssd-onboard owner would be stack ${stackName})`
+        ? `managed: a physical resource of stack ${stackName} in ${region} (exact name), tagged ssd:managed-by=ssd-onboard and ssd:environment=production`
+        : `existing: validated in place; never modified or adopted by name (an ssd-onboard owner would be stack ${stackName} in ${region})`
     ]
   });
   if (resourceState !== 'present') {
@@ -469,7 +469,9 @@ export const exitCodeOf = (r) => OUTCOMES[r.outcome] ?? 1;
 
 // awsDoctor({ config, region, exec, env }) -> report. Throws AwsCliError for a
 // run-ending failure (no CLI, no credentials, timeout on identity, …).
-export async function awsDoctor({ config, region: explicitRegion = null, exec, env = process.env }) {
+// deadlineMs / now: the run's overall AWS time budget and clock (L5;
+// readOnlyAws defaults apply when omitted).
+export async function awsDoctor({ config, region: explicitRegion = null, exec, env = process.env, deadlineMs, now }) {
   const d = config.delivery;
   const slug = config.repository.slug;
   const account = d.aws.accountId;
@@ -481,7 +483,7 @@ export async function awsDoctor({ config, region: explicitRegion = null, exec, e
     // Nothing is contacted in a region the configuration does not name.
     return report({ target, checks: [regionC], calls, skipped: 'region mismatch: AWS was not contacted' });
   }
-  const aws = readOnlyAws({ region: resolved.region, exec, env, onCall: (argv) => calls.push(argv.slice(0, argv.indexOf('--region')).join(' ')) });
+  const aws = readOnlyAws({ region: resolved.region, exec, env, deadlineMs, now, onCall: (argv) => calls.push(argv.slice(0, argv.indexOf('--region')).join(' ')) });
 
   const caller = await callerIdentity(aws);
   target.caller = caller;
@@ -543,8 +545,8 @@ export async function awsDoctor({ config, region: explicitRegion = null, exec, e
     ...roles.map((r) => ({ id: `ownership.${r.key}-role`, label: `${r.label} role`, mode: r.key === 'push' ? d.roles.pushScanOwnership : d.roles.deployOwnership, state: r.role.state === 'present' && r.role.value.arn === r.arn ? 'present' : 'unavailable', physicalId: r.role.state === 'present' ? r.role.value.name : null, type: 'AWS::IAM::Role', scope: 'repo', stackName: repoStackName(slug), tags: r.role.state === 'present' ? r.role.value.tags : null }))
   ];
   for (const o of ownershipTargets) {
-    const evaluation = o.state === 'present' ? evaluateOwnership({ discovered: await discoverStack(aws, o.physicalId), resourceTags: o.tags, expectedType: o.type, slug, scope: o.scope, expectedStackName: o.stackName }) : null;
-    owned.push(ownershipCheck({ label: o.label, id: o.id, mode: o.mode, evaluation, resourceState: o.state, stackName: o.stackName }));
+    const evaluation = o.state === 'present' ? evaluateOwnership({ discovered: await discoverStack(aws, o.physicalId), resourceTags: o.tags, expectedType: o.type, slug, scope: o.scope, expectedStackName: o.stackName, region: resolved.region }) : null;
+    owned.push(ownershipCheck({ label: o.label, id: o.id, mode: o.mode, evaluation, resourceState: o.state, stackName: o.stackName, region: resolved.region }));
   }
 
   // Checks.

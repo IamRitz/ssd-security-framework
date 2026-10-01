@@ -859,3 +859,63 @@ describe('ownership binds to the exact derived stack', () => {
     assert.throws(() => evaluateOwnership({ discovered: ownerDiscovered(), resourceTags: null, expectedType: 'AWS::IAM::Role', slug: SLUG, scope: 'repo' }), /expected stack name/);
   });
 });
+
+describe('L2 / L3 / L5 at the doctor level', () => {
+  it('L2: ownership conclusions name the searched region, and IAM ones say only that region was searched', async () => {
+    const { check } = await run(readyWorld());
+    const role = check('ownership.deploy-role');
+    assert.ok(role.observed.includes(`not a physical resource of any CloudFormation stack in ${REGION}`));
+    assert.ok(role.observed.some((o) => o.startsWith(`IAM resources are global but stacks are regional: only ${REGION}`)));
+    assert.ok(role.expected[0].includes(`${EXPECTED_STACK} in ${REGION}`));
+    const repo = check('ownership.ecr-repository');
+    assert.ok(repo.observed.includes(`not a physical resource of any CloudFormation stack in ${REGION}`));
+    assert.ok(!repo.observed.some((o) => o.startsWith('IAM resources are global')), 'ECR repositories are regional');
+  });
+
+  it('L2: a managed conclusion and a wrong-stack conclusion name the region', async () => {
+    const managed = await run(managedStack(readyWorld(), 'app-deploy', { type: 'AWS::IAM::Role', tags: SSD_STACK_TAGS }), { delivery: { environment: 'production', roles: { deployOwnership: 'managed' } } });
+    assert.ok(managed.check('ownership.deploy-role').observed.some((o) => o.includes(`of stack ${EXPECTED_STACK} in ${REGION}`)));
+    const other = await run(managedStack(readyWorld(), 'app-deploy', { type: 'AWS::IAM::Role', tags: SSD_STACK_TAGS, stackName: 'ssd-delivery-x-00000000' }));
+    assert.ok(other.check('ownership.deploy-role').observed.some((o) => o.includes(`'ssd-delivery-x-00000000' in ${REGION}, not the expected stack`)));
+  });
+
+  it('L3: an SSO session that expires after the identity call ends the run as authentication', async () => {
+    const world = readyWorld();
+    world[`ecr describe-repositories --registry-id ${ACCOUNT} --repository-names ${REPOSITORY}`] = { stdout: '', stderr: '\nError loading SSO Token: Token for x does not exist\n', exitCode: 255 };
+    const f = fakeAws(world);
+    await assert.rejects(awsDoctor({ config: config(ECR, { delivery: { environment: 'production' } }), exec: f.exec, env: {} }), (error) => error.kind === 'authentication');
+    assert.ok(!f.operations().includes('ecr get-registry-scanning-configuration'), 'nothing is read after the credentials fail');
+  });
+
+  it('L5: a per-call timeout is NOT VERIFIED for that check; the run continues', async () => {
+    const world = readyWorld();
+    world[`ec2 describe-instances --instance-ids ${INSTANCE}`] = { stdout: '', stderr: '', exitCode: null, error: Object.assign(new Error('killed'), { killed: true, signal: 'SIGTERM' }) };
+    const { check, report } = await run(world);
+    assert.equal(check('ssm.instance').status, 'NOT VERIFIED');
+    assert.deepEqual(kinds(check('ssm.instance')), ['timeout']);
+    assert.equal(check('ssm.managed').status, 'PASS', 'later reads still ran');
+    assert.equal(report.outcome, 'NOT_VERIFIED');
+  });
+
+  it('L5: a spent overall deadline ends the run (never a quiet NOT VERIFIED)', async () => {
+    let t = 0;
+    const world = readyWorld();
+    const f = fakeAws(world);
+    const exec = async (argv, options) => {
+      t += 10_000; // every call takes 10s on this clock
+      return f.exec(argv, options);
+    };
+    await assert.rejects(
+      awsDoctor({ config: config(ECR, { delivery: { environment: 'production' } }), exec, env: {}, deadlineMs: 45_000, now: () => t }),
+      (error) => error.kind === 'deadline'
+    );
+    assert.equal(f.calls.length, 5, 'five calls start inside the 45s budget; the sixth is refused before it runs');
+  });
+
+  it('malformed JSON during discovery is NOT VERIFIED for that check', async () => {
+    const world = readyWorld();
+    world['ecr get-registry-scanning-configuration'] = { stdout: 'not json', stderr: '', exitCode: 0 };
+    const { check } = await run(world);
+    assert.deepEqual([check('ecr.scanning').status, kinds(check('ecr.scanning'))[0]], ['NOT VERIFIED', 'malformed-json']);
+  });
+});

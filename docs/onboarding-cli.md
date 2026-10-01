@@ -331,8 +331,14 @@ AWS_PROFILE=<operator-profile> node ssd-framework/onboarding/cli.mjs aws doctor 
 
 **Credentials** come only from the AWS CLI's provider chain (profile, SSO,
 role credentials…). There is no option that takes a key; error text is reduced
-to the AWS error code and message with credential-shaped values redacted, and a
-credential failure prints no provider output at all.
+to the AWS error code and message with credential-shaped values redacted (access
+key IDs, secret keys, session and container-credential tokens, JWTs), and a
+credential failure — including a missing or expired IAM Identity Center (SSO)
+session — prints no provider output at all.
+
+**Time**: each AWS call has a 60 s timeout, and the whole run a 300 s budget;
+each call gets whichever is smaller. A call that times out is NOT VERIFIED for
+its check; a spent budget ends the run as `ERROR` (`deadline`).
 
 **Region**: `--region` if given, else `delivery.aws.region` — never the AWS
 CLI's default. A `--region` that differs from `delivery.aws.region` blocks
@@ -388,7 +394,10 @@ names (never configured):
 | shared: GitHub OIDC provider | `ssd-shared-github-oidc` |
 | shared: ECR registry scanning | `ssd-shared-ecr-scanning` |
 
-The name only **locates** the owner; it is not proof. A resource is reported
+The name only **locates** the owner; it is not proof. Stacks are regional while
+IAM roles and the OIDC provider are global; ssd-onboard's stacks live in
+`delivery.aws.region`, only that region is searched, and every ownership
+conclusion names it. A resource is reported
 `managed` only if CloudFormation, in `delivery.aws.region`, lists it as a
 physical resource of the expected type of **exactly that stack**, the stack is
 in a settled, successful state (`CREATE_COMPLETE`, `UPDATE_COMPLETE`,
@@ -449,7 +458,7 @@ Result
 
 or, when it cannot run, `{"schemaVersion": 1, "command": "aws doctor",
 "target": …, "outcome": "ERROR", "error": {"kind": "configuration" |
-"command-unavailable" | "authentication" | "timeout" | "malformed-json" | …,
+"command-unavailable" | "authentication" | "timeout" | "deadline" | "malformed-json" | …,
 "code": …, "message": …}}`.
 
 The operator needs read access only: `sts:GetCallerIdentity`,
