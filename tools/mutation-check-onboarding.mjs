@@ -35,7 +35,9 @@ const TESTS = [
   'test/aws-doctor.test.js',
   'test/aws-plan-wrapper.test.js',
   'test/aws-plan-templates.test.js',
-  'test/aws-plan.test.js'
+  'test/aws-plan.test.js',
+  'test/aws-apply-wrapper.test.js',
+  'test/aws-apply.test.js'
 ];
 
 // [invariant, file, search, replace]
@@ -257,6 +259,44 @@ const MUTATIONS = [
   ["only the stack's own inline policy name is managed", 'onboarding/aws/plan.mjs', "    const ours = policies.policies.find((p) => p.kind === 'inline' && p.name === `inline:${ROLE_POLICY_NAMES[key]}`);", "    const ours = policies.policies.find((p) => p.kind === 'inline');"],
   ['an unreadable policy list on an owned role blocks', 'onboarding/aws/plan.mjs', "        finding(FAIL, 'policies-unverified',", "        finding(NOT_VERIFIED, 'policies-unverified',"],
   ['the fake planning harness enforces the planning allowlist itself', 'test/support/aws-plan-fake.mjs', 'export const planFake = (world) => fakeAws(world, { allowlist: assertPlanning });', 'export const planFake = (world) => fakeAws(world, { allowlist: () => {} });'],
+  // Phase 2C: aws apply (execute exactly one reviewed change set).
+  ['apply revalidates --account against the plan and config', 'onboarding/aws/apply/plan-check.mjs', '  if (account !== plan.account || account !== d.aws.accountId) {', '  if (false) {'],
+  ['apply revalidates the live caller account', 'onboarding/aws/apply.mjs', '  const identity = [accountCheck(caller, account), principalCheck(caller)]', '  const identity = [principalCheck(caller)]'],
+  ['apply revalidates --region against the plan and config', 'onboarding/aws/apply/plan-check.mjs', '  if (region !== plan.region || region !== d.aws.region) {', '  if (false) {'],
+  ['apply enforces the framework binding', 'onboarding/aws/apply/plan-check.mjs', '  for (const problem of frameworkProblems(framework, config)) {', '  for (const problem of []) {'],
+  ['apply refuses a configuration changed since the plan', 'onboarding/aws/apply/plan-check.mjs', '  if (plan.createdFromConfigDigest !== configDigestOf(config)) {', '  if (false) {'],
+  ['apply recomputes every plan file hash', 'onboarding/aws/plan/record.mjs', '    if (sha256(content) !== plan.files?.[name]) {', '    if (false) {'],
+  ['apply verifies the tags the plan id binds', 'onboarding/aws/plan/record.mjs', '  if (!Array.isArray(plan.tags) || sha256(canonicalJson(plan.tags)) !== plan.planIdInput.tagsSha256) {', '  if (false) {'],
+  ['plan.json copies must equal what the plan id binds', 'onboarding/aws/apply/plan-check.mjs', '    if (!same(plan[key], input[key])) {', '    if (false) {'],
+  ['the recorded destructive count is re-derived from change-set.json', 'onboarding/aws/apply/plan-check.mjs', '    if (!same(plan.changes, classified) || !same(plan.counts, counts) || plan.destructive !== destructive) {', '    if (false) {'],
+  ['apply re-describes the change set and compares it', 'onboarding/aws/apply.mjs', "  if (!step(report, 'change-set', 'Change set unchanged', compareChangeSet(record.changeSet, live))) {", '  if (false) {'],
+  ['any difference in the live change set refuses', 'onboarding/aws/apply/live.mjs', '  if (differ.length > 0) {', '  if (false) {'],
+  ['apply never uses another (newer) change set', 'onboarding/aws/apply/live.mjs', '  if (live?.ChangeSetId !== recorded.ChangeSetId) {', '  if (false) {'],
+  ['apply executes only the recorded change-set ARN', 'onboarding/aws/aws-cli.mjs', "'execute-change-set', '--stack-name', stackName, '--change-set-name', changeSetArn];", "'execute-change-set', '--stack-name', stackName, '--change-set-name', changeSetArn.replace(/[0-9a-f]{64}/, 'b'.repeat(64))];"],
+  ['an unavailable change set is never executed', 'onboarding/aws/apply/live.mjs', "  if (live.Status !== 'CREATE_COMPLETE' || live.ExecutionStatus !== 'AVAILABLE') {", '  if (false) {'],
+  ["the change set's template must be template.json", 'onboarding/aws/apply/live.mjs', '  if (!body || typeof body !== \'object\' || canonicalJson(body) !== templateText) {', '  if (!body) {'],
+  ["the template is read from the change set, not the deployed stack", 'onboarding/aws/apply.mjs', "'get-template', '--stack-name', record.binding.stackName, '--change-set-name', record.binding.changeSetArn, '--template-stage', 'Original']", "'get-template', '--stack-name', record.binding.stackName, '--template-stage', 'Original']"],
+  ['apply checks the stack before executing', 'onboarding/aws/apply.mjs', "  return step(report, 'stack', title, checkStack({ record, stack, slug }));", '  return true;'],
+  ['a stale UPDATE base revision refuses', 'onboarding/aws/apply/live.mjs', '    if (st.status !== base.stackStatus || st.lastUpdatedTime !== (base.lastUpdatedTime ?? null)) {', '    if (false) {'],
+  ['another stack at the name (placeholder id) refuses', 'onboarding/aws/apply/live.mjs', '  if (st.stackId !== binding.stackId) {', '  if (false) {'],
+  ['a CREATE placeholder must still be REVIEW_IN_PROGRESS', 'onboarding/aws/apply/live.mjs', "    if (st.status !== 'REVIEW_IN_PROGRESS') {", '    if (false) {'],
+  ['a stack that lost its SSD ownership tags refuses', 'onboarding/aws/apply/live.mjs', '  if (tags.length > 0) {', '  if (false) {'],
+  ['destructive changes cannot be ignored', 'onboarding/aws/apply/plan-check.mjs', '  if (destructive === 0 && (allowDestructive === null || allowDestructive === 0)) {', '  if (true) {'],
+  ['a wrong --allow-destructive count refuses', 'onboarding/aws/apply/plan-check.mjs', '  if (allowDestructive !== destructive) {', '  if (false) {'],
+  ['the typed account and region must match exactly', 'onboarding/aws/apply.mjs', 'typed?.account === account && typed?.region === region ? [] :', 'true ? [] :'],
+  ['--yes never stands in for --account / --region', 'onboarding/aws/cli.mjs', '  if (planId === undefined || options.account === undefined || options.region === undefined) {', '  if (planId === undefined) {'],
+  ['the live checks are repeated immediately before execution', 'onboarding/aws/apply.mjs', '  if (!(await verifyLive(report, aws, { record, account, allowDestructive, slug }))) {', '  if (false) {'],
+  ['apply-started.json is written before execution', 'onboarding/aws/apply.mjs', "  report.record.started = await writeApplyRecord(root, planId, 'apply-started.json', canonicalJson(started), env);\n", ''],
+  ['an applied plan is never applied again', 'onboarding/aws/apply.mjs', "applied.length === 0 ? [] :", "true ? [] :"],
+  ['the apply wrapper executes at most once', 'onboarding/aws/aws-cli.mjs', '      if (executed) {', '      if (false) {'],
+  ['the apply wrapper refuses arbitrary operations', 'onboarding/aws/aws-cli.mjs', '  return wrapper((argv) => assertAllowed(argv, table, APPLY_WORDS), options, (aws, run) => {', '  return wrapper(() => {}, options, (aws, run) => {'],
+  ['a rollback or other *_COMPLETE is never success', 'onboarding/aws/apply/live.mjs', '  if (status === SUCCESS[operation]) {', "  if (status === SUCCESS[operation] || status.endsWith('_COMPLETE')) {"],
+  ['an UPDATE that has not started is not success', 'onboarding/aws/apply/live.mjs', "  if (operation === 'UPDATE' && status === base.stackStatus && live.lastUpdatedTime === (base.lastUpdatedTime ?? null)) {", '  if (false) {'],
+  ['a different stack id while waiting is failure', 'onboarding/aws/apply/live.mjs', '  if (live.stackId !== binding.stackId) {', '  if (false) {'],
+  ['an apply record is never overwritten', 'onboarding/aws/plan/record.mjs', "    await write(root, relative, text, { flag: 'wx', createParents: false });", "    await write(root, relative, text, { flag: 'w', createParents: false });"],
+  ['apply records are secret-checked', 'onboarding/aws/plan/record.mjs', '  assertPersistable({ [name]: text }, env);\n', ''],
+  ['AWS text in apply output is redacted with the run environment', 'onboarding/aws/apply.mjs', "statusReason: typeof s.StackStatusReason === 'string' ? redact(s.StackStatusReason, env) : null,", "statusReason: typeof s.StackStatusReason === 'string' ? s.StackStatusReason : null,"],
+  ['the fake apply harness enforces the apply allowlist itself', 'test/support/aws-apply-fake.mjs', '  const fake = fakeAws(world, { allowlist: assertApply(binding) });', '  const fake = fakeAws(world, { allowlist: () => {} });'],
 ];
 
 // Temp-workspace lifecycle

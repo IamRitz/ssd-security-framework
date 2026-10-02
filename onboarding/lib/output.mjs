@@ -93,7 +93,10 @@ export const OUTCOME = Object.freeze({
   BLOCKED: 'FAIL',
   'READY (LOCAL CHECKS)': 'PASS',
   'NOT READY': 'FAIL',
-  'NOT VERIFIED': 'NOT VERIFIED'
+  'NOT VERIFIED': 'NOT VERIFIED',
+  // `aws apply`: only an observed, successful stack operation is a pass;
+  // REFUSED, ERROR and APPLY FAILED fall through to FAIL.
+  APPLIED: 'PASS'
 });
 
 // Generated-file plan actions (files.mjs) and stale files.

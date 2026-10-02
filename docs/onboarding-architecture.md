@@ -635,12 +635,12 @@ Both are Phase 2 concerns (D.4, D.5).
 | --- | --- | --- |
 | 2A | `aws doctor` | **implemented** — [D.10](#d10-phase-2a-as-implemented), [onboarding-cli.md § AWS readiness](onboarding-cli.md#aws-readiness-aws-doctor-phase-2a) |
 | 2B | `aws plan` | **implemented** — [D.11](#d11-phase-2b-as-implemented), [onboarding-cli.md § AWS plans](onboarding-cli.md#aws-plans-aws-plan-phase-2b) |
-| 2C | `aws apply` | designed, **not implemented** (exit 2, contacts nothing) |
+| 2C | `aws apply` | **implemented** — [D.12](#d12-phase-2c-as-implemented), [onboarding-cli.md § Applying a plan](onboarding-cli.md#applying-a-plan-aws-apply-phase-2c) |
 | 2D | `aws verify` | designed, **not implemented** (exit 2, contacts nothing) |
 | 2E | `github …` | designed, **not implemented** |
 
-D.1–D.9 are the reviewed design; D.10 and D.11 record where the implementation
-refines it.
+D.1–D.9 are the reviewed design; D.10, D.11 and D.12 record where the
+implementation refines it.
 
 ### D.1 Command contract
 
@@ -694,7 +694,7 @@ onboarding/aws/
   identity.mjs               sts get-caller-identity, account/region/caller checks
   aws-cli.mjs                execFile wrapper; read-only vs mutating allowlists
   plan.mjs                   plan id, change-set creation, change classification   (2B: implemented, D.11)
-  apply.mjs                  confirmation, re-verification, execute, wait          (2C: not implemented)
+  apply.mjs                  confirmation, re-verification, execute, wait          (2C: implemented, D.12)
   discover/
     oidc-provider.mjs        exists? thumbprints/audiences
     ecr.mjs                  repository, tag immutability, scan config coverage
@@ -804,7 +804,7 @@ What exists, and where it refines D.1–D.6:
   `doctor.mjs` (orchestration + pure checks), `report.mjs` (presentation through
   `lib/output.mjs`), `discover/{oidc-provider,ecr,inspector,iam-role,ssm,stacks,result}.mjs`,
   `policy/{evaluate,trust,permissions}.mjs`. (`plan.mjs` and `templates/` were
-  added in Phase 2B, D.11; `apply.mjs` does not exist yet.)
+  added in Phase 2B, D.11; `apply.mjs` in Phase 2C, D.12.)
 - **Allowlist (refines D.1).** Not verb prefixes: an explicit map of
   `service → operation → permitted flags`. Every flag takes exactly one value
   that must not look like an option, nor begin with `file://`, `fileb://` or
@@ -970,8 +970,103 @@ What exists, and where it refines D.1–D.7:
 - **Residual.** A `CREATE` change set leaves a `REVIEW_IN_PROGRESS` placeholder
   stack, and no-change change sets remain `FAILED` objects, until deleted
   outside ssd-onboard (plan has no delete permission by design). The base
-  revision binds `LastUpdatedTime`, which AWS sets; apply (2C) must re-describe
-  the stack and refuse a stale plan.
+  revision binds `LastUpdatedTime`, which AWS sets; apply re-describes the
+  stack and refuses a stale plan (D.12).
+
+
+### D.12 Phase 2C as implemented
+
+What exists, and where it refines D.1 and D.7:
+
+- **Modules.** `aws/apply.mjs` (orchestration and the wait),
+  `aws/apply/plan-check.mjs` (pure local checks: record consistency, intent,
+  destructive count), `aws/apply/live.mjs` (pure live decisions: change-set and
+  template comparison, stack time-of-check/time-of-use, terminal states),
+  `aws/apply-report.mjs`. `plan/record.mjs` stays the only writer under
+  `onboarding/aws`: it gained `readPlan` (the hash-verified texts),
+  `applyRecordsOf`, `writeApplyRecord` and `configDigestOf`.
+- **Command (D.1).** `aws apply --plan-id <id> --account <id> --region <r>
+  [--allow-destructive <n>] [--yes] [--json]`. All three of plan id, account
+  and region are required in **both** modes (D.1 required them with `--yes`;
+  interactive mode requires them too, so the operator always states the target
+  before seeing it). Interactive confirmation is typing the account id and then
+  the region exactly; `--yes` skips only the typing. With neither a terminal
+  nor `--yes`, apply refuses before AWS.
+- **Third wrapper (refines D.1).** `applyAws({ binding })` is created for one
+  plan. Its reads accept only that plan's exact stack name / stack id /
+  change-set ARN (`sts get-caller-identity`; `cloudformation describe-stacks`,
+  `describe-change-set`, `get-template --template-stage Original`,
+  `describe-stack-resources`). Its single mutation is
+  `aws.executeChangeSet()`: the fixed argv
+  `cloudformation execute-change-set --stack-name <name> --change-set-name <ARN>`,
+  at most once per wrapper; the generic call path cannot express it. No
+  `--role-arn`, `--client-request-token`, `--disable-rollback`,
+  `--retain-except-on-create`; no other mutation. `readOnlyAws()` and
+  `planningAws()` are unchanged. `get-template` is an addition to D.7: the
+  describe document does not carry the template, so it is the only way to prove
+  the live change set holds `template.json`.
+- **Local verification (refines D.7).** `plan.json` itself is not hashed; the
+  plan id binds `planIdInput`. So apply (a) recomputes every file hash and the
+  tags hash, (b) requires every copy in `plan.json` to equal `planIdInput`, and
+  (c) re-derives every field the id does not bind — the change-set ARN and
+  name, the stack id (for a `CREATE`, the placeholder's), the classified
+  changes, counts and destructive count — from the hash-verified
+  `change-set.json`. Nothing in `plan.json` is trusted on its own.
+- **Intent.** `--account` = plan = `delivery.aws.accountId` = live caller
+  account; `--region` = plan = `delivery.aws.region`; repository and stack name
+  re-derived from the current configuration; the configuration digest equals
+  `createdFromConfigDigest` (a plan reviewed against another configuration is
+  stale); `frameworkProblems()` empty and the plan's framework ref is
+  `framework.ref`.
+- **Caller (D.7 vs D.11).** D.7 bound the caller ARN; D.11 removed it from the
+  plan id. Apply keeps D.11: any non-root principal of the plan's account may
+  apply; planner and applier ARNs are both shown and recorded.
+- **Change set (D.7 step 2).** Re-described by its recorded ARN and compared
+  with `change-set.json` as whole canonical documents — Phase 2B normalizes no
+  metadata, so neither does apply; a field present in one and not the other
+  also refuses. Only `CREATE_COMPLETE`/`AVAILABLE` executes. The destructive
+  count is recomputed from the live description.
+- **Stack time-of-check/time-of-use.** UPDATE: live stack id, status and
+  `LastUpdatedTime` equal the base revision. CREATE: the live stack is the
+  `REVIEW_IN_PROGRESS` placeholder with the recorded stack id (and, when planned
+  against an existing placeholder, the same revision). Both: SSD ownership tags
+  still present. All live checks run before confirmation **and again** after it,
+  immediately before execution.
+- **Destructive (D.7 step 3).** `--allow-destructive <n>` must equal the
+  recorded and the fresh count; none needs no flag (`0` accepted); no boolean.
+- **Execution and wait (D.7 step 4).** `apply-started.json` is written
+  exclusively before `execute-change-set` (a crash afterwards still blocks a
+  rerun; AWS blocks one too, the change set no longer being `AVAILABLE`). The
+  stack is polled by stack id with backoff up to 15 s, inside a 30-minute wait
+  budget separate from the 300 s pre-flight budget. Success is only
+  `CREATE_COMPLETE` (CREATE) or `UPDATE_COMPLETE` with a newer
+  `LastUpdatedTime` (UPDATE) on the same stack id; a rollback, failure, delete,
+  other stack id or unknown state is `APPLY_FAILED`; a timeout, lost
+  credentials or unreadable stack is `APPLY_FAILED` with `observed: false`. An
+  `execute-change-set` that AWS rejects is `APPLY_FAILED` (`accepted: false`)
+  and is not polled.
+- **Outcomes.** `APPLIED` (exit 0); `REFUSED`, `ERROR` (before execution) and
+  `APPLY_FAILED` (exit 1, distinguished by the JSON `outcome`) — the existing
+  0/1/2 convention, with no new exit code.
+- **Records (D.7 step 4).** `apply.json` holds non-secret evidence (identities,
+  stack, change set, operation, final status, redacted reason, counts, outputs,
+  resources). Both apply records are exclusive and secret-checked; AWS text is
+  redacted with the run's credential environment before display or recording.
+- **Configuration (D.7).** Apply never edits `.ssd/onboarding.yml`. The
+  generated templates have no outputs and create resources under the names the
+  configuration already holds, so the printed "config diff" is normally empty;
+  a physical id that differs from the configuration is printed as a manual
+  change.
+- **Residual.** (1) Drift **outside** the stack between plan and apply (e.g. a
+  policy attached by hand to a stack-owned role) is not re-discovered; plan's
+  discovery is not repeated, and the base-revision check only covers the stack.
+  (2) A rejected or failed apply spends the plan; because plan ids are
+  deterministic, re-planning an unchanged stack collides with the existing plan
+  directory and change set, which must be removed outside ssd-onboard. (3)
+  `REVIEW_IN_PROGRESS` placeholders of abandoned CREATE plans and failed stacks
+  are not cleaned up (no delete permission by design). (4) Full-document
+  change-set equality means an AWS CLI upgrade that adds a field between plan
+  and apply forces a re-plan.
 
 ---
 

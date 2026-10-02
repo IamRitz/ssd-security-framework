@@ -17,17 +17,10 @@ import { PathConfinementError, safeWriteFile } from '../onboarding/lib/safe-path
 import { serializeConfig } from '../onboarding/lib/config.mjs';
 import { FRAMEWORK, capture, commitAll, config, makeRepo, tempDir, write } from './support/onboarding-fixtures.mjs';
 import { awsError, ok, readyWorld } from './support/aws-fake.mjs';
-import { ACCOUNT, DEPLOY_ROLE, EXPECTED_STACK, MANAGED, PROVIDER, REPOSITORY, SHARED_TAGS, SSD_STACK_TAGS, changeSets, greenfieldWorld, planFake, stackIdOf, withStack } from './support/aws-plan-fake.mjs';
+import { ACCOUNT, DEPLOY_ROLE, EXPECTED_STACK, MANAGED, OWNED, PROVIDER, REPOSITORY, SHARED_TAGS, SSD_STACK_TAGS, STACK_POLICY, changeSets, greenfieldWorld, modify, ownedWorld, planFake, rolePolicies, stackIdOf, withStack } from './support/aws-plan-fake.mjs';
 
 const ECR = 'container-ecr-framework-gated';
 const quiet = async () => {};
-const OWNED = [
-  { logicalId: 'EcrRepository', physicalId: REPOSITORY, type: 'AWS::ECR::Repository' },
-  { logicalId: 'PushScanRole', physicalId: 'app-ecr-push-scan', type: 'AWS::IAM::Role' },
-  { logicalId: 'DeployRole', physicalId: 'app-deploy', type: 'AWS::IAM::Role' }
-];
-const modify = (template) => Object.entries(template.Resources).map(([logicalId, r]) => ({ Type: 'Resource', ResourceChange: { Action: 'Modify', Replacement: 'False', LogicalResourceId: logicalId, ResourceType: r.Type, Scope: ['Properties'], Details: [] } }));
-
 async function run(t, world, { overrides = MANAGED, scope = 'repo', framework = FRAMEWORK, env = {}, root = tempDir(t), region = null, sleep = quiet, now, deadlineMs } = {}) {
   const f = planFake(world);
   const report = await awsPlan({ config: config(ECR, overrides), scope, region, exec: f.exec, env, framework, root, sleep, now, deadlineMs });
@@ -44,34 +37,6 @@ const planDirs = (root) => {
 };
 const readPlan = (root, id) => JSON.parse(readFileSync(join(root, planDirOf(id), 'plan.json'), 'utf8'));
 const kinds = (findings) => findings.map((f) => f.kind);
-
-// A role whose ONLY policy is the stack's own inline policy (plus extras).
-function rolePolicies(world, name, { inline = {}, attached = [] }) {
-  world[`iam list-role-policies --role-name ${name}`] = ok({ PolicyNames: Object.keys(inline) });
-  for (const [policyName, document] of Object.entries(inline)) {
-    world[`iam get-role-policy --role-name ${name} --policy-name ${policyName}`] = ok({ RoleName: name, PolicyName: policyName, PolicyDocument: document });
-  }
-  world[`iam list-attached-role-policies --role-name ${name}`] = ok({ AttachedPolicies: attached.map((a) => ({ PolicyName: a.name, PolicyArn: a.arn })) });
-  for (const a of attached) {
-    world[`iam get-policy --policy-arn ${a.arn}`] = ok({ Policy: { Arn: a.arn, DefaultVersionId: 'v1' } });
-    world[`iam get-policy-version --policy-arn ${a.arn} --version-id v1`] = ok({ PolicyVersion: { Document: { Version: '2012-10-17', Statement: [{ Effect: 'Allow', Action: '*', Resource: '*' }] }, VersionId: 'v1' } });
-  }
-  return world;
-}
-const STACK_POLICY = { Version: '2012-10-17', Statement: [{ Effect: 'Allow', Action: 'ecr:GetAuthorizationToken', Resource: '*' }] };
-
-// Every per-repository resource exists, owned by the exact expected stack, and
-// each role carries only the stack's own inline policy.
-function ownedWorld(stack = {}) {
-  const world = greenfieldWorld();
-  const ready = readyWorld();
-  for (const key of [`ecr describe-repositories --registry-id ${ACCOUNT} --repository-names ${REPOSITORY}`, 'iam get-role --role-name app-ecr-push-scan', 'iam get-role --role-name app-deploy']) {
-    world[key] = ready[key];
-  }
-  rolePolicies(world, 'app-ecr-push-scan', { inline: { 'ssd-push-scan': STACK_POLICY } });
-  rolePolicies(world, 'app-deploy', { inline: { 'ssd-deploy': STACK_POLICY } });
-  return withStack(world, { resources: OWNED, ...stack });
-}
 
 describe('aws plan: preconditions block before any change set', () => {
   it('a framework checkout not bound to framework.ref blocks before AWS is contacted', async (t) => {
@@ -781,13 +746,15 @@ describe('aws plan: CLI', () => {
     assert.equal(doctor.f.calls.length, 0);
   });
 
-  it('apply and verify remain unimplemented and contact nothing', async (t) => {
-    for (const sub of ['apply', 'verify']) {
-      const { code, err, f } = await cli(consumer(t), ['aws', sub]);
-      assert.equal(code, 2);
-      assert.match(err, /not implemented/);
-      assert.equal(f.calls.length, 0);
-    }
+  it('verify remains unimplemented and contacts nothing; apply without its flags is a usage error', async (t) => {
+    const verify = await cli(consumer(t), ['aws', 'verify']);
+    assert.equal(verify.code, 2);
+    assert.match(verify.err, /not implemented/);
+    assert.equal(verify.f.calls.length, 0);
+    const apply = await cli(consumer(t), ['aws', 'apply']);
+    assert.equal(apply.code, 2);
+    assert.match(apply.err, /requires --plan-id, --account and --region/);
+    assert.equal(apply.f.calls.length, 0);
   });
 
   it('a non-ECR profile is a configuration error', async (t) => {
