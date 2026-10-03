@@ -100,7 +100,13 @@ export const OUTCOME = Object.freeze({
   // `aws verify` (aws/verify-report.mjs)
   VERIFIED: 'PASS',
   'VERIFIED WITH WARNINGS': 'WARN',
-  FAILED: 'FAIL'
+  FAILED: 'FAIL',
+  // `github plan` / `github apply` (github/report.mjs); INCOMPLETE, REFUSED
+  // and APPLY FAILED fall through to FAIL.
+  PLANNED: 'PASS',
+  COMPLIANT: 'PASS',
+  'NO CHANGES': 'PASS',
+  'NOTHING TO PLAN': 'PASS'
 });
 
 // Generated-file plan actions (files.mjs) and stale files.

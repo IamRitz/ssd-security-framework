@@ -698,12 +698,16 @@ describe('Phase 1 makes no AWS calls and no GitHub mutations', () => {
     assert.deepEqual(shimCalls().slice(before), []);
   });
 
-  it('the github commands are not implemented, and aws commands without a configuration contact nothing', async (t) => {
+  it('github and aws commands without their flags or a configuration contact nothing', async (t) => {
     const before = shimCalls().length;
     const root = makeRepo(t, PY_REPO);
+    // github apply (Phase 2E) without its flags is a usage error; github plan
+    // without a configuration stops before GitHub.
     const github = await cli(root, ['github', 'apply']);
     assert.equal(github.code, 2);
-    assert.match(github.err, /not implemented/);
+    assert.match(github.err, /requires --plan-id and --slug/);
+    const githubPlan = await cli(root, ['github', 'plan', '--scope', 'secrets']);
+    assert.equal(githubPlan.code, 1);
     // aws apply (Phase 2C) without its flags is a usage error.
     const apply = await cli(root, ['aws', 'apply']);
     assert.equal(apply.code, 2);
