@@ -4,13 +4,16 @@
 // Environment (set by server/break-glass/infra/deploy.sh — no secret VALUES here):
 //   TABLE_NAME                    DynamoDB table
 //   SLACK_CHANNEL_ID              approval channel (ci function)
-//   SLACK_APPROVER_IDS_BY_REPO    {"owner/repo":["Uxxx"]} (interactions function)
+//   SLACK_APPROVER_IDS_BY_REPOSITORY_ID  {"<repository_id>":["Uxxx"]} (interactions function)
+//                                 The pre-3A SLACK_APPROVER_IDS_BY_REPO (name-keyed) is
+//                                 deliberately NOT read: until re-keyed, nobody is authorized.
 //   SLACK_BOT_TOKEN_SECRET_ARN    both functions
 //   SLACK_SIGNING_SECRET_ARN      interactions function only
 //   GITHUB_TOKEN_SECRET_ARN       interactions function only
 import { Buffer } from 'node:buffer';
 
-import { parseApproverMapFromEnv } from '../authorize/slack-authorize.mjs';
+import { parseApproverMapByRepositoryId } from '../authorize/slack-authorize.mjs';
+import { createJwksCache, verifyGithubOidcToken } from '../identity/github-oidc.mjs';
 import { createGithubClient } from '../github.mjs';
 import { createSlackClient } from '../slack.mjs';
 import { createBroker } from './broker.mjs';
@@ -51,6 +54,7 @@ async function buildBroker(env) {
     readSecret(secretsClient, secrets, env.GITHUB_TOKEN_SECRET_ARN)
   ]);
 
+  const jwks = createJwksCache();
   const ddb = new dynamodb.DynamoDBClient({});
   const client = { call: (operation, input) => ddb.send(new dynamodb[`${operation}Command`](input)) };
 
@@ -61,7 +65,9 @@ async function buildBroker(env) {
     // Missing secret -> verifySlackSignature returns false -> every request 401.
     signingSecret,
     // Malformed or absent map -> empty map -> nobody authorized.
-    approverMap: parseApproverMapFromEnv(env.SLACK_APPROVER_IDS_BY_REPO),
+    approverMap: parseApproverMapByRepositoryId(env.SLACK_APPROVER_IDS_BY_REPOSITORY_ID),
+    // GitHub's JWKS from its fixed URL, cached per warm container.
+    verifyIdentity: (token) => verifyGithubOidcToken(token, { jwks }),
     slackChannelId: env.SLACK_CHANNEL_ID
   });
 }

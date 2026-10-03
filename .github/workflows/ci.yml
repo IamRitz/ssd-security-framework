@@ -70,6 +70,13 @@ jobs:
         # must make the tests fail.
         run: node tools/mutation-check-onboarding.mjs
 
+      - name: Prove the break-glass broker tests guard its identity invariants
+        # Breaks each property that stops one repository, run or workflow from
+        # acting as another (token signature, issuer, audience, job_workflow_ref,
+        # replay, status binding, payload disagreement, the OIDC-free source scan)
+        # in a scratch copy; the broker and client tests must fail every time.
+        run: node tools/mutation-check-broker.mjs
+
       - name: The toolkit must stay dependency-free
         # Every script imports only Node builtins. That is what lets the toolkit
         # be dropped into any consumer's runner with nothing installed, and it is

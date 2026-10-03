@@ -38,6 +38,22 @@ export function parseApproverMapFromEnv(envValue) {
   return map;
 }
 
+// The broker's approver map: SLACK_APPROVER_IDS_BY_REPOSITORY_ID, a JSON object
+// of GitHub repository_id (decimal string) -> ["Uxxx", ...]. Keyed by the
+// IMMUTABLE id, so a renamed or re-created repository cannot inherit approvers.
+// A key that is not a repository id (e.g. an old "owner/repo" key) is dropped,
+// logged, and authorizes nobody — fail closed, never a name-based fallback.
+export function parseApproverMapByRepositoryId(envValue) {
+  const map = parseApproverMapFromEnv(envValue);
+  for (const key of [...map.keys()]) {
+    if (!/^[1-9][0-9]{0,19}$/.test(key)) {
+      console.error('approver map key is not a GitHub repository_id; ignoring it (nobody authorized for it)');
+      map.delete(key);
+    }
+  }
+  return map;
+}
+
 // Authorized only if `repo` is an explicit key in the map AND `userId` is in that
 // repo's set. A repo with no entry authorizes NOBODY — fail closed, not a fallback
 // to some default list. That matches the onboarding rule: no entry = not onboarded.

@@ -3,23 +3,26 @@ import { Buffer } from 'node:buffer';
 import { createHmac } from 'node:crypto';
 import { describe, it } from 'node:test';
 
-import { parseApproverMapFromEnv } from '../broker/authorize/slack-authorize.mjs';
+import { parseApproverMapByRepositoryId } from '../broker/authorize/slack-authorize.mjs';
+import { createJwksCache, verifyGithubOidcToken } from '../broker/identity/github-oidc.mjs';
 import { createBroker } from '../broker/lambda/broker.mjs';
 import { createDynamoStore } from '../broker/lambda/dynamodb-store.mjs';
 import { createCiHandler, createInteractionsHandler } from '../broker/lambda/handlers.mjs';
 import { createFakeDynamo } from './support/fake-dynamodb.mjs';
+import { REPO_A as ID_A, REPO_B as ID_B, SHA_A, createSigningKey, fakeJwksFetch, githubClaims, signToken } from './support/jwt-fixtures.mjs';
 
 const SIGNING_SECRET = 'test-signing-secret';
-const REPO_A = 'owner/repo-a';
-const REPO_B = 'owner/repo-b';
-const APPROVERS = JSON.stringify({ [REPO_A]: ['U-A'], [REPO_B]: ['U-B'] });
+const REPO_A = ID_A.repository;
+// Approvers are keyed by the immutable repository_id (Phase 3A).
+const APPROVERS = JSON.stringify({ [ID_A.repositoryId]: ['U-A'], [ID_B.repositoryId]: ['U-B'] });
+const KEY = createSigningKey();
 const RESPONSE_URL = 'https://hooks.slack.com/actions/T0/1/abc';
 
 const eligiblePayload = (overrides = {}) => ({
   schemaVersion: 1,
   gateDigest: 'a'.repeat(64),
   timeoutSeconds: 900,
-  context: { repository: REPO_A, commitSha: 'abcdef1234567890', pullRequest: '51' },
+  context: { repository: REPO_A, commitSha: SHA_A, pullRequest: '51' },
   findings: [{ source: 'semgrep', id: 'demo.rule', action: 'BLOCK', policyRule: 'sast.high_new', reason: 'new high' }],
   ...overrides
 });
@@ -43,15 +46,17 @@ function fakeGithub() {
   return { calls, postComment: async (repo, pr, body) => calls.push({ repo, pr, body }) };
 }
 
-function setup({ approverEnv = APPROVERS, slack = fakeSlack(), now } = {}) {
+function setup({ approverEnv = APPROVERS, slack = fakeSlack(), now = () => new Date() } = {}) {
   const dynamo = createFakeDynamo();
   const github = fakeGithub();
+  const jwks = createJwksCache({ fetchImpl: fakeJwksFetch([KEY]).fetchImpl, now: () => now().getTime() });
   const broker = createBroker({
     store: createDynamoStore({ client: dynamo.client, tableName: 'break-glass-test' }),
     slack,
     github,
     signingSecret: SIGNING_SECRET,
-    approverMap: parseApproverMapFromEnv(approverEnv),
+    approverMap: parseApproverMapByRepositoryId(approverEnv),
+    verifyIdentity: (token) => verifyGithubOidcToken(token, { jwks, now: () => now().getTime() }),
     slackChannelId: 'C-TEST',
     now,
     log: () => {}
@@ -62,7 +67,14 @@ function setup({ approverEnv = APPROVERS, slack = fakeSlack(), now } = {}) {
     enqueue: async (job) => enqueued.push(job)
   });
   const ci = createCiHandler({ getBroker: async () => broker });
-  return { dynamo, slack, github, broker, interactions, ci, enqueued };
+  // A fresh GitHub token for repo A's PR 51 run, minted at the broker's clock.
+  const token = (claims = {}) =>
+    signToken(githubClaims({ nowSeconds: Math.floor(now().getTime() / 1000), ...claims }), { key: KEY });
+  const notify = (payload = eligiblePayload(), claims) =>
+    ci({ action: 'notify', payload, identityToken: token(claims) });
+  const status = (requestId, claims) => ci({ action: 'status', requestId, identityToken: token(claims) });
+  const requestItems = () => [...dynamo.table.keys()].filter((key) => !key.startsWith('oidc-jti:'));
+  return { dynamo, slack, github, broker, interactions, ci, enqueued, token, notify, status, requestItems };
 }
 
 function urlEvent(interaction, { secret = SIGNING_SECRET, timestamp, body, base64 = false } = {}) {
@@ -85,17 +97,17 @@ const click = (requestId, { userId = 'U-A', action = 'approve' } = {}) => ({
 });
 
 async function createRequest(env, payload = eligiblePayload()) {
-  const result = await env.ci({ action: 'notify', payload });
+  const result = await env.notify(payload);
   assert.equal(result.ok, true, JSON.stringify(result));
   return result.body.requestId;
 }
 
-const statusOf = async (env, requestId) => (await env.ci({ action: 'status', requestId })).body.status;
+const statusOf = async (env, requestId) => (await env.status(requestId)).body.status;
 
 describe('Lambda broker — CI function (direct invoke only)', () => {
   it('stores a pending request, posts the approval message, and records the message ref', async () => {
     const env = setup();
-    const result = await env.ci({ action: 'notify', payload: eligiblePayload() });
+    const result = await env.notify();
     assert.equal(result.ok, true);
     assert.equal(result.statusCode, 201);
     assert.equal(result.body.status, 'pending');
@@ -114,33 +126,35 @@ describe('Lambda broker — CI function (direct invoke only)', () => {
       const payload = eligiblePayload({
         findings: [{ id: 'x', action: 'BLOCK', policyRule, reason: 'hard block' }]
       });
-      const result = await env.ci({ action: 'notify', payload });
+      const result = await env.notify(payload);
       assert.equal(result.ok, false);
       assert.equal(result.statusCode, 400);
     }
+    // Refused before identity is even checked: no request and no token record.
     assert.equal(env.dynamo.table.size, 0);
     assert.equal(env.slack.calls.postMessage.length, 0);
   });
 
   it('fails closed and rolls back when Slack refuses the message', async () => {
     const env = setup({ slack: fakeSlack({ failPost: true }) });
-    const result = await env.ci({ action: 'notify', payload: eligiblePayload() });
+    const result = await env.notify();
     assert.equal(result.ok, false);
     assert.equal(result.statusCode, 502);
-    assert.equal(env.dynamo.table.size, 0);
+    // The request is rolled back; the spent token's one-shot record remains.
+    assert.deepEqual(env.requestItems(), []);
   });
 
   it('returns unknown_request for an unknown id and expires an elapsed pending request', async () => {
     let clock = new Date();
     const env = setup({ now: () => clock });
-    assert.deepEqual(await env.ci({ action: 'status', requestId: 'nope' }), {
+    assert.deepEqual(await env.status('nope'), {
       ok: false,
       statusCode: 404,
       error: 'unknown_request'
     });
     const requestId = await createRequest(env);
     clock = new Date(clock.getTime() + 901_000);
-    const status = await env.ci({ action: 'status', requestId });
+    const status = await env.status(requestId);
     assert.equal(status.body.status, 'expired');
     assert.equal(env.dynamo.table.get(requestId).status.S, 'expired');
   });
@@ -221,7 +235,7 @@ describe('Lambda broker — decisions', () => {
     // A redelivered follow-up posts nothing twice.
     assert.equal((await env.interactions(env.enqueued[0])).done, false);
     assert.equal(env.github.calls.length, 1);
-    const status = (await env.ci({ action: 'status', requestId })).body;
+    const status = (await env.status(requestId)).body;
     assert.equal(status.approver.id, 'U-A');
   });
 

@@ -70,6 +70,14 @@ export function buildAuditComment(request) {
     `Verified approver: **${decider.username}** (ID: \`${decider.userId}\`)`,
     `Timestamp: ${decider.claimedAt || request.decidedAt}`,
     `Overridden finding(s): ${findingText}`,
-    `Gate digest: \`${request.gateDigest}\``
+    `Gate digest: \`${request.gateDigest}\``,
+    // Correlation for incident review: the broker request and the VERIFIED run
+    // that filed it (present on every request filed through identity binding).
+    ...(request.identity
+      ? [
+          `Request: \`${request.requestId}\` (repository id ${request.identity.repositoryId}, ` +
+            `run ${request.identity.runId} attempt ${request.identity.runAttempt})`
+        ]
+      : [])
   ].join('\n\n');
 }

@@ -9,6 +9,11 @@
 //   doc          the full request object as JSON (what the shared modules operate on)
 //   ttl          epoch seconds for DynamoDB TTL cleanup (see RETENTION_SECONDS)
 //
+// The same table holds one-shot GitHub OIDC token records (see consumeTokenId),
+// keyed `oidc-jti:<sha256(jti)>`. They carry no `doc` and no `status`, so they
+// can never be read back as a request (fromItem) or satisfy any request
+// transition's condition. Request ids are UUIDs, so the key spaces cannot meet.
+//
 // Every state transition is a conditional write. The pure decision modules decide
 // WHAT the transition is; the condition makes it atomic, so two concurrent clicks
 // can both read `pending` and still only one of them commits.
@@ -21,6 +26,12 @@
 // expiry check). Decided items are kept for a week past expiry so a late CI poll
 // still reads a terminal status rather than 404, and the decision stays inspectable.
 export const RETENTION_SECONDS = 7 * 24 * 3600;
+
+// A token record outlives its token: DynamoDB TTL never deletes BEFORE `ttl`,
+// and the verifier refuses a token after `exp`, so a record is always present
+// for as long as its token could verify. Deletion after `ttl` is lazy
+// (typically within days) and harmless — the token is dead by then.
+export const TOKEN_RECORD_GRACE_SECONDS = 3600;
 
 export class ConditionFailed extends Error {}
 
@@ -37,7 +48,7 @@ function toItem(request) {
 }
 
 function fromItem(item) {
-  if (!item) return undefined;
+  if (!item || typeof item.doc?.S !== 'string') return undefined;
   const request = JSON.parse(item.doc.S);
   if (item.slackChannel && item.slackTs) {
     request.slack = { channel: item.slackChannel.S, ts: item.slackTs.S };
@@ -58,6 +69,33 @@ export function createDynamoStore({ client, tableName }) {
   }
 
   return {
+    // One-shot use of a verified GitHub OIDC token: an atomic conditional put
+    // on the token's jti. Exactly one of any number of concurrent uses wins;
+    // every other use — concurrent or later — returns false. Stores only what
+    // an investigation needs: who (repository id, run), for what (action), and
+    // when it may be cleaned up. Never the token.
+    async consumeTokenId({ jtiHash, exp, repositoryId, runId, runAttempt, action }) {
+      try {
+        await conditional('PutItem', {
+          Item: {
+            requestId: s(`oidc-jti:${jtiHash}`),
+            kind: s('oidc-jti'),
+            action: s(action),
+            repositoryId: s(repositoryId),
+            runId: s(runId),
+            runAttempt: s(runAttempt),
+            tokenExp: { N: String(exp) },
+            ttl: { N: String(exp + TOKEN_RECORD_GRACE_SECONDS) }
+          },
+          ConditionExpression: 'attribute_not_exists(requestId)'
+        });
+        return true;
+      } catch (error) {
+        if (error instanceof ConditionFailed) return false;
+        throw error;
+      }
+    },
+
     async get(requestId) {
       const result = await client.call('GetItem', {
         TableName: tableName,

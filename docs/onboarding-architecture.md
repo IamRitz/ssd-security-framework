@@ -1352,6 +1352,56 @@ and derives `repository`, `repository_id`, `ref`, `run_id` **from the token**,
 rejecting any payload context that disagrees. The approver map is then keyed by
 the immutable `repository_id`.
 
+**Status: implemented in Phase 3A (broker code; deployment is Phase 3C).** The
+broker now lives in this repository (`broker/`, imported unchanged from
+`IamRitz/secure-software-delivery@6c37d7d` and then hardened). It differs from
+the sketch above in three places, each one stricter:
+
+- **The B.9 boundary is kept.** The token is minted by the jobs that already
+  hold `id-token: write`: `_break-glass-lambda.yml`'s job, and legacy
+  `_source-security.yml`'s `source-gate`. `_source-scan.yml` gains nothing.
+  Notify and **every status poll** mint their own token, and each token is
+  accepted once (`jti`, conditional write).
+- **More is bound than `iss`/`aud`/`exp`.** `job_workflow_ref` must name one of
+  the two framework workflows at an exact SHA. A production request must be a
+  `pull_request` run, with the PR number taken from `ref` =
+  `refs/pull/<N>/merge`. A status read must come from the same `repository_id`,
+  `run_id` and `run_attempt` that filed the request.
+- **Live-verified claim shape.** A probe run (scratch consumer runs
+  37118241635, 37118245381 and 37118248911, framework called by exact SHA)
+  observed the following, and the verifier's rules are set from it rather than
+  from documentation:
+  - `job_workflow_ref` = `IamRitz/ssd-security-framework/.github/workflows/<file>@<40-hex SHA>`,
+    with `job_workflow_sha` equal to that SHA;
+  - a 300 s token lifetime, with `nbf = iat − 300`;
+  - a unique `jti` per mint;
+  - a 2048-bit RS256 key with `use: sig`.
+
+Contract and rollout: [break-glass-setup.md § Who is asking](break-glass-setup.md#who-is-asking-verified-github-identity).
+
+**Carried forward. These are not part of 3A, and the hardened broker is not
+deployed until they land:**
+
+1. **3B:** the approver map moves from the interaction function's environment
+   to one SSM parameter per repository (E.3).
+2. **3C:** CloudFormation/IAM deployment of the production and synthetic
+   stacks. The CI broker execution role's `dynamodb:PutItem` on the table
+   (used by the replay record) and TTL on `ttl` are, today, verified only
+   against the imported provisioning source. 3C must declare them, and live
+   verification must prove them (E.7).
+3. **3D:** an exact SHA is necessary but **not sufficient**. Today the broker
+   accepts any 40-hex SHA of the framework repository, including a commit on an
+   unmerged branch. That does not reopen cross-repository forgery, because
+   identity still comes from the token. But production acceptance must be
+   restricted to reviewed or allowed framework SHAs.
+4. **Synthetic demo path:** production rules refuse `workflow_dispatch`, so the
+   manually dispatched synthetic demo must move to an explicitly separate
+   synthetic contract against the synthetic stack (3E). Production validation
+   is not to be weakened for it.
+5. **The exact-SHA caller requirement stays.** Tag or branch trust (`@v1`) is
+   not reintroduced. Tag-pinned callers, including `examples/container-ecr`,
+   fail closed once the hardened broker is deployed.
+
 ### E.3 Per-repository onboarding without touching the shared stack
 
 Approver mappings move out of the interaction function's environment (changing it

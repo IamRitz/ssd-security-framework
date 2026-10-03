@@ -18,8 +18,8 @@ export function createCiHandler({ getBroker }) {
     // Defense in depth: this function must never be wired to a URL or API gateway.
     if (isUrlEvent(event) || event?.headers) return { ok: false, statusCode: 403, error: 'direct_invoke_only' };
     const broker = await getBroker();
-    if (event?.action === 'notify') return broker.notify(event.payload);
-    if (event?.action === 'status') return broker.status(event.requestId);
+    if (event?.action === 'notify') return broker.notify(event.payload, event.identityToken);
+    if (event?.action === 'status') return broker.status(event.requestId, event.identityToken);
     return { ok: false, statusCode: 400, error: 'unknown_action' };
   };
 }
