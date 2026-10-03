@@ -253,7 +253,9 @@ guards. TTL deletion is lazy and happens only after that.
 1. **Check the payload shape and verify the token.** Nothing is written.
 2. **Claim the token's `jti`** with a conditional write. This is the first write.
 3. **Bind the payload to the token.** A disagreement is refused, and the token
-   is already spent.
+   is already spent. This order is **intentional**: claiming first means no
+   path, valid or not, can use a token twice, and the cost is only that a
+   corrected retry mints a fresh token, which every caller can do.
 4. **Store the pending request** under a fresh UUID.
 5. **Post the Slack approval message**, then record its reference. If that
    fails, the request is deleted and the call returns 502.

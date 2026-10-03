@@ -1401,6 +1401,12 @@ deployed until they land:**
 5. **The exact-SHA caller requirement stays.** Tag or branch trust (`@v1`) is
    not reintroduced. Tag-pinned callers, including `examples/container-ecr`,
    fail closed once the hardened broker is deployed.
+6. **Stale approval messages (audit noise, not a bypass).** If a delivered
+   request's response is lost and the job is re-run, the earlier Slack message
+   stays approvable. Approving it cannot unblock any gate, because only the
+   earlier, finished attempt can read its status, but it still posts an audit
+   comment. Follow-up: mark superseded requests, or make the audit comment say
+   that no gate consumed the decision.
 
 ### E.3 Per-repository onboarding without touching the shared stack
 
