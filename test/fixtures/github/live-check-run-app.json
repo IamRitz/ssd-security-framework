@@ -1,0 +1,10 @@
+{
+  "name": "Framework checks",
+  "app": {
+    "id": 15368,
+    "slug": "github-actions",
+    "owner": {
+      "login": "github"
+    }
+  }
+}

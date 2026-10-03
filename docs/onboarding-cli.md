@@ -15,7 +15,8 @@ The manual procedure it automates: [onboarding.md](onboarding.md).
 >
 > **Phase 2 boundary.** The `aws` commands are a separate trust boundary that
 > talks to AWS with the operator's own AWS CLI credentials and makes no GitHub
-> call.
+> call. The `github` commands (Phase 2E) are another one: they talk to GitHub
+> through the operator's own `gh` login and make no AWS call.
 >
 > | Phase | Command | Status |
 > | --- | --- | --- |
@@ -23,9 +24,7 @@ The manual procedure it automates: [onboarding.md](onboarding.md).
 > | 2B | `aws plan` | **implemented** — writes `.ssd/aws-plans/<plan-id>/` and creates **unexecuted** CloudFormation change sets ([§ AWS plans](#aws-plans-aws-plan-phase-2b)) |
 > | 2C | `aws apply` | **implemented** — executes exactly one reviewed change set after re-verifying it ([§ Applying a plan](#applying-a-plan-aws-apply-phase-2c)) |
 > | 2D | `aws verify` | **implemented** — read-only; re-reads live state and simulates effective access ([§ AWS verification](#aws-verification-aws-verify-phase-2d)) |
->
-> The `github` commands (Part E of the architecture doc) are not implemented
-> either.
+> | 2E | `github plan` / `github apply` | **implemented** — read-only plan, then exactly one reviewed GitHub change: the Slack secret, or an additive merge-governance ruleset ([§ GitHub configuration](#github-configuration-github-plan--github-apply-phase-2e)) |
 
 ## Obtaining ssd-onboard
 
@@ -130,6 +129,8 @@ the tools for everything after first onboarding.
 | `aws doctor [--region <r>] [--json]` | nothing (no AWS change either) | Phase 2A: read-only AWS readiness of the configured delivery (§ AWS readiness) |
 | `aws plan [--scope repo\|shared] [--region <r>] [--json]` | `.ssd/aws-plans/<plan-id>/`; an **unexecuted** CloudFormation change set | Phase 2B: a reviewable infrastructure plan (§ AWS plans) |
 | `aws apply --plan-id <id> --account <id> --region <r> [--allow-destructive <n>] [--yes] [--json]` | executes that plan's change set; `apply-started.json` / `apply.json` in its plan directory | Phase 2C: apply one reviewed plan (§ Applying a plan) |
+| `github plan --scope secrets\|protection [--json]` | `.ssd/github-plans/<plan-id>/plan.json` (nothing on GitHub) | Phase 2E: the Slack secret or merge governance, read-only (§ GitHub configuration) |
+| `github apply --plan-id <id> --slug <owner/repo> [--yes] [--json]` | exactly one GitHub change; `apply-started.json` / `apply.json` in its plan directory | Phase 2E: apply one reviewed GitHub plan (§ GitHub configuration) |
 
 `--repo <dir>` points at the consumer repository (default: the current directory).
 Nothing is ever committed; every change is a diff for a pull request.
@@ -327,6 +328,11 @@ Remediation links to GitHub settings are shown only when origin is exactly
 `github.com` and names `repository.slug`; for any other host (GitHub
 Enterprise included) doctor gives the host-neutral steps (*repository
 settings → Rules → Rulesets*) without a link.
+
+doctor itself stays local. To prove merge governance and the Slack secret
+remotely, run `github plan --scope protection` / `--scope secrets`
+(§ GitHub configuration). Those commands report NOT VERIFIED in the same
+cases where GitHub does not let the token see enough.
 
 ## AWS readiness: `aws doctor` (Phase 2A)
 
@@ -938,6 +944,238 @@ ENHANCED scanning it also needs `inspector2:BatchGetAccountStatus` and
 - verify proves the boundary at the moment it runs. It is not continuous
   monitoring.
 
+## GitHub configuration: `github plan` / `github apply` (Phase 2E)
+
+The repository's GitHub side, kept separate from AWS. It has two
+responsibilities, and each one is its own plan:
+
+| Scope | What it configures | Privilege the apply needs |
+| --- | --- | --- |
+| `secrets` | the optional Slack webhook secret named by `notifications.slack.githubSecretName` | write access to Actions secrets (collaborator write/admin, or the fine-grained *Secrets: write* permission) |
+| `protection` | merge governance of `repository.defaultBranch` | repository **admin** (fine-grained *Administration: write*) |
+
+```sh
+ssd-onboard github plan --scope secrets|protection [--json]
+ssd-onboard github apply --plan-id <id> --slug <owner/repo> [--yes] [--json]
+```
+
+There is **no** `github protect` command. Changing merge governance needs
+administration rights and goes through the same reviewed plan as everything
+else: inspect, record an explicit plan, review it, then apply exactly that
+plan. Nothing mutates immediately
+([architecture § D.14](onboarding-architecture.md#d14-phase-2e-as-implemented)).
+
+Authentication is your own GitHub CLI login (`gh auth login`) or `GH_TOKEN`.
+ssd-onboard never reads, accepts or prints a token.
+
+### Repository identity
+
+Every command targets **only** `repository.slug` from `.ssd/onboarding.yml`:
+
+- GitHub's `full_name` for that slug must equal it. Slugs compare
+  case-insensitively, and a rename or transfer BLOCKs.
+- GitHub's `default_branch` must equal `repository.defaultBranch`.
+- An archived repository BLOCKs.
+- A local origin, or origin/HEAD, that names a different repository or branch
+  BLOCKs.
+- An unknown origin is a WARN for `plan` and BLOCKs `apply`: a mutation is
+  never made on an unresolved identity.
+- `apply` additionally requires `--slug` to equal `repository.slug`.
+
+The plan also records the numeric repository id, so a repository deleted and
+recreated under the same name is a different repository.
+
+### `github plan` (read-only on GitHub)
+
+Every call is a `gh api --method GET` to an endpoint built from the validated
+slug, default branch and numeric ruleset ids. No path comes from repository
+content or from a GitHub response. The only write is
+`.ssd/github-plans/<plan-id>/plan.json`. If the same state is planned twice,
+it gets the same id, and the identical existing plan is reused rather than
+overwritten.
+
+**`--scope secrets`.**
+- With Slack disabled, there is nothing to plan and GitHub is not contacted.
+- Otherwise the plan lists the repository's Actions secrets, which gives names
+  and timestamps only. GitHub never returns a secret's value, so the value is
+  **unknowable**.
+- The secret states are `absent` (the plan proposes *create*) and
+  `present — value unknowable` (the plan proposes *rotate*). There is no
+  "verified value" state.
+- If the token may not list secrets, the outcome is NOT VERIFIED.
+
+**`--scope protection`** judges five requirements for the default branch:
+
+| Requirement | Satisfied by |
+| --- | --- |
+| required status check `security-gate` | an entry whose context is **exactly** `security-gate` **and** whose integration is GitHub Actions |
+| code-owner review | `require_code_owner_review: true` |
+| at least one approval | `required_approving_review_count >= 1` |
+| stale approvals dismissed | `dismiss_stale_reviews_on_push: true` |
+| last push approved | `require_last_push_approval: true` |
+
+How it decides:
+
+- **The check name is matched exactly.** `security-gate-pr`, `Security Gate`,
+  `pr/security-gate` and an unpinned `security-gate` do not count. Neither
+  does `gate-mode: …`, the informational check that changes name with the
+  mode.
+- **The check must come from GitHub Actions.** A required check without an
+  integration can be satisfied by any app, or by a commit status anyone with
+  write access can post. The Actions app id is read live from
+  `GET /apps/github-actions` and must be `15368` / `github-actions` /
+  `github`, the identity observed when this was built. If GitHub cannot prove
+  it, the check requirement is NOT VERIFIED.
+- **Which sources count.** The rules come from GitHub's own
+  `rules/branches/<branch>` answer, so GitHub resolves conditions and
+  enforcement. A requirement is satisfied only by a **trusted** source:
+  - an *active* ruleset whose bypass list GitHub returned and which is
+    **empty**; or
+  - classic branch protection that is readable, has `enforce_admins` on, and
+    has no pull-request bypass allowances.
+
+  Rules from several trusted sources add up, because GitHub applies the most
+  restrictive version of each rule.
+- **Bypass.** Any bypass actor makes that source count for nothing:
+  repository roles (admin/maintain/write), organization admins, teams, apps
+  (integrations), deploy keys, or classic admins without `enforce_admins`.
+  The plan proposes the additive ruleset instead.
+- **Unknown bypass.** GitHub returns `bypass_actors` only to someone allowed
+  to edit the ruleset. A bypass list that is missing is **unknown**, not
+  empty, so the requirement is NOT VERIFIED and never compliant. Protected
+  classic settings that this token cannot read are NOT VERIFIED too.
+- **The change is additive only.** At most one operation is planned: create a
+  new ruleset `ssd-merge-governance`. It targets exactly
+  `refs/heads/<default branch>`, has no bypass actors, and holds only the
+  missing rule groups. The pull-request group is code-owner review, one
+  approval, stale-review dismissal and last-push approval. The status-check
+  group is `security-gate` pinned to GitHub Actions.
+- **Nothing existing is edited.** No existing ruleset is edited, no classic
+  protection is changed, and there is no PUT, PATCH or DELETE. An existing
+  compliant ruleset means nothing is planned, so no duplicate is created.
+- **Conflicts BLOCK.** An existing `ssd-merge-governance` that is not exactly
+  an SSD ruleset is an explicit conflict that BLOCKs, for example one with a
+  bypass actor, another branch, changed parameters or extra rules. So is one
+  that lacks a group still missing, because adding it would be an edit. Fix
+  or delete it by hand, then re-plan.
+- **What planning needs.** Planning a ruleset needs the rules for the branch,
+  the repository's ruleset list (so a name is never clobbered), the Actions
+  identity and admin permission. Without them the outcome is NOT VERIFIED.
+
+**CODEOWNERS: GitHub's file, not a local guess.** Two facts are reported
+separately:
+
+- **Remote.** GitHub uses the first of `.github/CODEOWNERS`, `CODEOWNERS`,
+  `docs/CODEOWNERS` that exists **on the default branch**. The plan reads
+  that file, checks it is under GitHub's 3 MB limit, and reads GitHub's own
+  parse errors (`codeowners/errors`), such as unknown owners or invalid
+  lines.
+- **Heuristic.** The local matcher judges whether **GitHub's copy** appears
+  to cover the SSD control paths. A local copy that differs is a warning.
+
+Full protection is all of these together:
+- CODEOWNERS exists on GitHub with no errors and appears complete;
+- GitHub **requires** code-owner review;
+- every other requirement holds.
+
+If CODEOWNERS is missing, protection is **INCOMPLETE**: ssd-onboard never
+invents owner names and never creates the file. A complete local file next
+to a ruleset that does not require code-owner review is not compliant.
+
+### `github apply`
+
+Order is part of the contract, and any failure refuses with nothing changed:
+
+1. `--slug` equals `repository.slug`. This is checked before GitHub is
+   contacted.
+2. `plan.json` is intact: its id is the hash of its bound input, and the
+   observed state matches its digest. The plan has not been applied before,
+   and it holds exactly one operation of its scope.
+3. The plan's repository, default branch, configuration digest and framework
+   ref equal the current ones. The CLI runs from a clean checkout at
+   `framework.ref`.
+4. The plan is **re-derived from live GitHub state** by the same code
+   `github plan` ran, and it must have the **same plan id**. That covers the
+   same repository id and default branch, operations, rulesets, classic
+   protection and secret metadata. Apply never computes a different plan
+   and runs it.
+5. Typed confirmation of the repository, or `--yes`.
+6. For a secrets plan only, the webhook is read now (see below).
+7. The live re-derivation runs **again**, immediately before the change.
+8. `apply-started.json` is written exclusively. Then comes the **one**
+   mutation, and `apply.json` records the result.
+
+The mutations it can make are exactly these:
+
+| Plan | Mutation |
+| --- | --- |
+| secrets | `gh secret set <NAME> --repo github.com/<owner>/<repo> --app actions`, with the value on **stdin** |
+| protection | `gh api --method POST repos/<owner>/<repo>/rulesets --input -`, with the plan's exact ruleset document on stdin |
+
+After the change, apply re-reads the result read-only. For a secret, that is
+the metadata timestamp; for protection, the five requirements. A change it
+cannot observe is a WARN. If GitHub refuses the change, the outcome is
+`APPLY_FAILED`. If the outcome is unknown (a timeout, or an unreadable answer
+after the request was sent), apply says so explicitly.
+
+### Secret handling
+
+- **Where the value comes from.** The webhook is read only by `github apply`
+  of a secrets plan, after confirmation. It comes from a hidden terminal
+  prompt (raw mode, nothing echoed) or, when stdin is deliberately not a
+  terminal, from stdin:
+  `printf '%s' "$URL" | ssd-onboard github apply … --yes`. With piped stdin,
+  `--yes` is required, because stdin cannot also confirm.
+- **Validation.** It must look like a Slack incoming-webhook URL. Errors
+  describe the problem, never the input.
+- **Where it goes.** It is held in one buffer, written to `gh`'s stdin, then
+  zero-filled.
+- **Where it never goes.** It is never in argv, the environment, a log line,
+  `plan.json`, the apply records, the JSON report or an error message. GitHub
+  error text is redacted of the exact value and of token- and webhook-shaped
+  strings. The plan and record writers refuse any text that contains a
+  credential shape or the value being applied.
+- **The child process.** gh runs with `GH_HOST=github.com` pinned. Pagers,
+  prompts, colour, the update notifier and `GH_DEBUG` (which can print
+  request bodies) are all disabled.
+- **The config file.** `.ssd/onboarding.yml` stores only the secret **name**.
+
+### Outcomes and exit codes
+
+| Command | Outcome | Exit |
+| --- | --- | --- |
+| plan | `PLANNED` (recorded), `COMPLIANT` (protection proven, nothing to do), `NO_CHANGES`, `NOTHING_TO_PLAN` (Slack disabled) | 0 |
+| plan | `INCOMPLETE` (provably missing and not plannable, for example CODEOWNERS), `NOT_VERIFIED` (insufficient privilege, or GitHub did not let the token prove the state), `BLOCKED` (identity mismatch, conflict, framework binding), `ERROR` (authentication, timeout, malformed or truncated GitHub data: fail closed) | 1 |
+| apply | `APPLIED` | 0 |
+| apply | `REFUSED`, `APPLY_FAILED`, `ERROR` | 1 |
+| both | usage error | 2 |
+
+Human output has these sections: *Repository*, *Current GitHub state*,
+*Planned changes*, *Protection status*, *Warnings*, *Blocking problems*,
+*Next action* and *Result*. Every GitHub-supplied string (ruleset names,
+check contexts, CODEOWNERS errors, API messages) goes through the shared
+terminal-control sanitization. `--json` prints the report as one document
+(`schemaVersion` 1), and GitHub strings appear in it as exact JSON values.
+
+### Residual limitations
+
+- **Organization rulesets.** Their bypass lists are usually invisible to
+  repository admins, so a requirement they alone provide stays NOT VERIFIED.
+  The additive repository ruleset is what makes it provable.
+- **Admins can still edit rulesets.** "No bypass" means no *standing* bypass.
+  It does not mean admins are powerless.
+- **A drifted `ssd-merge-governance` is not repaired.** v1 never edits a
+  ruleset, so it is remediated by hand.
+- **Private repositories on plans without rulesets** cannot be planned.
+  GitHub refuses the read or the create, and ssd-onboard never falls back to
+  rewriting classic protection.
+- **Fixtures.** The ruleset-detail and classic-protection fixtures follow
+  GitHub's documented schema. The live repository had none to capture
+  read-only ([test/fixtures/github/README.md](../test/fixtures/github/README.md)).
+- **The secret plan.** It binds the secret's metadata timestamp, so a rotation
+  by someone else between plan and apply refuses the apply. Its value can
+  never be compared.
+
 ## The rollout, end to end
 
 ```
@@ -962,6 +1200,11 @@ baseline accept           re-checks provenance against this checkout (HEAD, orig
 promote --enforce         refuses without a valid accepted baseline; shows the diff;
                           generates the delivery workflow for the ECR profile
                           (PR; require `security-gate` in branch protection)
+github plan --scope protection
+github apply --plan-id <id> --slug <owner/repo>
+                          an additive ruleset: security-gate from GitHub Actions,
+                          code-owner review, no bypass (needs admin; CODEOWNERS
+                          with real owners must already be on the default branch)
 ```
 
 Nothing silently switches modes, accepts findings, regenerates a baseline, or
@@ -1043,6 +1286,15 @@ gh secret set SECURITY_NOTIFY_SLACK_URL --repo <owner>/<repo>   # prompts; value
 gh variable delete SECURITY_NOTIFY_SLACK_URL --repo <owner>/<repo>
 ```
 
+or, with `notifications.slack.enabled: true`, let ssd-onboard set it from a
+reviewed plan (the value is read hidden or from stdin and goes to `gh` on stdin
+only):
+
+```sh
+ssd-onboard github plan --scope secrets
+ssd-onboard github apply --plan-id <id> --slug <owner>/<repo>
+```
+
 and pass it as `secrets: slack_notify_webhook: ${{ secrets.SECURITY_NOTIFY_SLACK_URL }}`
 (`ssd-onboard render` does this when `notifications.slack.enabled: true`). The
 old `slack_notify_url` input still works within v1 but warns on every run.
@@ -1053,3 +1305,6 @@ old `slack_notify_url` input still works within v1 but warns on every run.
 needs the same review as the workflows. Cover `/.ssd/`, `/.github/workflows/`,
 the baseline, `.semgrepignore`, and any Gitleaks/TruffleHog config
 ([example](../examples/CODEOWNERS.example)); `validate` warns about gaps.
+Local coverage is a heuristic: `github plan --scope protection` checks the file
+GitHub actually uses on the default branch, GitHub's own parse errors for it,
+and whether GitHub **requires** code-owner review.

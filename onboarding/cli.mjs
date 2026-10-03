@@ -9,7 +9,9 @@
 //
 // `aws …` is a SEPARATE trust boundary (Phase 2): it is dispatched before any
 // repository option parsing, through a dynamic import of ./aws/cli.mjs, so no
-// repository command's module graph contains the AWS executor.
+// repository command's module graph contains the AWS executor. `github …`
+// (Phase 2E) is dispatched the same way, through ./github/cli.mjs, so no
+// repository command's module graph contains the GitHub mutators.
 import { execFile } from 'node:child_process';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -87,6 +89,15 @@ credentials; see \`aws --help\`):
   aws verify [--region <r>] [--json]
                           READ-ONLY: proves the deployed boundary holds (trust, simulated
                           ALLOW and DENY, scanning coverage, SSM target); never repairs
+
+GitHub commands (Phase 2E — a separate trust boundary: the operator's own \`gh\` login;
+see \`github --help\`):
+  github plan --scope secrets|protection [--json]
+                          READ-ONLY on GitHub: the Slack webhook secret (names only) or merge
+                          governance (security-gate, code-owner review, bypass, CODEOWNERS);
+                          records .ssd/github-plans/<plan-id>/ (its only write)
+  github apply --plan-id <id> --slug <owner/repo> [--yes] [--json]
+                          executes exactly that reviewed plan, once, after re-verification
 
 Common options:
   --repo <dir>            consumer repository root (default: current directory)
@@ -878,6 +889,10 @@ export async function main(argv, io = {}) {
       const { awsMain } = await import('./aws/cli.mjs');
       return await awsMain(args, context);
     }
+    if (command === 'github') {
+      const { githubMain } = await import('./github/cli.mjs');
+      return await githubMain(args, context);
+    }
     const { values, positionals } = parseArgs({ args, options: OPTIONS, allowPositionals: true, strict: true });
     if (!command || values.help || command === 'help') {
       out(USAGE);
@@ -902,12 +917,6 @@ export async function main(argv, io = {}) {
         return await cmdBaseline(root, positionals[0], values, context);
       case 'promote':
         return await cmdPromote(root, values, context);
-      case 'github':
-        err(
-          "'ssd-onboard github' is Phase 2E and is not implemented in this version.\n" +
-            'Its reviewed design is in docs/onboarding-architecture.md (Part D.8). Nothing was contacted.'
-        );
-        return 2;
       default:
         throw new UsageError(`unknown command '${command}'`);
     }

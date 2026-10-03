@@ -637,9 +637,9 @@ Both are Phase 2 concerns (D.4, D.5).
 | 2B | `aws plan` | **implemented** — [D.11](#d11-phase-2b-as-implemented), [onboarding-cli.md § AWS plans](onboarding-cli.md#aws-plans-aws-plan-phase-2b) |
 | 2C | `aws apply` | **implemented** — [D.12](#d12-phase-2c-as-implemented), [onboarding-cli.md § Applying a plan](onboarding-cli.md#applying-a-plan-aws-apply-phase-2c) |
 | 2D | `aws verify` | **implemented** — [D.13](#d13-phase-2d-as-implemented), [onboarding-cli.md § AWS verification](onboarding-cli.md#aws-verification-aws-verify-phase-2d) |
-| 2E | `github …` | designed, **not implemented** |
+| 2E | `github plan` / `github apply` | **implemented** — [D.14](#d14-phase-2e-as-implemented), [onboarding-cli.md § GitHub configuration](onboarding-cli.md#github-configuration-github-plan--github-apply-phase-2e) |
 
-D.1–D.9 are the reviewed design; D.10–D.13 record where the implementation
+D.1–D.9 are the reviewed design; D.10–D.14 record where the implementation
 refines it.
 
 ### D.1 Command contract
@@ -781,7 +781,11 @@ the webhook from hidden TTY input (or stdin when not a TTY) and pipes it to
 `gh secret set <name> --repo <o>/<r>` on **stdin** — never argv, never logged.
 Branch protection / rulesets (`security-gate` required, code-owner review, no
 admin bypass) is a distinct `github protect` operation because it needs
-repository administration.
+repository administration. *(Refined in D.14: there is no immediately-mutating
+`protect`. Protection is `github plan --scope protection` + `github apply` of
+that reviewed plan, so governance changes get the same plan/review/apply and
+drift guarantees as AWS. The privilege separation D.8 asked for is kept by
+scope: one plan never holds both a secret and a ruleset.)*
 
 ### D.9 Tests required before Phase 2 ships
 
@@ -1145,6 +1149,172 @@ evidence.
   - A new ENHANCED repository stays NOT VERIFIED until Inspector lists it.
   - Ownership searches only `delivery.aws.region`.
   - verify is a point-in-time check, not monitoring.
+
+### D.14 Phase 2E as implemented
+
+What exists, and where it refines D.8:
+
+- **Command contract (refines D.8).** D.8 named `github plan|apply` for the
+  Slack secret, plus a separate `github protect` because protection needs
+  repository administration. Implemented as:
+  - `github plan --scope secrets|protection [--json]`
+  - `github apply --plan-id <id> --slug <owner/repo> [--yes] [--json]`
+
+  There is **no** `github protect` verb and no alias. A `protect` that
+  mutated immediately would change admin-level governance without a reviewed
+  artifact or drift binding, which is strictly weaker than the AWS
+  plan/apply model. The administration risk D.8 wanted kept apart is kept
+  apart by **scope**: one plan holds one privilege class (a secret, or a
+  ruleset), never both. `plan --scope protection` is also the read-only
+  compliance view.
+- **Modules.** Everything lives under `onboarding/github/`:
+
+  | Module | Role |
+  | --- | --- |
+  | `cli.mjs` | reached only by a dynamic import from `cli.mjs`'s `github` branch, as `aws` is |
+  | `gh-cli.mjs` | the only process runner |
+  | `discover.mjs` | schema-checked reads |
+  | `protection.mjs` | pure evaluation |
+  | `codeowners.mjs` | pure: the remote fact vs the local heuristic |
+  | `identity.mjs` | pure |
+  | `plan.mjs` | `derivePlan`, shared with apply |
+  | `apply.mjs` | executes one plan |
+  | `record.mjs` | the only writer: `.ssd/github-plans/` |
+  | `secret-input.mjs` | reads the secret value |
+  | `report.mjs` | presentation |
+
+  `onboarding/aws` and `onboarding/github` never import each other (a test
+  asserts it), and no repository command's static module graph reaches
+  `onboarding/github`.
+- **Wrapper.** spawn with an argv array and `shell: false`. Three factories:
+  - `readGh({ slug, branch })` makes GETs only. The caller names an endpoint
+    and the wrapper builds it from the validated slug, default branch and a
+    numeric ruleset id. An independent argv check accepts only those exact
+    shapes: no `-f`, `--input`, `--paginate` or `--hostname`, and no other
+    repository, branch or contents path.
+  - `secretSetter({ slug, name })` makes one fixed `gh secret set` with the
+    value on stdin, at most once.
+  - `rulesetCreator({ slug, body })` makes one POST with the plan's document
+    on stdin, at most once.
+
+  The wrapper has no PUT, PATCH or DELETE.
+  - **Child environment.** It pins `GH_HOST=github.com` and sets
+    `GH_PROMPT_DISABLED=1` and `GH_PAGER=cat`. It removes `GH_DEBUG`,
+    `DEBUG`, `GH_REPO` and the enterprise tokens.
+  - **Limits.** A 30 s per-call timeout inside a 180 s run deadline, and
+    bounded output.
+  - **Errors.** A 401, timeout, deadline, overflow or malformed JSON ends the
+    run (ERROR). A 403 or 404 on a privileged read becomes NOT VERIFIED,
+    never "absent": GitHub answers 404 for "no access" too. Absence is
+    claimed only from an empty list, or from a 404 on contents of a
+    repository the token was shown to read.
+- **Live shapes (2026-10-03, GET only, `IamRitz/ssd-security-framework`).**
+  - `rules/branches/main` and `rulesets?includes_parents=true` return `[]`
+    when nothing applies.
+  - `branches/main` returns `protected: false` with
+    `protection.required_status_checks.checks: [{context, app_id}]`.
+  - `branches/main/protection` returns 404 `Branch not protected`, even to an
+    admin.
+  - `codeowners/errors` returns 404 when the branch has no CODEOWNERS.
+  - `actions/secrets` returns names and timestamps only.
+  - `apps/github-actions` returns `id 15368, slug github-actions, owner
+    github`, and an Actions check run on this repository carried
+    `app.id 15368`.
+  - gh prints error bodies on stdout (`status` as a string) and
+    `gh: <message> (HTTP <n>)` on stderr.
+
+  Ruleset detail, `bypass_actors` and full classic protection could not be
+  captured without creating them, so those fixtures follow the documented
+  schema (`test/fixtures/github/README.md`).
+- **Required check (refines D.8).** `security-gate` is compared exactly. The
+  check must also be pinned to the GitHub Actions app id, which is read live
+  and must equal the recorded constant `15368`, or the requirement is NOT
+  VERIFIED. An unpinned required check is not compliant: any app, or a commit
+  status anyone with write access can post, could satisfy it. `gate-mode: …`
+  is never accepted.
+- **Pull-request rule (refines D.8).** The rule requires code-owner review,
+  at least one approval, `dismiss_stale_reviews_on_push` and
+  `require_last_push_approval`. `required_review_thread_resolution: false` is
+  a mandatory field of the rule and adds no governance.
+- **Trust and bypass.** Applicable rules come from `rules/branches/<branch>`,
+  where GitHub resolves conditions and enforcement, so ssd-onboard never
+  re-implements `ref_name` matching. A source counts only when its bypass is
+  **proven** empty:
+  - for an active ruleset, `bypass_actors: []` was returned and
+    `current_user_can_bypass` is absent or `never`;
+  - for classic protection, it is readable, has `enforce_admins` on, and has
+    no bypass allowances.
+
+  A source with bypass actors counts for nothing; actors are listed by type
+  (repository role, organization admin, team, integration, deploy key). An
+  omitted bypass list is unknown, and the requirement is then NOT VERIFIED.
+  Requirements aggregate across trusted sources.
+- **Additive only.** A plan creates at most one ruleset,
+  `ssd-merge-governance`: exactly `refs/heads/<default branch>`, no bypass,
+  only the missing rule groups. Because GitHub aggregates rulesets and applies
+  the most restrictive version of each rule, adding one never weakens or
+  overwrites another.
+  - No existing ruleset or classic protection is edited.
+  - An existing compliant ruleset means no operation, so no duplicate is
+    created.
+  - An `ssd-merge-governance` that is not exactly an SSD ruleset is a BLOCK.
+    So is one that lacks a still-missing group, because adding it would be an
+    edit. Either way it is remediated by hand.
+  - A name is never matched as ownership; GitHub rulesets carry no tags.
+- **CODEOWNERS.** Remote facts:
+  - the file GitHub uses on the default branch, in its lookup order
+    `.github/`, root, `docs/`;
+  - the 3 MB limit;
+  - `codeowners/errors`.
+
+  Heuristic: the local matcher over **GitHub's** copy, with a differing local
+  copy as a warning. Full protection needs CODEOWNERS present with no errors
+  and appearing complete, **plus** GitHub-required code-owner review. If it
+  is missing, the result is INCOMPLETE; owners are never invented.
+- **Secret.** The plan reports `absent` (create) or
+  `present — value unknowable` (rotate). The value is read only by apply,
+  after confirmation, from a hidden TTY or deliberately piped stdin (which
+  then needs `--yes`). It is held in one Buffer, sent to gh's stdin, then
+  zero-filled.
+- **Plan binding.** The plan id is
+  `sha256(canonicalJson(planIdInput))`, over scope, slug, numeric repository
+  id, default branch, configuration digest, framework repository/ref, the
+  exact operations (the full ruleset document) and the sha256 of the observed
+  state (rules, rulesets, details, classic protection, Actions identity,
+  secret metadata).
+
+  `apply` checks, in order:
+  1. `--slug`;
+  2. the record hash and that it was never applied;
+  3. the plan's slug, default branch, configuration digest and framework
+     binding against the current ones;
+  4. the plan **re-derived** from live state by the same `derivePlan`, which
+     must have the identical id;
+  5. confirmation;
+  6. the secret value (secrets plans);
+  7. a **second** live re-derivation;
+  8. `apply-started.json`, the mutation, `apply.json`.
+
+  A GitHub refusal is `APPLY_FAILED`. A timeout after the request is
+  `APPLY_FAILED` with the outcome explicitly unknown.
+- **Outcomes.**
+  - plan `PLANNED` / `COMPLIANT` / `NO_CHANGES` / `NOTHING_TO_PLAN`: exit 0;
+  - plan `INCOMPLETE` / `NOT_VERIFIED` / `BLOCKED` / `ERROR`: exit 1;
+  - apply `APPLIED`: exit 0; `REFUSED` / `APPLY_FAILED` / `ERROR`: exit 1.
+
+  No new exit code.
+- **doctor (unchanged).** doctor stays local. Its GitHub governance, Slack
+  and CODEOWNERS checks remain NOT VERIFIED, and the CLI guide points at
+  `github plan` for the remote facts.
+- **Residual.**
+  - Organization rulesets' bypass lists are usually invisible to repository
+    admins.
+  - Admins can still edit rulesets: "no bypass" means no standing bypass.
+  - A drifted SSD ruleset needs manual remediation (v1 never edits).
+  - Private repositories on plans without rulesets cannot be planned, and
+    there is no classic-protection fallback.
+  - Re-planning an unchanged state reuses the identical plan; a spent plan
+    needs a re-plan once state changes.
 
 ---
 

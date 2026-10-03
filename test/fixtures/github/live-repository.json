@@ -1,0 +1,20 @@
+{
+  "full_name": "IamRitz/ssd-security-framework",
+  "id": 1372600442,
+  "owner": {
+    "login": "IamRitz",
+    "id": 26003726,
+    "type": "User"
+  },
+  "default_branch": "main",
+  "archived": false,
+  "private": false,
+  "visibility": "public",
+  "permissions": {
+    "admin": true,
+    "maintain": true,
+    "push": true,
+    "triage": true,
+    "pull": true
+  }
+}

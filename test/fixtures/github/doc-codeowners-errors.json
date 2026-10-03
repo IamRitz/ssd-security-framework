@@ -1,0 +1,13 @@
+{
+  "errors": [
+    {
+      "line": 1,
+      "column": 7,
+      "kind": "Unknown owner",
+      "source": "/.ssd/ @acme/security",
+      "suggestion": "make sure @acme/security exists and has write access to the repository",
+      "message": "Unknown owner on line 1: make sure @acme/security exists and has write access to the repository",
+      "path": ".github/CODEOWNERS"
+    }
+  ]
+}

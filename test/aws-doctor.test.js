@@ -319,10 +319,10 @@ describe('trust boundary', () => {
     assert.equal(execFileSync('git', ['-C', root, 'status', '--porcelain'], { encoding: 'utf8' }), '');
   });
 
-  it('the github command is still Phase 2E: exit 2, nothing contacted', async (t) => {
+  it('github (Phase 2E) is a separate boundary: apply without its flags is exit 2, nothing contacted', async (t) => {
     const result = await cli(consumer(t), ['github', 'apply']);
     assert.equal(result.code, 2);
-    assert.match(result.err, /not implemented/);
+    assert.match(result.err, /requires --plan-id and --slug/);
     assert.deepEqual(result.f.calls, []);
   });
 });
