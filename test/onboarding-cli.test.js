@@ -698,17 +698,22 @@ describe('Phase 1 makes no AWS calls and no GitHub mutations', () => {
     assert.deepEqual(shimCalls().slice(before), []);
   });
 
-  it('aws apply/verify and the github commands are not implemented and contact nothing', async (t) => {
+  it('the github commands are not implemented, and aws commands without a configuration contact nothing', async (t) => {
     const before = shimCalls().length;
     const root = makeRepo(t, PY_REPO);
-    for (const args of [['aws', 'apply'], ['aws', 'verify'], ['github', 'apply']]) {
-      const result = await cli(root, args);
-      assert.equal(result.code, 2);
-      assert.match(result.err, /not implemented/);
+    const github = await cli(root, ['github', 'apply']);
+    assert.equal(github.code, 2);
+    assert.match(github.err, /not implemented/);
+    // aws apply (Phase 2C) without its flags is a usage error.
+    const apply = await cli(root, ['aws', 'apply']);
+    assert.equal(apply.code, 2);
+    assert.match(apply.err, /requires --plan-id, --account and --region/);
+    // aws plan (Phase 2B) and aws verify (Phase 2D) exist; without a
+    // configuration they stop before AWS.
+    for (const sub of ['plan', 'verify']) {
+      const result = await cli(root, ['aws', sub]);
+      assert.equal(result.code, 1);
     }
-    // aws plan (Phase 2B) exists; without a configuration it stops before AWS.
-    const plan = await cli(root, ['aws', 'plan']);
-    assert.equal(plan.code, 1);
     assert.deepEqual(shimCalls().slice(before), []);
   });
 

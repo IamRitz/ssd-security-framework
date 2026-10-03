@@ -96,7 +96,11 @@ export const OUTCOME = Object.freeze({
   'NOT VERIFIED': 'NOT VERIFIED',
   // `aws apply`: only an observed, successful stack operation is a pass;
   // REFUSED, ERROR and APPLY FAILED fall through to FAIL.
-  APPLIED: 'PASS'
+  APPLIED: 'PASS',
+  // `aws verify` (aws/verify-report.mjs)
+  VERIFIED: 'PASS',
+  'VERIFIED WITH WARNINGS': 'WARN',
+  FAILED: 'FAIL'
 });
 
 // Generated-file plan actions (files.mjs) and stale files.

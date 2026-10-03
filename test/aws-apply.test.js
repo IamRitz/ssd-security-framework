@@ -13,6 +13,7 @@ import { describe, it } from 'node:test';
 import { main } from '../onboarding/cli.mjs';
 import { awsApply } from '../onboarding/aws/apply.mjs';
 import { awsPlan } from '../onboarding/aws/plan.mjs';
+import { verifyAws } from '../onboarding/aws/verify.mjs';
 import { PlanRecordError, planDirOf, writeApplyRecord } from '../onboarding/aws/plan/record.mjs';
 import { canonicalJson, sha256 } from '../onboarding/aws/templates/common.mjs';
 import { serializeConfig } from '../onboarding/lib/config.mjs';
@@ -653,12 +654,12 @@ describe('aws apply: CLI', () => {
     assert.match(r.out, /account-mismatch|must all be equal/);
   });
 
-  it('verify remains unimplemented and contacts nothing', async (t) => {
-    const p = await planVia(t);
-    const c = capture();
-    const w = applyWorld({ root: p.root, planId: p.planId });
-    assert.equal(await main(['aws', 'verify', '--repo', p.root], { framework: FRAMEWORK, awsExec: w.fake.exec, env: {}, ...c.io }), 2);
-    assert.equal(w.fake.calls.length, 0);
+  it('verify (Phase 2D) can never reach the apply mutation: its wrapper refuses execute-change-set', async () => {
+    const executed = [];
+    const aws = verifyAws({ region: 'us-east-1', exec: async (argv) => (executed.push(argv), { stdout: '{}', stderr: '', exitCode: 0 }) });
+    assert.equal(aws.executeChangeSet, undefined);
+    await assert.rejects(aws(['cloudformation', 'execute-change-set', '--stack-name', 'x', '--change-set-name', 'y']), (error) => error.kind === 'refused');
+    assert.deepEqual(executed, []);
   });
 });
 

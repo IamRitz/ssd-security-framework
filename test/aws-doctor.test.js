@@ -164,14 +164,11 @@ describe('aws doctor: exit codes', () => {
     assert.deepEqual(f.calls, []);
   });
 
-  it('apply and verify are not implemented: exit 2, nothing contacted', async (t) => {
-    const root = consumer(t);
-    for (const sub of ['apply', 'verify']) {
-      const result = await cli(root, ['aws', sub]);
-      assert.equal(result.code, 2);
-      assert.match(result.err, /not implemented/);
-      assert.deepEqual(result.f.calls, []);
-    }
+  it('apply without its flags is a usage error: exit 2, nothing contacted', async (t) => {
+    const result = await cli(consumer(t), ['aws', 'apply']);
+    assert.equal(result.code, 2);
+    assert.match(result.err, /requires --plan-id, --account and --region/);
+    assert.deepEqual(result.f.calls, []);
   });
 });
 

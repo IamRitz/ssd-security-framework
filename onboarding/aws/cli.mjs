@@ -9,8 +9,8 @@
 // (unexecuted change sets + .ssd/aws-plans/, its ONLY repository write);
 // Phase 2C implements `aws apply` (executes exactly one recorded change set;
 // writes only apply-started.json / apply.json into that plan's directory).
-// verify is designed (docs/onboarding-architecture.md Part D) and not
-// implemented.
+// Phase 2D implements `aws verify` (read-only, through the same allowlist as
+// doctor; writes nothing).
 import { join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 
@@ -24,6 +24,8 @@ import { awsPlanBlocks, awsPlanErrorBlocks, awsPlanErrorReport } from './plan-re
 import { awsApply, exitCodeOf as applyExitCodeOf } from './apply.mjs';
 import { awsApplyBlocks, awsApplyErrorBlocks, awsApplyErrorReport, awsApplyPreflightBlocks, executingBlocks } from './apply-report.mjs';
 import { PLAN_ID } from './plan/record.mjs';
+import { awsVerify, exitCodeOf as verifyExitCodeOf } from './verify.mjs';
+import { awsVerifyBlocks, awsVerifyErrorBlocks, awsVerifyErrorReport } from './verify-report.mjs';
 import { detectFramework } from '../lib/framework.mjs';
 import { terminalPrompter } from '../lib/prompt.mjs';
 
@@ -61,7 +63,14 @@ instance/role credentials…). ssd-onboard never reads, accepts or prints a key.
                           Never edits .ssd/onboarding.yml or any repository file; writes only
                           apply-started.json / apply.json into the plan directory.
                           Exit 0 applied, 1 refused / error / apply failed
-  verify                  designed (docs/onboarding-architecture.md Part D), not implemented
+  verify [--region <r>] [--json]
+                          READ-ONLY: re-reads the deployed state and proves the boundary holds:
+                          caller, account and region; ownership; OIDC provider; each role's trust,
+                          required access (simulated ALLOW) and forbidden access (simulated
+                          DENY); push/deploy separation; ECR repository, registry scanning and
+                          Inspector coverage; SSM instance Online and its ECR pull access.
+                          Never repairs anything. Needs iam:SimulatePrincipalPolicy.
+                          Exit 0 verified (warnings allowed), 1 failed or not verifiable
 
 Options:
   --repo <dir>            consumer repository root (default: current directory)
@@ -142,11 +151,10 @@ export async function awsMain(args, context) {
         }
         return await cmdAwsApply(resolve(values.repo ?? process.cwd()), values, context);
       case 'verify':
-        context.err(
-          "'ssd-onboard aws verify' is designed but not implemented in this version (Phase 2D).\n" +
-            'Its reviewed design is in docs/onboarding-architecture.md Part D. Nothing was contacted.'
-        );
-        return 2;
+        if (values.scope !== undefined) {
+          throw new AwsUsageError("Unknown option '--scope'");
+        }
+        return await cmdAwsVerify(resolve(values.repo ?? process.cwd()), values, context);
       default:
         throw new AwsUsageError(`unknown aws command '${sub}'`);
     }
@@ -164,6 +172,14 @@ function configurationError(message) {
   return error;
 }
 
+// command -> [what it does to the delivery, what it would have nothing to do]
+const DELIVERY_PURPOSE = {
+  'aws doctor': ['checks', 'check'],
+  'aws plan': ['plans', 'plan'],
+  'aws apply': ['applies plans of', 'apply'],
+  'aws verify': ['verifies', 'verify']
+};
+
 async function loadDelivery(root, command = 'aws doctor') {
   let loaded;
   try {
@@ -176,13 +192,8 @@ async function loadDelivery(root, command = 'aws doctor') {
     throw configurationError(`${CONFIG_PATH} is invalid (run \`ssd-onboard validate\`): ${errors.map((e) => `${e.path}: ${e.message}`).join('; ')}`);
   }
   if (!isEcrProfile(config.profile) || !config.delivery) {
-    throw configurationError(
-      command === 'aws doctor'
-        ? `aws doctor checks the AWS delivery of the container-ecr-framework-gated profile; this repository's profile is ${config.profile} (no delivery.* to check)`
-        : command === 'aws apply'
-          ? `aws apply applies plans of the AWS delivery of the container-ecr-framework-gated profile; this repository's profile is ${config.profile} (no delivery.* to apply)`
-          : `${command} plans the AWS delivery of the container-ecr-framework-gated profile; this repository's profile is ${config.profile} (no delivery.* to plan)`
-    );
+    const [does, todo] = DELIVERY_PURPOSE[command];
+    throw configurationError(`${command} ${does} the AWS delivery of the container-ecr-framework-gated profile; this repository's profile is ${config.profile} (no delivery.* to ${todo})`);
   }
   return config;
 }
@@ -371,4 +382,41 @@ async function cmdAwsApply(root, options, context) {
     context.print(awsApplyBlocks(report, { preflightShown }));
   }
   return applyExitCodeOf(report);
+}
+
+async function cmdAwsVerify(root, options, context) {
+  if (options.region !== undefined && !REGION.test(options.region)) {
+    throw new AwsUsageError(`--region '${options.region}' is not an AWS region name`);
+  }
+  const fail = (error, target = null) => {
+    const errorReport = awsVerifyErrorReport(error, target);
+    if (options.json) {
+      context.json(errorReport);
+    } else {
+      context.printErr(awsVerifyErrorBlocks(errorReport));
+    }
+    return 1;
+  };
+  let config;
+  try {
+    config = await loadDelivery(root, 'aws verify');
+  } catch (error) {
+    return fail(error);
+  }
+  const target = { repository: config.repository.slug, account: config.delivery.aws.accountId, region: options.region ?? config.delivery.aws.region };
+  let report;
+  try {
+    report = await awsVerify({ config, region: options.region ?? null, exec: context.awsExec ?? execAws, env: context.env ?? process.env });
+  } catch (error) {
+    if (error instanceof AwsCliError || error instanceof IdentityError) {
+      return fail(error, target);
+    }
+    throw error;
+  }
+  if (options.json) {
+    context.json(report);
+  } else {
+    context.print(awsVerifyBlocks(report));
+  }
+  return verifyExitCodeOf(report);
 }

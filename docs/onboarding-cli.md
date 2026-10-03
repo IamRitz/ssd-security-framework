@@ -22,7 +22,7 @@ The manual procedure it automates: [onboarding.md](onboarding.md).
 > | 2A | `aws doctor` | **implemented** — read-only ([§ AWS readiness](#aws-readiness-aws-doctor-phase-2a)) |
 > | 2B | `aws plan` | **implemented** — writes `.ssd/aws-plans/<plan-id>/` and creates **unexecuted** CloudFormation change sets ([§ AWS plans](#aws-plans-aws-plan-phase-2b)) |
 > | 2C | `aws apply` | **implemented** — executes exactly one reviewed change set after re-verifying it ([§ Applying a plan](#applying-a-plan-aws-apply-phase-2c)) |
-> | 2D | `aws verify` | not implemented (exit 2) |
+> | 2D | `aws verify` | **implemented** — read-only; re-reads live state and simulates effective access ([§ AWS verification](#aws-verification-aws-verify-phase-2d)) |
 >
 > The `github` commands (Part E of the architecture doc) are not implemented
 > either.
@@ -794,6 +794,149 @@ In addition to `aws plan`'s access, the operator needs
 `cloudformation:ExecuteChangeSet` and `cloudformation:GetTemplate` on the stack,
 and the permissions CloudFormation uses to create or update the resources (no
 service role is passed).
+
+## AWS verification: `aws verify` (Phase 2D)
+
+`aws verify` answers one question: **is the AWS state deployed today actually
+safe for this repository's delivery?** It is not a planner and not a mutator.
+It re-reads live state and does not take a CloudFormation `*_COMPLETE`, a
+successful `aws apply`, a resource name or a configuration value as evidence.
+
+```sh
+AWS_PROFILE=<operator-profile> node ssd-framework/onboarding/cli.mjs aws verify --repo <consumer-repo> [--region <r>] [--json]
+```
+
+Credentials, time budget, region resolution, identity order and redaction are
+exactly `aws doctor`'s (§ AWS readiness): `--region` or `delivery.aws.region`,
+never the CLI default, and a disagreeing `--region` fails before AWS is
+contacted. `sts get-caller-identity` runs first, and a wrong account or the
+root user fails before any resource is read. The report prints the
+repository, account, region, caller ARN and `AWS_PROFILE` (its name only). No
+credential is ever printed.
+
+**Read-only by construction.** verify receives only the read-only wrapper
+(`readOnlyAws`, the same explicit `service operation --flag` allowlist as
+doctor). Every call it makes is a `get-*`, `list-*`, `describe-*`,
+`batch-get-*` or `simulate-*` read, plus `sts get-caller-identity`. Every
+mutating verb (`create`, `update`, `delete`, `put`, `attach`, `detach`, `set`,
+`tag`, `untag`, `register`, `modify`, `execute-change-set`, `send-command`…)
+is refused before a process starts (`test/aws-verify.test.js`). There is **no
+controlled live probe**:
+- assuming a role for real needs a GitHub-issued OIDC token, which an operator
+  cannot mint;
+- a real `ssm send-command` would run on the production instance.
+
+Effective access is proven with `iam simulate-principal-policy` instead, which
+has no side effect. verify never repairs anything. It never updates IAM,
+attaches policies, changes ECR or registry scanning, enables Inspector, touches
+SSM or instance profiles, or edits `.ssd/onboarding.yml` or workflows. Each
+problem prints what was **observed**, what was **expected**, **why** it matters
+and how to **remediate** it.
+
+### What is checked
+
+Resource exists, resource is owned, configuration looks right, effective
+authorization is right, and service is operational are separate facts, so
+they are separate checks:
+
+| Section | Check | FAIL when | NOT VERIFIED when |
+| --- | --- | --- | --- |
+| Identity | Caller account / principal / region | wrong account; root user; `--region` ≠ config | |
+| GitHub OIDC | Provider | absent; another account; no `sts.amazonaws.com` audience | unreadable |
+| | Subject format *(advisory)* | | **always**: which format GitHub sends needs the GitHub API |
+| Push/scan role, Deploy role | Role | absent; another ARN | unreadable |
+| | Trust | any path beyond this repository and the role's context (the offline evaluator of `aws doctor`): wildcard, org-wide or other repository, other branch/environment, `pull_request`, wrong/missing `aud`, other federated provider, `*`/cross-account principal, unsupported operator | role unavailable |
+| | Required access | a required action **simulates** to a deny | simulation denied to the operator, malformed, truncated or incomplete; a deny that depends on missing context values |
+| | Negative access | a forbidden action **simulates** to `allowed`; the role's policy text grants `*:*`, `Allow`+`NotAction` on everything, or a forbidden action | as above; an implicit deny that depends on missing context values; a policy unreadable |
+| Separation of duties | Distinct push and deploy roles | same configured ARN; same live ARN or `RoleId`; push role may `ssm:SendCommand` the instance; deploy role may `ecr:PutImage` | a role unreadable; no `RoleId`; simulation unavailable |
+| ECR | Repository | absent; ARN not exactly `arn:…:ecr:<region>:<account>:repository/<name>`; public repository policy | unreadable; no `registryId` |
+| | Tag immutability | **managed** repository not `IMMUTABLE` (drift from its stack) | managed and not reported |
+| | Managed settings *(managed only)* | `scanOnPush` off or encryption ≠ `AES256` (drift) | encryption not reported |
+| | Registry scanning coverage | no `SCAN_ON_PUSH`/`CONTINUOUS_SCAN` rule whose `WILDCARD` filter matches the **whole** repository name (MANUAL is not coverage); configuration of another registry | unreadable; unknown scan type; an unevaluated filter type could matter |
+| | Inspector enabled *(ENHANCED)* | Inspector ECR scanning not `ENABLED` | unreadable |
+| | Inspector coverage *(ENHANCED)* | a coverage record not `ACTIVE` | **no** coverage record (Inspector enabled does not prove this repository is covered); unreadable |
+| | Inspector evidence access *(ENHANCED)* | push/scan role cannot `inspector2:ListCoverage`/`ListFindings` | simulation unavailable |
+| SSM | Instance | absent; another account; not running | unreadable |
+| | Online | SSM does not list **this** instance id; `PingStatus` ≠ `Online` | unreadable |
+| | ECR pull access | no instance profile / profile in another account / not exactly one role; the instance role cannot **simulate** `ecr:GetAuthorizationToken` + `BatchGetImage` + `GetDownloadUrlForLayer` on the repository (a **proposed** policy is printed, never attached) | simulation unavailable; role unreadable |
+| Ownership | per resource | configured `managed` but not proven owned (expected stack, settled state, SSD tags incl. `ssd:consumer-repository`), or owned under another logical id | stack lookup denied |
+
+With `existing` ownership, tag mutability keeps the doctor's advisory WARN
+(an owner decision), and ownership reports `exists, not owned` without ever
+claiming management. A resource that only has the expected name is **never**
+managed.
+
+### Effective permissions
+
+The probes come from the one role contract (`roleRequirements` in
+`aws/policy/permissions.mjs`, the same contract `aws plan`'s policy builder
+and `aws doctor` use), and each one is simulated against the role's ARN:
+
+| Role | Expected ALLOW | Expected DENY |
+| --- | --- | --- |
+| push/scan | `ecr:GetAuthorizationToken` on `*`; `BatchCheckLayerAvailability`, `InitiateLayerUpload`, `UploadLayerPart`, `CompleteLayerUpload`, `PutImage`, `DescribeImageScanFindings` on the repository; with ENHANCED, `inspector2:ListCoverage`/`ListFindings` | `ssm:SendCommand` on the instance; ECR push on another repository; `iam:PassRole` |
+| deploy | `ssm:SendCommand` on the instance **and** `AWS-RunShellScript`; `ssm:GetCommandInvocation` on `*` | ECR push on the repository; `ssm:SendCommand` on another instance (another document: WARN); `iam:PassRole` |
+| both delivery roles | | `sts:AssumeRole` on an unrelated role; `secretsmanager:GetSecretValue` on an unrelated secret; `iam:PutRolePolicy`/`AttachRolePolicy`/`UpdateAssumeRolePolicy` on **itself**; `iam:CreateRole`; `ecr:SetRepositoryPolicy`/`DeleteRepository` on the repository; `ecr:PutRegistryScanningConfiguration` |
+| instance role | `ecr:GetAuthorizationToken` on `*`; `BatchGetImage`, `GetDownloadUrlForLayer` on the repository | ECR push on the repository (WARN) |
+
+"Unrelated" resources are probe ARNs under `ssd-onboard-probe/` that exist
+nowhere. A grant that matches them is a grant beyond the configured resources.
+Only `allowed` is ALLOW, and `implicitDeny`/`explicitDeny` are DENY. Any other
+decision is malformed and NOT VERIFIED. So is an answer that is missing,
+duplicated, truncated or about another resource.
+
+**What simulation covers:** identity policies, permissions boundaries and
+Organizations SCPs. **What it does not:** resource policies (repository
+policies are still read and judged on their own), session policies, VPC
+endpoint policies and real request context. A probe set is also finite, so the
+role's own policy documents are still analysed offline as a backstop
+(administrator access, `NotAction`, forbidden grants).
+
+### Outcomes and exit codes
+
+The status semantics are the Phase 2A contract: `required` decides whether a
+NOT VERIFIED blocks.
+
+| Condition | Outcome | Exit |
+| --- | --- | --- |
+| every check PASS | `VERIFIED` | 0 |
+| WARN, or NOT VERIFIED only on an advisory check (subject format, `existing` tag mutability/ownership) | `VERIFIED_WITH_WARNINGS` | 0 |
+| a **required** check NOT VERIFIED | `NOT_VERIFIED` | 1 |
+| any FAIL | `FAILED` | 1 |
+| could not run (credentials, deadline, malformed identity, configuration) | `ERROR` | 1 |
+| usage error (`--scope`, a malformed `--region`, an extra argument) | — | 2 |
+
+Uncertainty never becomes PASS. A run against a correct deployment ends
+`VERIFIED_WITH_WARNINGS` while the subject format stays unverifiable without
+the GitHub API.
+
+`--json` prints one document (`schemaVersion` 1, `command: "aws verify"`) with
+`target`, `outcome`, `counts`, `checks`, `skipped` and `awsCalls`. `target`
+holds `repository`, `account`, `region`, `regionSource`, `caller` and
+`awsProfile`. Every check has `id`, `section`, `title`, `status`, `required`,
+`basis` (`runtime`, `configuration`, `policy-document`, `simulation`, …),
+`why`, `observed`, `expected`, `findings` and `remediation`. The document
+contains no ANSI and no human formatting, and it lists every simulated probe
+(human output abbreviates long evidence lists).
+
+**Prerequisites.** Besides the read access of `aws doctor`, the operator
+needs `iam:SimulatePrincipalPolicy` on the push/scan, deploy and instance
+roles. Without it, effective access is NOT VERIFIED and verify exits 1. With
+ENHANCED scanning it also needs `inspector2:BatchGetAccountStatus` and
+`inspector2:ListCoverage`.
+
+**Residual limitations.**
+- Resource, session and VPC endpoint policies are not part of simulation.
+- The GitHub OIDC subject format GitHub actually issues is not verified
+  (advisory).
+- A freshly created ENHANCED repository has no Inspector coverage record until
+  Inspector evaluates it, so it is NOT VERIFIED until then.
+- Only `delivery.aws.region` is searched for owning stacks, while IAM is
+  global.
+- Lifecycle policy is reported, not judged: the delivery stack does not manage
+  one.
+- verify proves the boundary at the moment it runs. It is not continuous
+  monitoring.
 
 ## The rollout, end to end
 

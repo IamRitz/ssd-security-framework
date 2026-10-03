@@ -636,11 +636,11 @@ Both are Phase 2 concerns (D.4, D.5).
 | 2A | `aws doctor` | **implemented** — [D.10](#d10-phase-2a-as-implemented), [onboarding-cli.md § AWS readiness](onboarding-cli.md#aws-readiness-aws-doctor-phase-2a) |
 | 2B | `aws plan` | **implemented** — [D.11](#d11-phase-2b-as-implemented), [onboarding-cli.md § AWS plans](onboarding-cli.md#aws-plans-aws-plan-phase-2b) |
 | 2C | `aws apply` | **implemented** — [D.12](#d12-phase-2c-as-implemented), [onboarding-cli.md § Applying a plan](onboarding-cli.md#applying-a-plan-aws-apply-phase-2c) |
-| 2D | `aws verify` | designed, **not implemented** (exit 2, contacts nothing) |
+| 2D | `aws verify` | **implemented** — [D.13](#d13-phase-2d-as-implemented), [onboarding-cli.md § AWS verification](onboarding-cli.md#aws-verification-aws-verify-phase-2d) |
 | 2E | `github …` | designed, **not implemented** |
 
-D.1–D.9 are the reviewed design; D.10, D.11 and D.12 record where the
-implementation refines it.
+D.1–D.9 are the reviewed design; D.10–D.13 record where the implementation
+refines it.
 
 ### D.1 Command contract
 
@@ -1067,6 +1067,84 @@ What exists, and where it refines D.1 and D.7:
   are not cleaned up (no delete permission by design). (4) Full-document
   change-set equality means an AWS CLI upgrade that adds a field between plan
   and apply forces a re-plan.
+
+### D.13 Phase 2D as implemented
+
+`aws verify` decides whether the deployed state holds the delivery's security
+boundary. Its evidence is live state and IAM simulation. A CloudFormation
+status, an `aws apply` record, a name or a configuration value is never
+evidence.
+
+- **Modules.**
+  - `aws/verify.mjs` holds the orchestration and the verify-only pure checks.
+  - `aws/verify-report.mjs` is the presentation, built on `lib/output.mjs`.
+  - `verificationProbes()` in `policy/permissions.mjs` is built on
+    `roleRequirements()`, so there is no second permission contract.
+  - `simulateProbes()` in `discover/iam-role.mjs` is a strict simulation
+    reader.
+  - `ownershipTargets()` was extracted from `doctor.mjs` unchanged.
+
+  Everything else is reused from Phase 2A: the discovery functions,
+  `evaluateTrust`, `evaluateOwnership`, `scanningCoverage`, and doctor's pure
+  checks, which verify adopts and makes stricter where verification needs it.
+  verify's module graph reaches neither the planner, the plan record, nor any
+  writer (asserted).
+- **Allowlist (refines D.1).** verify uses `readOnlyAws()` itself, with no
+  table of its own. `READ_ONLY_OPERATIONS` already held every read verify
+  needs, including `simulate-principal-policy`, so nothing was added to it.
+  `verifyAws` is that wrapper, and the tests assert it refuses every mutating
+  verb before execution.
+- **No controlled live invocation (refines D.1).** D.1 allowed "explicitly
+  listed controlled invocations"; Phase 2D lists none:
+  - a real `AssumeRoleWithWebIdentity` needs a GitHub-issued token;
+  - a real `ssm send-command` executes on the production instance;
+  - simulation proves both ALLOW and DENY of identity policies, boundaries
+    and SCPs without a side effect.
+
+  Live probes belong to Phase 3 (E.7).
+- **Effective permissions.** Every role is simulated for what it must do
+  (expected ALLOW) and what it must not (expected DENY):
+  - the delivery roles get the contract's forbidden list, plus a boundary
+    common to both: no `sts:AssumeRole` of another role, no secret read, no
+    rewrite of their own IAM, no `iam:CreateRole`, no change to the
+    repository policy or registry scanning;
+  - the instance role gets ECR pull.
+
+  An answer that is missing, duplicated, truncated, about another resource,
+  or carries an unknown decision makes the whole simulation NOT VERIFIED. A
+  deny that depends on missing context values proves neither ALLOW nor DENY.
+  The offline breadth analysis (administrator, `NotAction`) stays a
+  backstop, because a probe set is finite.
+- **Stricter than doctor.**
+  - Simulation is **required**: if the operator may not simulate, the result
+    is NOT VERIFIED and verify exits 1.
+  - A managed repository must be `IMMUTABLE`, with `scanOnPush` and `AES256`
+    as its stack declares; drift is FAIL.
+  - The repository ARN must be exactly the configured account, region and
+    name.
+  - The scanning configuration must be this registry's.
+  - Inspector enabled, Inspector coverage and the push role's
+    Inspector-evidence access are three checks, and no coverage record is
+    NOT VERIFIED (doctor: WARN).
+  - A managed resource must be its stack's resource under the logical id
+    ssd-onboard gave it.
+  - Push/deploy separation is its own check: distinct configured ARNs,
+    distinct live ARNs and `RoleId`s, push cannot `ssm:SendCommand`, deploy
+    cannot `ecr:PutImage`.
+- **Outcomes.** These are the doctor contract with verification words:
+  `VERIFIED` / `VERIFIED_WITH_WARNINGS` exit 0; `NOT_VERIFIED` (a required
+  check), `FAILED` and `ERROR` exit 1; usage errors exit 2. A correct
+  deployment ends `VERIFIED_WITH_WARNINGS`, because the subject format
+  remains an advisory NOT VERIFIED.
+- **Independence from Phase 2C.** verify reads no plan or apply record. It
+  verifies the configuration's desired state against AWS, so it applies
+  equally to resources an operator created by hand (`existing`).
+- **Residual.**
+  - Resource, session and VPC endpoint policies are outside simulation.
+  - The GitHub subject format is unverified.
+  - A new ENHANCED repository stays NOT VERIFIED until Inspector lists it.
+  - Ownership searches only `delivery.aws.region`.
+  - verify is a point-in-time check, not monitoring.
 
 ---
 

@@ -435,6 +435,18 @@ export function ownershipCheck({ label, id, mode, evaluation, resourceState, sta
 
 // --- orchestration ------------------------------------------------------------------
 
+// The resources whose ownership is evaluated, and where their owner would be.
+// Shared by `aws doctor` and `aws verify`. roles: [{ key, label, arn, role }].
+export function ownershipTargets({ config, oidc, repo, roles }) {
+  const d = config.delivery;
+  const slug = config.repository.slug;
+  return [
+    { id: 'ownership.oidc-provider', label: 'OIDC provider (shared)', mode: d.oidcProvider, state: oidc.state, physicalId: oidc.state === 'present' ? oidc.value.arn : null, type: 'AWS::IAM::OIDCProvider', scope: 'shared', stackName: SHARED_STACKS.githubOidc, tags: oidc.state === 'present' ? oidc.value.tags : null },
+    { id: 'ownership.ecr-repository', label: 'ECR repository', mode: d.ecr.ownership, state: repo.state, physicalId: d.ecr.repository, type: 'AWS::ECR::Repository', scope: 'repo', stackName: repoStackName(slug), tags: repo.state === 'present' && repo.value.tags.state === 'present' ? repo.value.tags.value : null },
+    ...roles.map((r) => ({ id: `ownership.${r.key}-role`, label: `${r.label} role`, mode: r.key === 'push' ? d.roles.pushScanOwnership : d.roles.deployOwnership, state: r.role.state === 'present' && r.role.value.arn === r.arn ? 'present' : 'unavailable', physicalId: r.role.state === 'present' ? r.role.value.name : null, type: 'AWS::IAM::Role', scope: 'repo', stackName: repoStackName(slug), tags: r.role.state === 'present' ? r.role.value.tags : null }))
+  ];
+}
+
 // The outcome contract. `required` is the only thing that separates the two
 // kinds of NOT VERIFIED:
 //   any FAIL                         -> BLOCKED              (exit 1)
@@ -539,12 +551,7 @@ export async function awsDoctor({ config, region: explicitRegion = null, exec, e
 
   // Ownership (discovery of the stack relationship, for resources that exist).
   const owned = [];
-  const ownershipTargets = [
-    { id: 'ownership.oidc-provider', label: 'OIDC provider (shared)', mode: d.oidcProvider, state: oidc.state, physicalId: oidc.state === 'present' ? oidc.value.arn : null, type: 'AWS::IAM::OIDCProvider', scope: 'shared', stackName: SHARED_STACKS.githubOidc, tags: oidc.state === 'present' ? oidc.value.tags : null },
-    { id: 'ownership.ecr-repository', label: 'ECR repository', mode: d.ecr.ownership, state: repo.state, physicalId: d.ecr.repository, type: 'AWS::ECR::Repository', scope: 'repo', stackName: repoStackName(slug), tags: repo.state === 'present' && repo.value.tags.state === 'present' ? repo.value.tags.value : null },
-    ...roles.map((r) => ({ id: `ownership.${r.key}-role`, label: `${r.label} role`, mode: r.key === 'push' ? d.roles.pushScanOwnership : d.roles.deployOwnership, state: r.role.state === 'present' && r.role.value.arn === r.arn ? 'present' : 'unavailable', physicalId: r.role.state === 'present' ? r.role.value.name : null, type: 'AWS::IAM::Role', scope: 'repo', stackName: repoStackName(slug), tags: r.role.state === 'present' ? r.role.value.tags : null }))
-  ];
-  for (const o of ownershipTargets) {
+  for (const o of ownershipTargets({ config, oidc, repo, roles })) {
     const evaluation = o.state === 'present' ? evaluateOwnership({ discovered: await discoverStack(aws, o.physicalId), resourceTags: o.tags, expectedType: o.type, slug, scope: o.scope, expectedStackName: o.stackName, region: resolved.region }) : null;
     owned.push(ownershipCheck({ label: o.label, id: o.id, mode: o.mode, evaluation, resourceState: o.state, stackName: o.stackName, region: resolved.region }));
   }
