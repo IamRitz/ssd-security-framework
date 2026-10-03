@@ -244,7 +244,7 @@ break-glass:
 | `synthetic_lambda_function` / `synthetic_lambda_role_arn` / `synthetic_aws_region` | `''` | Isolated test broker, used **only** when the gate evidence records a synthetic fixture. There is no input that turns synthetic routing on or off. |
 | `timeout_seconds` | `900` | How long to wait for a verified decision. |
 | `slack_notify_url` | `''` | **Deprecated** — pass the `slack_notify_webhook` secret instead. An additional alert when the request is **not** delivered; the source workflow always sends its own BLOCK alert. A webhook URL is a credential and an input is printed unmasked in run logs, so a non-empty value now emits a warning. Still honoured within v1 when no secret is passed. |
-| `pr_number` | `''` | Recorded in the request. |
+| `pr_number` | `''` | Display only, and only for a `pull_request` run: the broker takes the PR number from the verified token's `ref` and **refuses** a request whose number disagrees, or whose run is not `pull_request` (see below). |
 
 Secret: `slack_notify_webhook` (optional), read by the notifier step **only**, and
 taking precedence over the deprecated `slack_notify_url` input. It is not a cloud
@@ -263,7 +263,14 @@ mutation cases that reorder it:
    production-vs-synthetic route from `synthetic`;
 4. **only then** `aws-actions/configure-aws-credentials`, with the role the
    preflight resolved;
-5. request, poll (requestId + gateDigest verified exactly, as before);
+5. request, poll (requestId + gateDigest verified exactly, as before). Each broker
+   call carries its own freshly minted GitHub OIDC token for the audience
+   `ssd-break-glass` (`identityToken`, beside the payload, never in argv, an
+   output or an artifact). The broker derives the repository, PR and run from
+   that token and accepts each token once. A request needs a `pull_request` run
+   and a caller that pins this workflow by **exact SHA**; a `@v1` tag pin is
+   refused by the hardened broker. Contract:
+   [break-glass-setup.md § Who is asking](break-glass-setup.md#who-is-asking-verified-github-identity);
 6. always: record `break-glass-result.json`, notify, upload `break-glass-results`, enforce.
 
 | Output | Values |

@@ -4,6 +4,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath, URL } from 'node:url';
 
 import { lambdaInvokerFromEnv } from './break-glass-lambda-invoke.mjs';
+import { mintBreakGlassIdentityToken } from './break-glass-oidc-token.mjs';
 
 const DEFAULT_GATE_PATH = 'reports/security-gate.json';
 const DEFAULT_OUTPUT_PATH = 'reports/break-glass-request.json';
@@ -64,13 +65,19 @@ export async function notifyBreakGlass({
   fetchImpl = globalThis.fetch,
   // When set, the broker is invoked directly over IAM (GitHub OIDC) instead of the
   // shared-secret webhook; endpoint and sharedSecret are then unused.
-  invoke = null
+  invoke = null,
+  // Lambda transport only: async () -> a fresh `ssd-break-glass` GitHub OIDC
+  // token. The broker derives the repository, PR and run from it and refuses a
+  // request without one. It travels beside the payload, never inside it.
+  mintIdentityToken = null
 }) {
   const findings = validateEligibleGate(gate);
   let send;
   if (invoke) {
+    assert(typeof mintIdentityToken === 'function', 'the Lambda transport needs a GitHub OIDC identity token minter');
     send = async (payload) => {
-      const result = await invoke({ action: 'notify', payload });
+      const identityToken = await mintIdentityToken();
+      const result = await invoke({ action: 'notify', payload, identityToken });
       assert(result?.ok === true, `break-glass broker rejected notify: ${result?.error ?? 'no response'}`);
       return result.body;
     };
@@ -157,7 +164,8 @@ async function main() {
       sharedSecret: process.env.BREAK_GLASS_SHARED_SECRET,
       context,
       timeoutSeconds,
-      invoke: lambdaInvokerFromEnv(process.env)
+      invoke: lambdaInvokerFromEnv(process.env),
+      mintIdentityToken: () => mintBreakGlassIdentityToken()
     });
     await mkdir(dirname(options.output), { recursive: true });
     await writeFile(options.output, `${JSON.stringify(result, null, 2)}\n`);

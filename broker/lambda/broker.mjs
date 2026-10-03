@@ -1,0 +1,324 @@
+// Transport-neutral break-glass broker used by the Lambda handlers.
+//
+// Verification, authorization, and the claim/finalize decisions are the shared
+// modules imported verbatim — the same ones the Express service imports and the
+// n8n Code nodes mirror. The only thing this file adds is persistence: each
+// decision the modules make is committed with a DynamoDB conditional write, which
+// is what makes a rapid double-click safe by construction instead of by
+// serializing executions.
+//
+// IDENTITY. Both CI actions (notify, status) require a fresh GitHub OIDC token
+// for the `ssd-break-glass` audience, verified by `verifyIdentity` and accepted
+// once only (consumeTokenId). The repository, pull request and run a request
+// belongs to come from that token; approvers are looked up by the immutable
+// repository_id; the audit comment goes to the token's repository and PR; and a
+// status read must come from the same repository, run and run attempt that
+// filed the request. Tokens are never logged, stored or echoed.
+import { createHash } from 'node:crypto';
+
+import {
+  verifySlackSignature,
+  parseSlackInteraction,
+  extractSlackDecision
+} from '../authorize/slack-interaction-verify.mjs';
+import { authorizeSlackInteraction } from '../authorize/slack-authorize.mjs';
+import {
+  claimDecision,
+  finalizeDecision,
+  buildAuditComment
+} from '../authorize/break-glass-decision.mjs';
+import { buildApprovalMessage, buildDecisionUpdate, ephemeral } from '../messages.mjs';
+import { IdentityRejected } from '../identity/github-oidc.mjs';
+import { bindRequestIdentity, createPendingRequest, statusView, validateNotifyPayload } from '../request.mjs';
+import { ConditionFailed } from './dynamodb-store.mjs';
+
+const SLACK_RESPONSE_URL = /^https:\/\/hooks\.slack\.com\//;
+const REQUEST_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+// A caller-asserted value copied into a log line: bounded, never interpreted.
+const claimed = (value) => (typeof value === 'string' ? value.slice(0, 200) : null);
+
+export function createBroker({
+  store,
+  slack,
+  github,
+  signingSecret,
+  approverMap,
+  // async (token) -> verified GitHub identity, or throws IdentityRejected.
+  verifyIdentity,
+  slackChannelId,
+  now = () => new Date(),
+  randomUUID = () => globalThis.crypto.randomUUID(),
+  log = (entry) => console.log(JSON.stringify(entry))
+}) {
+  // --- CI identity -------------------------------------------------------------
+  // Verify the token, then spend it. Returns { identity } or { rejected }.
+  // Rejections log enough to investigate (code, any verified ids, what the
+  // payload claimed) and never the token.
+  async function authenticate(action, identityToken, claimedRepository) {
+    let verified;
+    try {
+      if (typeof verifyIdentity !== 'function') throw new IdentityRejected('verifier_not_configured');
+      verified = await verifyIdentity(identityToken);
+    } catch (error) {
+      if (!(error instanceof IdentityRejected)) throw error;
+      log({ event: 'identity_rejected', action, code: error.code, claimedRepository: claimed(claimedRepository) });
+      return { rejected: { ok: false, statusCode: 401, error: error.message } };
+    }
+    const fresh = await store.consumeTokenId({
+      jtiHash: createHash('sha256').update(verified.jti).digest('hex'),
+      exp: verified.exp,
+      repositoryId: verified.repositoryId,
+      runId: verified.runId,
+      runAttempt: verified.runAttempt,
+      action
+    });
+    if (!fresh) {
+      log({ event: 'identity_rejected', action, code: 'token_replayed', ...who(verified) });
+      return { rejected: { ok: false, statusCode: 401, error: 'identity_rejected: token_replayed' } };
+    }
+    return { identity: verified };
+  }
+
+  const who = (identity) => ({
+    repositoryId: identity.repositoryId,
+    repository: identity.repository,
+    runId: identity.runId,
+    runAttempt: identity.runAttempt
+  });
+
+  // --- CI notify ------------------------------------------------------------
+  // Write order (asserted in test/broker-oidc-identity.test.js, "notify ordering"):
+  //   1. payload shape, token verification              no writes
+  //   2. replay claim on the token's jti                first write
+  //   3. payload must agree with the token              no writes
+  //   4. putPending (fresh UUID, conditional)
+  //   5. Slack post + setSlackRef; on failure deletePending, then 502
+  // The token is spent before anything else is written, so a resend of the
+  // same event can never create a second request; any retry needs a new token
+  // and, after a failure at 4 or 5, leaves at most one request with an
+  // approval message.
+  async function notify(payload, identityToken) {
+    try {
+      validateNotifyPayload(payload);
+    } catch (error) {
+      return { ok: false, statusCode: 400, error: error.message };
+    }
+    if (!slackChannelId) return { ok: false, statusCode: 500, error: 'SLACK_CHANNEL_ID is not configured' };
+
+    const auth = await authenticate('notify', identityToken, payload.context.repository);
+    if (auth.rejected) return auth.rejected;
+    let bound;
+    try {
+      bound = bindRequestIdentity(payload, auth.identity);
+    } catch (error) {
+      if (!(error instanceof IdentityRejected)) throw error;
+      log({
+        event: 'identity_rejected',
+        action: 'notify',
+        code: error.code,
+        ...who(auth.identity),
+        claimedRepository: claimed(payload.context.repository),
+        claimedPullRequest: claimed(String(payload.context.pullRequest ?? ''))
+      });
+      return { ok: false, statusCode: 403, error: error.message };
+    }
+
+    const request = createPendingRequest(payload, { now: now(), randomUUID, bound });
+    // Store before posting so a fast click finds the request; roll back and fail
+    // closed if Slack refuses the message.
+    await store.putPending(request);
+    try {
+      const posted = await slack.postMessage(buildApprovalMessage(request, slackChannelId));
+      await store.setSlackRef(request.requestId, { channel: posted.channel, ts: posted.ts });
+    } catch (error) {
+      await store.deletePending(request.requestId).catch(() => {});
+      return { ok: false, statusCode: 502, error: `slack_post_failed: ${error.message}` };
+    }
+    log({
+      event: 'notify',
+      requestId: request.requestId,
+      ...who(request.identity),
+      pullRequest: request.identity.pullRequest,
+      jobWorkflowRef: request.identity.jobWorkflowRef,
+      jti: request.identity.jti
+    });
+    return {
+      ok: true,
+      statusCode: 201,
+      body: {
+        requestId: request.requestId,
+        gateDigest: request.gateDigest,
+        status: request.status,
+        createdAt: request.createdAt,
+        expiresAt: request.expiresAt
+      }
+    };
+  }
+
+  // --- CI status poll ---------------------------------------------------------
+  // Bound to the run that filed the request: a request id alone is not
+  // authorization. A request with no stored identity (filed before this
+  // hardening) matches nobody.
+  async function status(requestId, identityToken) {
+    const auth = await authenticate('status', identityToken, null);
+    if (auth.rejected) return auth.rejected;
+    const id = String(requestId || '');
+    const request = REQUEST_ID.test(id) ? await store.get(id) : undefined;
+    if (!request) return { ok: false, statusCode: 404, error: 'unknown_request' };
+    const owner = request.identity;
+    if (
+      !owner ||
+      owner.repositoryId !== auth.identity.repositoryId ||
+      owner.runId !== auth.identity.runId ||
+      owner.runAttempt !== auth.identity.runAttempt
+    ) {
+      log({ event: 'status_identity_mismatch', requestId: id, ...who(auth.identity) });
+      return { ok: false, statusCode: 403, error: 'request_identity_mismatch' };
+    }
+    const nowDate = now();
+    if (request.status === 'pending' && new Date(request.expiresAt) <= nowDate) {
+      await store.expire(request, nowDate.toISOString());
+      const fresh = await store.get(request.requestId);
+      return { ok: true, statusCode: 200, body: statusView(fresh) };
+    }
+    return { ok: true, statusCode: 200, body: statusView(request) };
+  }
+
+  // --- Slack interaction (synchronous part, before the ack) --------------------
+  // Returns the HTTP response for Slack plus the follow-up work to run after the
+  // ack. Every state transition happens HERE, before responding; only the
+  // message update, audit comment, and ephemeral replies are deferred.
+  async function handleInteraction({ headers, rawBody }) {
+    const verified = verifySlackSignature({
+      signingSecret,
+      signature: headers['x-slack-signature'],
+      timestamp: headers['x-slack-request-timestamp'],
+      rawBody,
+      now: now().getTime()
+    });
+    if (!verified) return { statusCode: 401, outcome: 'invalid_signature' };
+
+    let interaction;
+    try {
+      interaction = parseSlackInteraction(rawBody);
+    } catch {
+      return { statusCode: 400, outcome: 'invalid_payload' };
+    }
+    if (interaction.type !== 'block_actions') return { statusCode: 200, outcome: 'ignored' };
+
+    const reply = (outcome, text, extra = {}) => ({
+      statusCode: 200,
+      outcome,
+      ...extra,
+      followUp: SLACK_RESPONSE_URL.test(interaction.response_url || '')
+        ? { kind: 'ephemeral', responseUrl: interaction.response_url, text }
+        : null
+    });
+
+    const decision = extractSlackDecision(interaction);
+    if (!decision) return reply('rejected', 'Invalid or stale approval control.');
+
+    // The repository comes from the STORED request's VERIFIED identity, keyed
+    // by the immutable repository_id — never from the click payload, and never
+    // from the display context. No stored identity -> nobody is authorized.
+    const stored = await store.get(decision.requestId);
+    const auth = authorizeSlackInteraction({
+      interaction,
+      repo: stored?.identity?.repositoryId,
+      approverMap
+    });
+    if (!auth.authorized) {
+      log({
+        event: 'unauthorized',
+        requestId: decision.requestId,
+        repositoryId: stored?.identity?.repositoryId ?? null,
+        userId: auth.userId || null
+      });
+      return reply('unauthorized', 'You are not an authorized break-glass approver.', {
+        requestId: decision.requestId
+      });
+    }
+
+    const nowDate = now();
+    const claim = claimDecision({
+      requestId: decision.requestId,
+      action: decision.action,
+      userId: auth.userId,
+      username: auth.username,
+      requests: { [decision.requestId]: stored },
+      now: nowDate
+    });
+    if (claim.outcome === 'expired') {
+      await store.expire(stored, nowDate.toISOString());
+      return reply('expired', 'This approval request has expired.', { requestId: decision.requestId });
+    }
+    if (claim.outcome === 'duplicate') {
+      return reply('duplicate', `This request is already ${claim.status}.`, { requestId: decision.requestId });
+    }
+    if (claim.outcome !== 'claimed') {
+      return reply('rejected', 'Unknown or invalid approval request.', { requestId: decision.requestId });
+    }
+
+    try {
+      await store.claim(claim.request, nowDate.toISOString());
+    } catch (error) {
+      if (!(error instanceof ConditionFailed)) throw error;
+      // Someone else committed first (or it expired between read and write).
+      const fresh = await store.get(decision.requestId);
+      log({ event: 'claim_lost', requestId: decision.requestId, userId: auth.userId, status: fresh?.status });
+      return reply('duplicate', `This request is already ${fresh?.status ?? 'decided'}.`, {
+        requestId: decision.requestId
+      });
+    }
+
+    // Finalize BEFORE any side effect, so a Slack/GitHub failure can never strand
+    // a valid decision in `processing`.
+    const finalized = finalizeDecision({ request: claim.request, userId: auth.userId, now: now() });
+    await store.finalize(finalized, auth.userId);
+    log({
+      event: 'decided',
+      requestId: finalized.requestId,
+      repositoryId: finalized.identity?.repositoryId ?? null,
+      runId: finalized.identity?.runId ?? null,
+      status: finalized.status,
+      approverId: auth.userId
+    });
+
+    return {
+      statusCode: 200,
+      outcome: 'claimed',
+      requestId: finalized.requestId,
+      decision: finalized.status,
+      followUp: { kind: 'side-effects', requestId: finalized.requestId }
+    };
+  }
+
+  // --- Follow-up work (after the ack) -----------------------------------------
+  async function runFollowUp(job) {
+    if (job?.kind === 'ephemeral') {
+      if (!SLACK_RESPONSE_URL.test(job.responseUrl || '')) throw new Error('refusing non-Slack response_url');
+      await slack.respond(job.responseUrl, ephemeral(String(job.text || '')));
+      return { done: true };
+    }
+    if (job?.kind !== 'side-effects') throw new Error('unknown follow-up job');
+
+    // Work only from stored, finalized state — never from the job payload.
+    if (!(await store.claimSideEffects(String(job.requestId || ''), now().toISOString()))) {
+      return { done: false, reason: 'not finalized or already delivered' };
+    }
+    const request = await store.get(job.requestId);
+    // The audit comment's destination is the verified identity, never context.
+    if (!request?.identity) throw new Error('refusing side effects for a request without verified identity');
+    const effects = [
+      github.postComment(request.identity.repository, request.identity.pullRequest, buildAuditComment(request))
+    ];
+    if (request.slack) effects.push(slack.update(buildDecisionUpdate(request)));
+    const results = await Promise.allSettled(effects);
+    const failures = results.filter((r) => r.status === 'rejected').map((r) => String(r.reason));
+    for (const failure of failures) console.error(`break-glass side effect failed: ${failure}`);
+    return { done: true, failures };
+  }
+
+  return { notify, status, handleInteraction, runFollowUp };
+}

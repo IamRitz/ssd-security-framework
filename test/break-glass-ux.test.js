@@ -608,7 +608,16 @@ describe('request step: a failed request is an ERROR, never a decision', () => {
     }
   };
   const CI = { CI_REPOSITORY: 'owner/repo', CI_COMMIT_SHA: 'abc123', CI_SYSTEM: 'github-actions' };
-  const LAMBDA = { BREAK_GLASS_TRANSPORT: 'lambda', BREAK_GLASS_FUNCTION_NAME: 'break-glass-ci', AWS_REGION: 'us-east-1' };
+  // A job with `id-token: write`: the runner's token endpoint is available
+  // (served by test/support/fake-actions-oidc.mjs) and mints IDENTITY_TOKEN.
+  const IDENTITY_TOKEN = 'eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ0ZXN0In0.c2lnbmF0dXJlLXRlc3Q';
+  const OIDC = {
+    ACTIONS_ID_TOKEN_REQUEST_URL: 'https://token.actions.example/idtoken?api-version=2.0',
+    ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'runner-request-token',
+    SSD_TEST_OIDC_REQUEST_TOKEN: 'runner-request-token',
+    SSD_TEST_OIDC_TOKEN: IDENTITY_TOKEN
+  };
+  const LAMBDA = { BREAK_GLASS_TRANSPORT: 'lambda', BREAK_GLASS_FUNCTION_NAME: 'break-glass-ci', AWS_REGION: 'us-east-1', ...OIDC };
   const DECISION_WORDS = /DENIED|APPROVED|EXPIRED|TIMEOUT|denied|approved/;
 
   // Stands in for the AWS CLI: writes `response` (verbatim) to the output file
@@ -628,7 +637,8 @@ describe('request step: a failed request is an ERROR, never a decision', () => {
     const gatePath = join(directory, 'security-gate.json');
     const output = join(directory, 'out', 'break-glass-request.json');
     await writeFile(gatePath, gateText ?? JSON.stringify(gate));
-    const r = spawnSync(process.execPath, [join(SCRIPTS, 'break-glass-notify.mjs'), ...(args ?? ['--gate', gatePath, '--output', output])], {
+    const preload = ['--import', resolve('test/support/fake-actions-oidc.mjs')];
+    const r = spawnSync(process.execPath, [...preload, join(SCRIPTS, 'break-glass-notify.mjs'), ...(args ?? ['--gate', gatePath, '--output', output])], {
       encoding: 'utf8',
       env: { PATH: process.env.PATH, ...CI, ...env }
     });
@@ -654,6 +664,30 @@ describe('request step: a failed request is an ERROR, never a decision', () => {
       assert.equal(r.stderr, '');
       assert.equal(r.written.requestId, 'r-1');
       assert.match(r.written.gateDigest, /^[0-9a-f]{64}$/);
+      // The token is masked the moment it exists, and that mask command is the
+      // ONLY place it is written: never another log line, never the record.
+      const lines = r.stdout.split('\n').filter((line) => line.includes(IDENTITY_TOKEN));
+      assert.deepEqual(lines, [`::add-mask::${IDENTITY_TOKEN}`]);
+      assert.ok(!JSON.stringify(r.written).includes(IDENTITY_TOKEN), 'the request record never holds the token');
+    });
+  });
+
+  it('a Lambda request from a job without `id-token: write` -> ERROR before any invocation', async () => {
+    await withTempDir(async (directory) => {
+      const PATH = await fakeAws(directory, { exitCode: 99 });
+      const { ACTIONS_ID_TOKEN_REQUEST_URL, ACTIONS_ID_TOKEN_REQUEST_TOKEN, ...noOidc } = LAMBDA;
+      const r = await request(directory, { env: { ...noOidc, PATH } });
+      assertRequestError(r, /GitHub OIDC is not available to this job/);
+    });
+  });
+
+  it('a failed token request -> ERROR that names neither token', async () => {
+    await withTempDir(async (directory) => {
+      const PATH = await fakeAws(directory, { exitCode: 99 });
+      const r = await request(directory, { env: { ...LAMBDA, ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'wrong-request-token', PATH } });
+      assertRequestError(r, /GitHub OIDC token request returned HTTP 401/);
+      assert.doesNotMatch(r.stdout + r.stderr, /wrong-request-token|runner-request-token/);
+      assert.ok(!(r.stdout + r.stderr).includes(IDENTITY_TOKEN));
     });
   });
 

@@ -107,10 +107,15 @@ the control and reordering it would not fail anything at runtime.
 | Repository secret | **none** | `break_glass_shared_secret` |
 | Public surface | none | a webhook endpoint |
 | Race safety | DynamoDB conditional write | depends on the host |
+| Request identity | **verified GitHub OIDC token** (below) | **caller-asserted** |
 
 The `lambda` transport needs no repository secret at all, which removes the
 whole class of "the secret leaked / the secret rotated and CI broke" problems.
 Prefer it. The `http` transport remains for rollback and for existing consumers.
+It cannot carry a verified identity: in `_source-scan.yml` it runs in a job
+that has no OIDC token, and that job stays OIDC-free on purpose. So an `http`
+broker trusts the repository its caller names. It is suitable for a single
+repository only, and it is never generated.
 
 ## Synthetic runs are isolated by construction
 
@@ -199,37 +204,132 @@ happens on the **raw body, before parsing**, and timestamps older than five
 minutes are rejected. Invalid signatures get HTTP 401 before any state is
 touched.
 
-## Authorization is per repo and fail-closed
+## Who is asking: verified GitHub identity
+
+The broker does not believe the repository, pull request or run named in a
+request. Every `notify` and every `status` call carries a GitHub OIDC token
+minted for the dedicated audience **`ssd-break-glass`** (separate from the
+`sts.amazonaws.com` token the job uses to assume its AWS role), and the broker
+verifies it before anything else (`broker/identity/github-oidc.mjs`):
+
+| Check | Required value |
+| --- | --- |
+| signature | RS256 only, key found by `kid` in GitHub's JWKS at the fixed URL `https://token.actions.githubusercontent.com/.well-known/jwks`; RSA ≥ 2048 bits; header `jku`/`jwk`/`x5u`/`x5c`/`crit` refused |
+| `iss` | exactly `https://token.actions.githubusercontent.com` (an enterprise-scoped issuer is refused) |
+| `aud` | exactly `ssd-break-glass` |
+| `exp` / `iat` / `nbf` | not expired; `iat` at most 300 s old and not in the future; `nbf` (when present) not in the future (30 s skew) |
+| `job_workflow_ref` | parsed into repository, path and ref: repository `IamRitz/ssd-security-framework`, path `.github/workflows/_break-glass-lambda.yml` or `.github/workflows/_source-security.yml`, ref a 40-character commit SHA equal to `job_workflow_sha` |
+| `event_name` / `ref` | `pull_request` with `ref` = `refs/pull/<N>/merge`; the PR number is `<N>` |
+| `jti` | accepted **once** (an atomic conditional write in the request table) |
+
+What the broker then does with it:
+
+- **Identity comes from the token.** The stored request keeps the verified
+  `identity` (repository, `repository_id`, PR, commit, run, run attempt,
+  `job_workflow_ref`) separately from the display `context`. The payload's
+  `context` may still carry `repository`, `pullRequest`, `commitSha`, `runUrl`,
+  `ciSystem`, `repositoryId`, `runId`, `runAttempt`, but every supplied value
+  must **equal** the token's. A disagreement is a rejection, never a
+  correction, and so is any other context field.
+- **Approvers are keyed by `repository_id`**, the immutable id, so a renamed
+  or re-created repository cannot inherit someone else's approvers.
+- **The audit comment** goes to the token's repository and pull request.
+- **Status is bound to the filing run.** A `status` call needs its own fresh
+  token whose `repository_id`, `run_id` and `run_attempt` equal the request's.
+  A request id alone authorizes nothing.
+- **Refusals are logged with** the rejection code, any verified ids and what
+  the payload claimed, so abuse is investigable. Tokens are never logged,
+  stored or echoed.
+
+Replay records are keyed `oidc-jti:<sha256(jti)>` and hold only the action,
+`repository_id`, run id, run attempt and token expiry. Their DynamoDB `ttl` is
+one hour after the token's `exp`, so a record always outlives the token it
+guards. TTL deletion is lazy and happens only after that.
+
+### Request creation order, and what a failure leaves behind
+
+`notify` writes in this order, and nothing before step 2 writes at all:
+
+1. **Check the payload shape and verify the token.** Nothing is written.
+2. **Claim the token's `jti`** with a conditional write. This is the first write.
+3. **Bind the payload to the token.** A disagreement is refused, and the token
+   is already spent. This order is **intentional**: claiming first means no
+   path, valid or not, can use a token twice, and the cost is only that a
+   corrected retry mints a fresh token, which every caller can do.
+4. **Store the pending request** under a fresh UUID.
+5. **Post the Slack approval message**, then record its reference. If that
+   fails, the request is deleted and the call returns 502.
+
+The client never retries `notify`. A retry means either a resend of the same
+event (for example, the AWS CLI retrying after a lost response) or a new step or
+job attempt with a new token.
+
+| Failure at | What remains | Retry with the same event | Retry with a new token |
+| --- | --- | --- | --- |
+| 1 | nothing | refused again | normal |
+| 3 | spent token | `token_replayed` | normal, if the payload is corrected |
+| 4 (storage) | spent token, no request, nobody paged | `token_replayed` | exactly one request |
+| 5 (Slack) | spent token; request rolled back | `token_replayed` | exactly one request and one message |
+| 5, rollback also fails | an orphan pending request with **no** Slack message | `token_replayed` | one request with a message, plus the orphan, which nobody can click and which expires at `expiresAt` |
+| after 5, response lost | one complete request | `token_replayed`: **no duplicate** | not attempted by the client (the step fails, and the BLOCK stands) |
+
+Two cases leave a stale Slack message, though never a second approvable
+request for the same run:
+
+- **Slack posted, but its response was lost.** The request is rolled back, and
+  a click on the message gets "unknown request".
+- **The broker delivered, but CI never saw the response, and someone re-runs
+  the job.** The new attempt files its own request. The earlier message stays
+  approvable, but its status can only be read by the earlier, finished attempt,
+  so approving it changes no gate (it does post an audit comment).
+
+### Rollout order, and what fails closed
+
+1. **Client first.** Framework callers at a commit that includes this change
+   send the token. The pre-hardening broker ignores the extra field, so this
+   step changes nothing on its own.
+2. **Broker second.** Once the hardened broker is deployed (Phase 3C provisions
+   it), it refuses every request that does not prove its identity:
+   - a caller pinned to an **older framework commit** sends no token, so its
+     request is refused (`identity_rejected: token_missing`). The request is not
+     delivered and **the BLOCK stands**;
+   - a caller that pins the framework by **tag or branch** (`@v1`) yields a
+     `job_workflow_ref` that is not a SHA and is refused. Generated callers
+     always pin an exact SHA;
+   - a request from **`workflow_dispatch`, `push`, `schedule` or
+     `pull_request_target`** is refused. That includes a manually dispatched
+     synthetic demo: a non-PR synthetic route needs its own, explicitly
+     separate contract (Phase 3E);
+   - **pending requests filed before the hardening** have no stored identity.
+     They match no status caller and authorize no approver, so they simply
+     expire. That is fail-closed by design.
+3. **Re-key the approver map** at the same time (below). Until then, nobody is
+   authorized.
+
+## Authorization is per repository and fail-closed
 
 ```
-SLACK_APPROVER_IDS_BY_REPO={"org/repo-a":["U123"],"org/repo-b":["U456","U789"]}
+SLACK_APPROVER_IDS_BY_REPOSITORY_ID={"1001":["U123"],"1002":["U456","U789"]}
 ```
 
-- A repo **not present as a key authorizes nobody.** No fallback to a shared
-  default list. A repo is not onboarded to break-glass until it has an explicit
-  entry.
-- **Malformed JSON is treated as an empty map** — nobody authorized for
-  anything — logged, never thrown. One bad edit cannot take down approvals for
-  every repo at once.
-- The repository identity comes from the **stored pending request**, looked up
-  by request ID when the click arrives. It is **never** read from the Slack
-  interaction payload, which has no notion of a GitHub repository and therefore
-  offers nothing to forge. The clicking user is checked against that repo's set
-  only.
+Keys are GitHub `repository_id`s (`gh api repos/<owner>/<repo> --jq .id`).
+
+- A repository **not present as a key authorizes nobody.** There is no fallback
+  to a shared default list. A repository is not onboarded to break-glass until
+  it has an explicit entry.
+- **Malformed JSON is treated as an empty map**: nobody is authorized for
+  anything. It is logged, never thrown, so one bad edit cannot take down
+  approvals for every repository at once.
+- A key that is not a repository id is ignored, including an `"owner/repo"` key
+  from the pre-hardening `SLACK_APPROVER_IDS_BY_REPO` format. That variable is
+  no longer read.
+- The repository is the **stored request's verified identity**, looked up by
+  request id when the click arrives. It is never read from the Slack interaction
+  payload or from the display context. The clicking user is checked against
+  that repository's set only.
 
 Changing the map is an environment change and needs the handler restarted.
-
-> **Known gap: the stored repository is caller-asserted.** The pending
-> request's repository comes from the CI broker's invoke **payload**, and Lambda
-> direct invocation does not tell the function which IAM principal called it.
-> So any principal allowed to invoke the broker can file a request labelled as
-> a *different* repository, and that repository's approvers are the ones asked.
-> With one shared invoker role, only the role's holders can do this. With
-> per-repository invoker roles, any onboarded repository could forge requests
-> for another. The fix is for the broker to verify a GitHub OIDC token and
-> derive the repository from it. That is the first item of the Phase 3 design
-> ([onboarding-architecture.md § E.2](onboarding-architecture.md#e2-concrete-defect-to-fix-first-caller-asserted-repository)).
-> Do not onboard a second repository onto a shared broker until it lands.
+(Phase 3B moves it to one SSM parameter per repository.)
 
 ## A repository with no Slack
 

@@ -723,7 +723,7 @@ describe('broker exchange: request, poll, and the recorded decision', () => {
     return async () => bodies[Math.min(i++, bodies.length - 1)];
   };
   const poll = (invoke, extra = {}) =>
-    pollBreakGlass({ request, invoke, sleep: async () => {}, intervalMilliseconds: 0, ...extra });
+    pollBreakGlass({ request, invoke, mintIdentityToken: async () => 'h.p.s', sleep: async () => {}, intervalMilliseconds: 0, ...extra });
 
   it('approved with the exact requestId and gate digest succeeds', async () => {
     const status = await poll(invokeReturning({ ok: true, body: { requestId: 'req-1', gateDigest: DIGEST, status: 'approved', approver: { username: 'u' } } }));
@@ -752,7 +752,7 @@ describe('broker exchange: request, poll, and the recorded decision', () => {
     await assert.rejects(() => poll(invokeReturning({ ok: false, error: 'nope' })), /rejected status/);
     const g = await G.sast();
     await assert.rejects(
-      () => notifyBreakGlass({ gate: g, context: { repository: 'a/b', commitSha: 'x' }, invoke: async () => ({ ok: false, error: 'denied' }) }),
+      () => notifyBreakGlass({ gate: g, context: { repository: 'a/b', commitSha: 'x' }, invoke: async () => ({ ok: false, error: 'denied' }), mintIdentityToken: async () => 'h.p.s' }),
       /rejected notify/
     );
   });

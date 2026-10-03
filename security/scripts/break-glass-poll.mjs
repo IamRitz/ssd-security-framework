@@ -4,6 +4,7 @@ import { setTimeout as sleepTimer } from 'node:timers/promises';
 import { fileURLToPath, URL } from 'node:url';
 
 import { lambdaInvokerFromEnv } from './break-glass-lambda-invoke.mjs';
+import { mintBreakGlassIdentityToken } from './break-glass-oidc-token.mjs';
 
 const TERMINAL = new Set(['approved', 'denied', 'expired']);
 
@@ -28,14 +29,19 @@ export async function pollBreakGlass({
   sleep = sleepTimer,
   now = () => Date.now(),
   // Direct IAM (GitHub OIDC) invocation instead of the shared-secret webhook.
-  invoke = null
+  invoke = null,
+  // Lambda transport only: a FRESH `ssd-break-glass` token per status call. The
+  // broker accepts each token once and answers only the run that filed the request.
+  mintIdentityToken = null
 }) {
   assert(typeof request?.requestId === 'string' && request.requestId !== '', 'requestId is required');
   assert(typeof request.gateDigest === 'string' && request.gateDigest !== '', 'gateDigest is required');
   let fetchStatus;
   if (invoke) {
+    assert(typeof mintIdentityToken === 'function', 'the Lambda transport needs a GitHub OIDC identity token minter');
     fetchStatus = async () => {
-      const result = await invoke({ action: 'status', requestId: request.requestId });
+      const identityToken = await mintIdentityToken();
+      const result = await invoke({ action: 'status', requestId: request.requestId, identityToken });
       assert(result?.ok === true, `break-glass broker rejected status: ${result?.error ?? 'no response'}`);
       return result.body;
     };
@@ -116,7 +122,8 @@ export async function runPoll({
       sharedSecret: env.BREAK_GLASS_SHARED_SECRET,
       timeoutSeconds: Number(env.BREAK_GLASS_TIMEOUT_SECONDS || 900),
       intervalMilliseconds: Number(env.BREAK_GLASS_POLL_INTERVAL_MS || 10_000),
-      invoke: lambdaInvokerFromEnv(env)
+      invoke: lambdaInvokerFromEnv(env),
+      mintIdentityToken: () => mintBreakGlassIdentityToken({ env })
     });
     await mkdir(dirname(outputPath), { recursive: true });
     await writeFile(outputPath, `${JSON.stringify(result, null, 2)}\n`);

@@ -70,11 +70,20 @@ jobs:
         # must make the tests fail.
         run: node tools/mutation-check-onboarding.mjs
 
+      - name: Prove the break-glass broker tests guard its identity invariants
+        # Breaks each property that stops one repository, run or workflow from
+        # acting as another (token signature, issuer, audience, job_workflow_ref,
+        # replay, status binding, payload disagreement, the OIDC-free source scan)
+        # in a scratch copy; the broker and client tests must fail every time.
+        run: node tools/mutation-check-broker.mjs
+
       - name: The toolkit must stay dependency-free
         # Every script imports only Node builtins. That is what lets the toolkit
         # be dropped into any consumer's runner with nothing installed, and it is
         # why there is no lockfile here for a consumer's OSV scan to trip over.
-        # The onboarding CLI follows the same rule.
+        # The onboarding CLI follows the same rule, and so does the break-glass
+        # broker: its only third-party code is the AWS SDK the Lambda Node.js
+        # runtime provides, loaded lazily in broker/lambda/runtime.mjs.
         #
         # The pattern uses a negative lookahead, so it is PCRE (-P) ONLY: passing
         # -E as well makes GNU grep exit 2 with "conflicting matchers specified",
@@ -86,7 +95,7 @@ jobs:
           grep -rnP \
             --include='*.mjs' \
             "^import .* from '(?!node:)[^.]" \
-            security/scripts onboarding
+            security/scripts onboarding broker
           rc=$?
           set -e
 
