@@ -82,7 +82,9 @@ credentials; see \`aws --help\`):
   aws plan [--scope repo|shared] [--region <r>] [--json]
                           UNEXECUTED CloudFormation change sets + .ssd/aws-plans/<plan-id>/
                           (its only repository write); never executes them
-  aws apply|verify        designed, not implemented
+  aws apply --plan-id <id> --account <id> --region <r> [--allow-destructive <n>] [--yes] [--json]
+                          executes exactly that reviewed change set, after re-verification
+  aws verify              designed, not implemented
 
 Common options:
   --repo <dir>            consumer repository root (default: current directory)

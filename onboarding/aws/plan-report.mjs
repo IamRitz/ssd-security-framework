@@ -35,7 +35,7 @@ function destructiveBlock(unit) {
     rows([statusRow('FAIL', `DESTRUCTIVE: ${unit.destructive} (${c.DELETE} DELETE, ${c.REPLACE} REPLACE)`, 'review every line below')], { words: true }),
     group(
       text(unit.changes.filter((ch) => ch.action === 'DELETE' || ch.action === 'REPLACE').map((ch) => `${SYMBOL[ch.action]} ${ch.action} ${ch.type} ${ch.logicalId}${ch.conditional ? ' (conditional)' : ''}`)),
-      dim('A future aws apply will require this exact destructive count to be confirmed.')
+      dim(`aws apply requires this exact count to be confirmed: --allow-destructive ${unit.destructive}.`)
     )
   ];
 }
@@ -109,7 +109,7 @@ function unitBlocks(unit) {
 export function awsPlanBlocks(report) {
   const t = report.target;
   return [
-    heading('SSD AWS Plan', 'Creates an UNEXECUTED CloudFormation change set; nothing in AWS is changed until aws apply (not implemented).'),
+    heading('SSD AWS Plan', 'Creates an UNEXECUTED CloudFormation change set; nothing in AWS is changed until aws apply executes it.'),
     section(
       'Target',
       rows([
@@ -127,7 +127,7 @@ export function awsPlanBlocks(report) {
     section(
       'Result',
       resultLine(HUMAN_OUTCOME[report.outcome] ?? 'BLOCKED', `${report.outcome.replace(/_/g, ' ')}: ${OUTCOME_DETAIL[report.outcome] ?? ''}`),
-      report.outcome === 'PLANNED' && dim('Next: review this plan. aws apply is not implemented (Phase 2C); run aws doctor for readiness.')
+      report.outcome === 'PLANNED' && dim('Next: review this plan, then apply it with aws apply --plan-id <id> --account <account> --region <region>.')
     )
   ].filter(Boolean);
 }

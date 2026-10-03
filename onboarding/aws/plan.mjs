@@ -41,7 +41,7 @@ import { SHARED_STACKS, canonicalSlug, repoStackName } from './stack-names.mjs';
 import { diffLines, semanticPolicyDiff } from './policy/diff.mjs';
 import { parseDocument } from './policy/evaluate.mjs';
 import { planChangeSet } from './plan/change-set.mjs';
-import { PLAN_SCHEMA_VERSION, assertPersistable, assertPlanSlotFree, changeSetNameOf, planDirOf, planIdInput, planIdOf, writePlanDirectory } from './plan/record.mjs';
+import { PLAN_SCHEMA_VERSION, assertPersistable, assertPlanSlotFree, changeSetNameOf, configDigestOf, planDirOf, planIdInput, planIdOf, writePlanDirectory } from './plan/record.mjs';
 import { STACK_KINDS, assertTemplateScope } from './plan/scope.mjs';
 import { canonicalJson, sha256, ssdTags } from './templates/common.mjs';
 import { REPO_LOGICAL_IDS, ROLE_POLICY_NAMES, renderRepoTemplate } from './templates/repo-ecr-delivery.mjs';
@@ -468,7 +468,7 @@ export async function awsPlan({ config, scope = 'repo', region: explicitRegion =
     unit.changeSetName = changeSetNameOf(unit.planId);
     await assertPlanSlotFree(root, unit.planId);
   }
-  const configDigest = sha256(canonicalJson(config));
+  const configDigest = configDigestOf(config);
 
   for (const unit of planned) {
     const result = await planChangeSet(aws, { stackKind: unit.stackKind, stackName: unit.stackName, changeSetName: unit.changeSetName, type: unit.changeSetType, body: unit.body, tags, account, region: resolved.region, sleep });

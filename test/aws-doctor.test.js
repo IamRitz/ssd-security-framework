@@ -271,8 +271,10 @@ describe('trust boundary', () => {
   });
 
   it('only aws-cli.mjs runs a process; only plan/record.mjs writes files (the plan directory); nothing calls gh', () => {
-    // The ONE writer under onboarding/aws: the `aws plan` record, confined to
-    // .ssd/aws-plans/ through safe-path (test/aws-plan.test.js).
+    // The ONE writer under onboarding/aws: the plan record (and, for `aws
+    // apply`, the two exclusive apply records in that plan's directory),
+    // confined to .ssd/aws-plans/ through safe-path (test/aws-plan.test.js,
+    // test/aws-apply.test.js).
     const WRITER = join('onboarding', 'aws', 'plan', 'record.mjs');
     for (const file of walk('onboarding/aws')) {
       const imports = importsOf(file);

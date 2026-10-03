@@ -124,3 +124,41 @@ export function changeSets(world, { changes = null, status = 'CREATE_COMPLETE', 
 
 // A managed config: every per-repository resource managed.
 export const MANAGED = { delivery: { environment: 'production', ecr: { ownership: 'managed' }, roles: { pushScanOwnership: 'managed', deployOwnership: 'managed' } } };
+
+// --- an owned stack (UPDATE plans) ----------------------------------------------------
+
+export const OWNED = [
+  { logicalId: 'EcrRepository', physicalId: REPOSITORY, type: 'AWS::ECR::Repository' },
+  { logicalId: 'PushScanRole', physicalId: 'app-ecr-push-scan', type: 'AWS::IAM::Role' },
+  { logicalId: 'DeployRole', physicalId: 'app-deploy', type: 'AWS::IAM::Role' }
+];
+// Changes for an UPDATE: one in-place Modify per template resource.
+export const modify = (template) => Object.entries(template.Resources).map(([logicalId, r]) => ({ Type: 'Resource', ResourceChange: { Action: 'Modify', Replacement: 'False', LogicalResourceId: logicalId, ResourceType: r.Type, Scope: ['Properties'], Details: [] } }));
+
+// A role whose ONLY policy is the stack's own inline policy (plus extras).
+export function rolePolicies(world, name, { inline = {}, attached = [] }) {
+  world[`iam list-role-policies --role-name ${name}`] = ok({ PolicyNames: Object.keys(inline) });
+  for (const [policyName, document] of Object.entries(inline)) {
+    world[`iam get-role-policy --role-name ${name} --policy-name ${policyName}`] = ok({ RoleName: name, PolicyName: policyName, PolicyDocument: document });
+  }
+  world[`iam list-attached-role-policies --role-name ${name}`] = ok({ AttachedPolicies: attached.map((a) => ({ PolicyName: a.name, PolicyArn: a.arn })) });
+  for (const a of attached) {
+    world[`iam get-policy --policy-arn ${a.arn}`] = ok({ Policy: { Arn: a.arn, DefaultVersionId: 'v1' } });
+    world[`iam get-policy-version --policy-arn ${a.arn} --version-id v1`] = ok({ PolicyVersion: { Document: { Version: '2012-10-17', Statement: [{ Effect: 'Allow', Action: '*', Resource: '*' }] }, VersionId: 'v1' } });
+  }
+  return world;
+}
+export const STACK_POLICY = { Version: '2012-10-17', Statement: [{ Effect: 'Allow', Action: 'ecr:GetAuthorizationToken', Resource: '*' }] };
+
+// Every per-repository resource exists, owned by the exact expected stack, and
+// each role carries only the stack's own inline policy.
+export function ownedWorld(stack = {}) {
+  const world = greenfieldWorld();
+  const ready = readyWorld();
+  for (const key of [`ecr describe-repositories --registry-id ${ACCOUNT} --repository-names ${REPOSITORY}`, 'iam get-role --role-name app-ecr-push-scan', 'iam get-role --role-name app-deploy']) {
+    world[key] = ready[key];
+  }
+  rolePolicies(world, 'app-ecr-push-scan', { inline: { 'ssd-push-scan': STACK_POLICY } });
+  rolePolicies(world, 'app-deploy', { inline: { 'ssd-deploy': STACK_POLICY } });
+  return withStack(world, { resources: OWNED, ...stack });
+}

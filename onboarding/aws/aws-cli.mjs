@@ -1,6 +1,7 @@
 // The ONE way ssd-onboard runs the AWS CLI.
 //
-// TRUST BOUNDARY. Two factories, two allowlists, no generic mutating wrapper:
+// TRUST BOUNDARY. Three factories, three allowlists, no generic mutating
+// wrapper:
 //
 //   readOnlyAws()   `aws doctor` (Phase 2A). READ-ONLY by construction: only
 //                   READ_ONLY_OPERATIONS.
@@ -10,6 +11,12 @@
 //                   UNEXECUTED change set), describe-change-set and stack
 //                   lookups by name. Nothing here can execute a change set or
 //                   create, update or delete a stack or any resource.
+//   applyAws()      `aws apply` (Phase 2C). Built for ONE recorded plan: its
+//                   reads (applyOperations) take only that plan's exact stack
+//                   name / stack id / change-set ARN, and its single mutation is
+//                   aws.executeChangeSet() — a fixed argv, no caller-supplied
+//                   values, at most once per wrapper. The generic call path
+//                   can never reach execute-change-set or any other mutation.
 //
 //   - each factory refuses — BEFORE anything is executed — any argv that is
 //     not an explicitly listed (service, operation) pair called with only that
@@ -142,6 +149,57 @@ export const PLANNING_OPERATIONS = Object.freeze(
     ])
   )
 );
+
+// --- the apply allowlist (Phase 2C) ------------------------------------------------
+
+// Every value is the recorded plan's own: compared for equality, never matched
+// by pattern. binding = { stackName, stackId, changeSetArn }.
+const exactly = (...allowed) => (value) => allowed.includes(value);
+
+const STACK_ID = /^arn:(?:aws|aws-cn|aws-us-gov):cloudformation:[a-z0-9-]+:\d{12}:stack\/([A-Za-z][A-Za-z0-9-]*)\/[0-9a-f-]+$/;
+const CHANGE_SET_ARN = /^arn:(?:aws|aws-cn|aws-us-gov):cloudformation:[a-z0-9-]+:\d{12}:changeSet\/(ssd-plan-[0-9a-f]{64})\/[0-9a-f-]+$/;
+
+function assertBinding(binding) {
+  const { stackName, stackId, changeSetArn } = binding ?? {};
+  const strings = [stackName, stackId, changeSetArn].every((v) => typeof v === 'string');
+  if (!strings || !STACK_NAMES.test(stackName) || STACK_ID.exec(stackId)?.[1] !== stackName || !CHANGE_SET_ARN.test(changeSetArn)) {
+    throw new AwsCliError('refused', "refusing to create an apply wrapper without the recorded plan's exact stack name, stack id (of that stack) and ssd-plan change-set ARN");
+  }
+}
+
+// The READ operations `aws apply` may make for one plan. execute-change-set is
+// deliberately absent: only applyAws().executeChangeSet() can issue it.
+export function applyOperations(binding) {
+  assertBinding(binding);
+  const { stackName, stackId, changeSetArn } = binding;
+  return Object.freeze({
+    sts: Object.freeze({ 'get-caller-identity': {} }),
+    cloudformation: Object.freeze({
+      'describe-stacks': { '--stack-name': exactly(stackName, stackId) },
+      'describe-change-set': { '--stack-name': exactly(stackName), '--change-set-name': exactly(changeSetArn) },
+      'get-template': { '--stack-name': exactly(stackName), '--change-set-name': exactly(changeSetArn), '--template-stage': exactly('Original') },
+      'describe-stack-resources': { '--stack-name': exactly(stackId) }
+    })
+  });
+}
+
+// The one mutating argv `aws apply` can produce: no other flag (no
+// --role-arn, --client-request-token, --disable-rollback,
+// --retain-except-on-create), no other value.
+export const executeArgv = ({ stackName, changeSetArn }) => ['cloudformation', 'execute-change-set', '--stack-name', stackName, '--change-set-name', changeSetArn];
+
+// Throws unless argv is one of the plan's reads or EXACTLY its execute argv.
+// (The fake AWS harness checks every argv against this, independently.)
+export function assertApply(binding) {
+  const table = applyOperations(binding);
+  const execute = executeArgv(binding);
+  return (argv) => {
+    if (Array.isArray(argv) && argv.length === execute.length && argv.every((v, i) => v === execute[i])) {
+      return;
+    }
+    assertAllowed(argv, table, APPLY_WORDS);
+  };
+}
 
 // Appended by the wrapper, so never accepted from a caller.
 const WRAPPER_FLAGS = ['--region', '--output', '--no-cli-pager'];
@@ -305,6 +363,7 @@ export function classifyFailure({ stderr = '', error = null } = {}, env = proces
 
 const READ_ONLY_WORDS = { list: 'the read-only allowlist (ssd-onboard aws doctor makes no AWS changes)', kind: 'read' };
 const PLANNING_WORDS = { list: 'the planning allowlist (ssd-onboard aws plan never executes a change set)', kind: 'planning' };
+const APPLY_WORDS = { list: "the apply allowlist (ssd-onboard aws apply only reads the recorded plan's stack and change set, and executes nothing but that change set)", kind: 'apply' };
 
 function assertAllowed(argv, table, words) {
   if (!Array.isArray(argv) || argv.length < 2 || !argv.every((arg) => typeof arg === 'string')) {
@@ -413,7 +472,27 @@ export function planningAws(options = {}) {
   return wrapper(assertPlanning, options);
 }
 
-function wrapper(assertCall, { region, exec = execAws, env = process.env, timeoutMs = DEFAULT_TIMEOUT_MS, deadlineMs = DEFAULT_DEADLINE_MS, now = Date.now, onCall = () => {} } = {}) {
+// applyAws({ region, binding, ...readOnlyAws options }) — the same contract
+// over applyOperations(binding), plus aws.executeChangeSet(): the plan's
+// execute-change-set argv, issued at most once by this wrapper. Its response
+// carries no document (the CLI prints nothing), so it resolves to {}.
+export function applyAws({ binding, ...options } = {}) {
+  const table = applyOperations(binding);
+  let executed = false;
+  return wrapper((argv) => assertAllowed(argv, table, APPLY_WORDS), options, (aws, run) => {
+    aws.executeChangeSet = async function executeChangeSet() {
+      if (executed) {
+        throw new AwsCliError('refused', 'refusing a second execute-change-set: a plan is executed at most once', { operation: 'cloudformation execute-change-set' });
+      }
+      executed = true;
+      return run(executeArgv(binding), { allowEmpty: true });
+    };
+  });
+}
+
+// extend(aws, run) is the only way to reach `run` (the unchecked executor); only
+// applyAws() passes one, to bind its single fixed execute argv.
+function wrapper(assertCall, { region, exec = execAws, env = process.env, timeoutMs = DEFAULT_TIMEOUT_MS, deadlineMs = DEFAULT_DEADLINE_MS, now = Date.now, onCall = () => {} } = {}, extend = () => {}) {
   if (typeof region !== 'string' || region === '') {
     throw new AwsCliError('refused', 'refusing to create an AWS CLI wrapper without an explicit region');
   }
@@ -421,6 +500,11 @@ function wrapper(assertCall, { region, exec = execAws, env = process.env, timeou
   const spent = (operation) => new AwsCliError('deadline', `the run's overall AWS time budget (${Math.round(deadlineMs / 1000)}s) is spent`, { operation });
   const aws = async function aws(argv) {
     assertCall(argv);
+    return run(argv);
+  };
+  // Executes an argv the caller has already checked. Reachable only through
+  // aws() above or, via `extend`, applyAws().executeChangeSet().
+  async function run(argv, { allowEmpty = false } = {}) {
     const operation = `${argv[0]} ${argv[1]}`;
     const remaining = deadlineMs - (now() - startedAt);
     if (remaining <= 0) {
@@ -436,6 +520,9 @@ function wrapper(assertCall, { region, exec = execAws, env = process.env, timeou
       // A call cut short by the remaining budget, not by its own timeout, is the deadline.
       throw failure.kind === 'timeout' && callTimeout < timeoutMs ? spent(operation) : failure;
     }
+    if (allowEmpty && result.stdout.trim() === '') {
+      return {};
+    }
     try {
       const parsed = JSON.parse(result.stdout);
       if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
@@ -445,8 +532,9 @@ function wrapper(assertCall, { region, exec = execAws, env = process.env, timeou
     } catch {
       throw new AwsCliError('malformed-json', `'aws ${operation}' did not return a JSON object`, { operation });
     }
-  };
+  }
   // Time left in the run's budget (ms), for callers that wait between calls.
   aws.remainingMs = () => deadlineMs - (now() - startedAt);
+  extend(aws, run);
   return aws;
 }

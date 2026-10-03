@@ -183,11 +183,13 @@ describe('read-only allowlist', () => {
         assert.doesNotMatch(operation, MUTATING, `${service} ${operation}`);
       }
     }
-    // The only factories are the read-only one (doctor) and the planning one
-    // (aws plan, test/aws-plan-wrapper.test.js); there is no mutating wrapper.
+    // The only factories are the read-only one (doctor), the planning one
+    // (aws plan, test/aws-plan-wrapper.test.js) and the per-plan apply one
+    // (aws apply, test/aws-apply-wrapper.test.js); there is no generic
+    // mutating wrapper.
     assert.deepEqual(Object.keys(awsCli).sort(), [
       'AwsCliError', 'DEFAULT_DEADLINE_MS', 'DEFAULT_MAX_BUFFER', 'DEFAULT_TIMEOUT_MS', 'MAX_TEMPLATE_BODY', 'PLANNING_OPERATIONS', 'READ_ONLY_OPERATIONS',
-      'assertPlanning', 'assertReadOnly', 'classifyFailure', 'execAws', 'planningAws', 'readOnlyAws', 'redact'
+      'applyAws', 'applyOperations', 'assertApply', 'assertPlanning', 'assertReadOnly', 'classifyFailure', 'execAws', 'executeArgv', 'planningAws', 'readOnlyAws', 'redact'
     ]);
   });
 

@@ -21,7 +21,7 @@ The manual procedure it automates: [onboarding.md](onboarding.md).
 > | --- | --- | --- |
 > | 2A | `aws doctor` | **implemented** — read-only ([§ AWS readiness](#aws-readiness-aws-doctor-phase-2a)) |
 > | 2B | `aws plan` | **implemented** — writes `.ssd/aws-plans/<plan-id>/` and creates **unexecuted** CloudFormation change sets ([§ AWS plans](#aws-plans-aws-plan-phase-2b)) |
-> | 2C | `aws apply` | not implemented (exit 2) |
+> | 2C | `aws apply` | **implemented** — executes exactly one reviewed change set after re-verifying it ([§ Applying a plan](#applying-a-plan-aws-apply-phase-2c)) |
 > | 2D | `aws verify` | not implemented (exit 2) |
 >
 > The `github` commands (Part E of the architecture doc) are not implemented
@@ -129,6 +129,7 @@ the tools for everything after first onboarding.
 | `promote --enforce` | config, workflows | log-only → enforce (requires an accepted baseline) |
 | `aws doctor [--region <r>] [--json]` | nothing (no AWS change either) | Phase 2A: read-only AWS readiness of the configured delivery (§ AWS readiness) |
 | `aws plan [--scope repo\|shared] [--region <r>] [--json]` | `.ssd/aws-plans/<plan-id>/`; an **unexecuted** CloudFormation change set | Phase 2B: a reviewable infrastructure plan (§ AWS plans) |
+| `aws apply --plan-id <id> --account <id> --region <r> [--allow-destructive <n>] [--yes] [--json]` | executes that plan's change set; `apply-started.json` / `apply.json` in its plan directory | Phase 2C: apply one reviewed plan (§ Applying a plan) |
 
 `--repo <dir>` points at the consumer repository (default: the current directory).
 Nothing is ever committed; every change is a diff for a pull request.
@@ -137,7 +138,7 @@ Nothing is ever committed; every change is a diff for a pull request.
 
 Human-readable output is presentation only: its layout may change between
 versions, and nothing should parse it. Scripts use `--json` (`inspect`,
-`validate`, `doctor`, `aws doctor`) and the exit code.
+`validate`, `doctor`, `aws doctor`, `aws plan`, `aws apply`) and the exit code.
 
 - **Color** is used only when the stream is an interactive terminal. Redirected
   or piped output, CI logs and `--json` are plain text. Color is also off when
@@ -499,7 +500,7 @@ AWS_PROFILE=<operator-profile> node ssd-framework/onboarding/cli.mjs aws plan --
 | --- | --- |
 | `.ssd/aws-plans/<plan-id>/` in the consumer repository (its only repository write) | `.ssd/onboarding.yml`, workflows, any other repository file |
 | an **unexecuted** CloudFormation change set per planned stack | stacks, IAM roles, the OIDC provider, ECR repositories, registry scanning, Inspector, SSM, Secrets Manager, GitHub |
-| for a `CREATE`, a **`REVIEW_IN_PROGRESS` placeholder stack** with no resources, which CloudFormation creates to hold the change set; it stays until the change set is executed (Phase 2C) or someone deletes it | |
+| for a `CREATE`, a **`REVIEW_IN_PROGRESS` placeholder stack** with no resources, which CloudFormation creates to hold the change set; it stays until the change set is executed (`aws apply`) or someone deletes it | |
 
 `aws plan` cannot execute a change set: its AWS wrapper has a separate
 **planning allowlist** — the read-only operations of `aws doctor` plus exactly
@@ -642,7 +643,157 @@ In addition to `aws doctor`'s read access, the operator needs
 `cloudformation:ValidateTemplate`, `cloudformation:CreateChangeSet`,
 `cloudformation:DescribeChangeSet` and `cloudformation:DescribeStacks`/
 `DescribeStackResources`. CloudFormation computes a change set without creating
-the resources it describes; executing it (Phase 2C) needs those permissions.
+the resources it describes; executing it (`aws apply`) needs those permissions.
+
+## Applying a plan: `aws apply` (Phase 2C)
+
+```sh
+AWS_PROFILE=<operator-profile> node ssd-framework/onboarding/cli.mjs aws apply \
+  --plan-id <plan-id> --account <12-digit-account> --region <region> --repo <consumer-repo>
+```
+
+`aws apply` executes **exactly** the change set `aws plan` recorded in
+`.ssd/aws-plans/<plan-id>/` — by its recorded ARN, once — and nothing else. It
+never renders a template, creates a change set, or creates/updates/deletes a
+stack directly, and it never treats "the same enough" as the same: anything
+that differs from what was reviewed refuses, and the fix is a new
+`aws plan`.
+
+**Arguments.** `--plan-id`, `--account` and `--region` are **always**
+required; the AWS CLI's default region is never used. `--allow-destructive <n>`
+is required when the plan holds destructive changes and must be their exact
+count. `--yes` skips the typed confirmation, never the flags: `--yes` without
+`--account` or `--region` is a usage error (exit 2) and contacts nothing.
+`--scope`, `--plan-id`/`--account`/`--yes`/`--allow-destructive` on other `aws`
+commands, a malformed plan id, account or count are usage errors.
+
+**Order** (each step blocks the next; nothing in AWS changes before step 7):
+
+1. **Plan directory.** `plan.json` exists (it is written last) and binds the
+   plan id; every other file — `template.json`, `parameters.json`,
+   `change-set.json`, `policies.json` — exists and its sha256 is recomputed and
+   compared; the template, parameters and **tags** hashes are the ones the plan
+   id binds. A partial, inconsistent, unknown-schema or `no-changes` plan is
+   refused, and so is a plan whose directory already holds
+   `apply-started.json` or `apply.json`.
+2. **Record consistency.** Every field `plan.json` copies from the plan-id
+   input must equal it; the change-set name is `ssd-plan-<plan-id>`; the
+   change-set ARN, the stack id (for a `CREATE`, the placeholder's), the change
+   list, counts and destructive count must all re-derive from the
+   hash-verified `change-set.json`, which must record `CREATE_COMPLETE` /
+   `AVAILABLE`; the template still passes the repo/shared scope boundary.
+3. **Intent.** `--account` = plan account = `delivery.aws.accountId`;
+   `--region` = plan region = `delivery.aws.region`; the plan's repository and
+   stack are the ones the current configuration derives;
+   `.ssd/onboarding.yml` is unchanged since the plan (`createdFromConfigDigest`);
+   the framework checkout passes the same binding rule as `aws plan` (clean,
+   origin = `framework.repository`, HEAD = `framework.ref`) and is the ref the
+   plan was created at.
+4. **Destructive count and confirmation mode** (still no AWS call).
+5. **Live, read-only:** `sts get-caller-identity` (account = plan, never the
+   root user); `describe-change-set` by the **recorded ARN**, compared field for
+   field with `change-set.json` — any difference refuses (id, stack, status,
+   execution status, capabilities, parameters, tags, nested-stack and import
+   flags, changes, or a field that was not there); only
+   `CREATE_COMPLETE` + `AVAILABLE` executes; the destructive count recomputed
+   from the live description; `get-template --template-stage Original` of that
+   change set must be `template.json`; and the stack (below).
+6. **Confirmation**, then step 5 **again**, so the time spent typing is not a
+   window.
+7. `apply-started.json` is written exclusively, then
+   `cloudformation execute-change-set --stack-name <recorded name> --change-set-name <recorded ARN>`,
+   once.
+8. The stack is polled by its **stack id** until it settles; `apply.json` is
+   written.
+
+**Stale plans (time-of-check/time-of-use).** For an `UPDATE`, the live stack
+must still be the recorded base revision — same stack id, status and
+`LastUpdatedTime`. Another deployment between plan and apply changes
+`LastUpdatedTime`, so the plan is refused even though its change set is still
+`AVAILABLE`. For a `CREATE`, the live stack must be the `REVIEW_IN_PROGRESS`
+placeholder **this** change set created — the stack id recorded in
+`change-set.json` (and, when the plan was made against an existing
+placeholder, the same revision). A stack deleted and recreated under the name,
+a stack that left `REVIEW_IN_PROGRESS`, or one whose SSD ownership tags changed
+is refused.
+
+**Destructive changes.** DELETE and REPLACE (including a conditional
+replacement) are destructive. With none, no flag is needed (`0` is accepted).
+Otherwise `--allow-destructive <n>` must equal the recorded count **and** the
+count freshly computed from the live change set; there is no boolean form.
+The resources themselves are retained (`DeletionPolicy: Retain`).
+
+**Confirmation.** Interactively, after the read-only pre-flight is shown:
+
+```
+Type AWS account 123456789012 to continue: 123456789012
+Type region us-east-1 to continue: us-east-1
+```
+
+Both must match exactly; `y`, `yes` or Enter refuse, and nothing is executed.
+Without a terminal (and no `--yes`), apply refuses before contacting AWS.
+
+**Caller.** The applying principal need not be the planner: the caller ARN is
+deliberately not part of the plan id (a role session name is incidental), so
+any non-root principal of the plan's account may apply a reviewed plan. Both
+ARNs are shown and recorded (`plannedByArn`, `callerArn`).
+
+**What it changes.**
+
+| Mutated | Not mutated |
+| --- | --- |
+| the stack, by executing exactly the recorded change set | `.ssd/onboarding.yml`, workflows, any other repository file, GitHub |
+| `apply-started.json` (before execution) and `apply.json` (after) in that plan directory | any other change set or stack; nothing is deleted, rolled back or imported |
+
+Its AWS wrapper is built for the one plan: the reads are
+`sts get-caller-identity`, and `describe-stacks`, `describe-change-set`,
+`get-template` and `describe-stack-resources` with **only** the recorded stack
+name / stack id / change-set ARN as values; the single mutation is the fixed
+`execute-change-set` argv above, at most once per wrapper. `create-change-set`,
+`create/update/delete-stack`, `delete-change-set`, imports, stack policies,
+termination protection, `--role-arn`, `--client-request-token`,
+`--notification-arns` and every `file://`/`http(s)://` value are refused before
+anything runs. `aws doctor` and `aws plan` keep their own allowlists unchanged.
+
+**Waiting.** Only the operation's own success on the same stack id is
+`APPLIED`: `CREATE_COMPLETE` for a `CREATE`, `UPDATE_COMPLETE` with a
+`LastUpdatedTime` newer than the base revision for an `UPDATE`. A rollback
+(`ROLLBACK_COMPLETE`, `UPDATE_ROLLBACK_COMPLETE`, …), `*_FAILED`,
+`DELETE_COMPLETE`, another stack id or any unknown state is `APPLY_FAILED`,
+even when CloudFormation is settled. Polls back off up to 15 s within a 30-minute
+budget; a timeout, lost credentials or an unreadable stack after execution is
+`APPLY_FAILED` with `observed: false` — success is never claimed without seeing
+it. ssd-onboard rolls nothing back.
+
+**Apply records.** `apply-started.json` (plan id, start time, account, region,
+caller, stack, change set, operation) is written exclusively immediately
+before `execute-change-set`; its presence alone refuses any later apply of the
+plan, even if the process died before `apply.json`. `apply.json` records
+`schemaVersion`, `planId`, `outcome`, `appliedAt`, `account`, `region`,
+`callerArn`, `plannedByArn`, `stackName`, `stackId`, `changeSetId`,
+`changeSetName`, `operation`, `observed`, `finalStackStatus`,
+`stackStatusReason`, `reason`, `counts`, `destructiveCount`, `outputs`,
+`resources` and the framework. Both are written exclusively (never overwritten)
+and pass the same credential-shape check as the plan; AWS-provided text is
+redacted (credential shapes, JWTs, the values of the credential environment
+variables) before it is shown or recorded.
+
+**Next steps.** After `APPLIED`, apply prints the configuration changes the
+operator may need — normally none, because the generated stacks create
+resources under the names `.ssd/onboarding.yml` already holds — and suggests
+`aws doctor`. It never edits the configuration.
+
+| Condition | Outcome | Exit |
+| --- | --- | --- |
+| the change set was executed and the stack reached its success state | `APPLIED` | 0 |
+| a verification or intent mismatch (plan, record, account, region, configuration, framework, caller, change set, template, stack, destructive count, confirmation) | `REFUSED` | 1 |
+| an operational failure before execution (credentials, deadline, malformed AWS output, an unreadable stack, unsafe path) | `ERROR` | 1 |
+| `execute-change-set` was issued and success was not observed | `APPLY_FAILED` | 1 |
+
+In addition to `aws plan`'s access, the operator needs
+`cloudformation:ExecuteChangeSet` and `cloudformation:GetTemplate` on the stack,
+and the permissions CloudFormation uses to create or update the resources (no
+service role is passed).
 
 ## The rollout, end to end
 
