@@ -84,7 +84,9 @@ credentials; see \`aws --help\`):
                           (its only repository write); never executes them
   aws apply --plan-id <id> --account <id> --region <r> [--allow-destructive <n>] [--yes] [--json]
                           executes exactly that reviewed change set, after re-verification
-  aws verify              designed, not implemented
+  aws verify [--region <r>] [--json]
+                          READ-ONLY: proves the deployed boundary holds (trust, simulated
+                          ALLOW and DENY, scanning coverage, SSM target); never repairs
 
 Common options:
   --repo <dir>            consumer repository root (default: current directory)

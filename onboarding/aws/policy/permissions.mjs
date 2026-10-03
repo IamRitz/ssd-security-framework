@@ -29,7 +29,12 @@ export const arns = ({ partition = 'aws', account, region, repository, instanceI
   instance: `arn:${partition}:ec2:${region}:${account}:instance/${instanceId}`,
   otherInstance: `arn:${partition}:ec2:${region}:${account}:instance/i-00000000000000000`,
   runShellScript: `arn:${partition}:ssm:${region}::document/AWS-RunShellScript`,
-  otherDocument: `arn:${partition}:ssm:${region}::document/SsdOnboardProbeOtherDocument`
+  otherDocument: `arn:${partition}:ssm:${region}::document/SsdOnboardProbeOtherDocument`,
+  // Phase 2D probe resources: names that exist nowhere, used only as
+  // simulate-principal-policy inputs, so a grant matching them is a grant
+  // beyond the configured resources.
+  unrelatedRole: `arn:${partition}:iam::${account}:role/ssd-onboard-probe/unrelated`,
+  unrelatedSecret: `arn:${partition}:secretsmanager:${region}:${account}:secret:ssd-onboard-probe/unrelated-AbCdEf`
 });
 
 // role -> { required: [{action, resource, why}], forbidden: [{action, resource, severity, why}] }
@@ -174,6 +179,45 @@ export function simulationGroups(role, target, { enhanced = false } = {}) {
     groups.get(r.resource).push(r.action);
   }
   return [...groups].map(([resource, actions]) => ({ resource, actions }));
+}
+
+// --- verification probes (Phase 2D) -------------------------------------------------
+
+// What `aws verify` asks simulate-principal-policy about one role:
+//   required  roleRequirements().required — hard requirements must evaluate to
+//             `allowed`. `soft` ones (SSM core on the instance role, proven at
+//             runtime by an Online instance) are not probed.
+//   denied    roleRequirements().forbidden, plus the boundary every DELIVERY
+//             role (push, deploy) holds whatever it is for: it cannot assume
+//             another role, read a secret, rewrite its own IAM, or undo the
+//             controls the gate relies on (the repository policy and
+//             registry scanning). `self` is the role's own ARN.
+// No second definition of what a role may do: required access and the
+// role-specific denials come from the one contract above.
+export function verificationProbes(role, target, { enhanced, self }) {
+  const req = roleRequirements(role, target, { enhanced });
+  const a = arns(target);
+  const delivery =
+    role === 'instance'
+      ? []
+      : [
+          { action: 'sts:AssumeRole', resource: a.unrelatedRole, severity: 'FAIL', why: 'a delivery role must not assume other roles' },
+          { action: 'secretsmanager:GetSecretValue', resource: a.unrelatedSecret, severity: 'FAIL', why: 'a delivery role reads no secret' },
+          ...['iam:PutRolePolicy', 'iam:AttachRolePolicy', 'iam:UpdateAssumeRolePolicy'].map((action) => ({
+            action,
+            resource: self,
+            severity: 'FAIL',
+            why: 'a role that can rewrite its own permissions or trust can grant itself anything'
+          })),
+          { action: 'iam:CreateRole', resource: a.unrelatedRole, severity: 'FAIL', why: 'a delivery role must not create IAM roles' },
+          { action: 'ecr:SetRepositoryPolicy', resource: a.repository, severity: 'FAIL', why: 'the repository policy bounds who can read and write images' },
+          { action: 'ecr:DeleteRepository', resource: a.repository, severity: 'FAIL', why: 'a delivery role must not delete the repository' },
+          { action: 'ecr:PutRegistryScanningConfiguration', resource: '*', severity: 'FAIL', why: 'the gate relies on registry scanning; a delivery role must not change it' }
+        ];
+  return {
+    required: req.required.filter((r) => !r.soft),
+    denied: [...req.forbidden, ...delivery]
+  };
 }
 
 // A least-privilege statement set for the instance role, printed as a

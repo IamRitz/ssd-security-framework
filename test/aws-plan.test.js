@@ -746,11 +746,7 @@ describe('aws plan: CLI', () => {
     assert.equal(doctor.f.calls.length, 0);
   });
 
-  it('verify remains unimplemented and contacts nothing; apply without its flags is a usage error', async (t) => {
-    const verify = await cli(consumer(t), ['aws', 'verify']);
-    assert.equal(verify.code, 2);
-    assert.match(verify.err, /not implemented/);
-    assert.equal(verify.f.calls.length, 0);
+  it('apply without its flags is a usage error and contacts nothing', async (t) => {
     const apply = await cli(consumer(t), ['aws', 'apply']);
     assert.equal(apply.code, 2);
     assert.match(apply.err, /requires --plan-id, --account and --region/);

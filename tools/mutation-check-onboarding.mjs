@@ -37,7 +37,8 @@ const TESTS = [
   'test/aws-plan-templates.test.js',
   'test/aws-plan.test.js',
   'test/aws-apply-wrapper.test.js',
-  'test/aws-apply.test.js'
+  'test/aws-apply.test.js',
+  'test/aws-verify.test.js'
 ];
 
 // [invariant, file, search, replace]
@@ -297,6 +298,37 @@ const MUTATIONS = [
   ['apply records are secret-checked', 'onboarding/aws/plan/record.mjs', '  assertPersistable({ [name]: text }, env);\n', ''],
   ['AWS text in apply output is redacted with the run environment', 'onboarding/aws/apply.mjs', "statusReason: typeof s.StackStatusReason === 'string' ? redact(s.StackStatusReason, env) : null,", "statusReason: typeof s.StackStatusReason === 'string' ? s.StackStatusReason : null,"],
   ['the fake apply harness enforces the apply allowlist itself', 'test/support/aws-apply-fake.mjs', '  const fake = fakeAws(world, { allowlist: assertApply(binding) });', '  const fake = fakeAws(world, { allowlist: () => {} });'],
+  // Phase 2D: aws verify (read-only, effective-permission verification).
+  ['verify: the account comparison cannot be skipped', 'onboarding/aws/verify.mjs', '  const identity = [identityCheck(accountCheck(caller, account)), identityCheck(principalCheck(caller)), regionC];', '  const identity = [identityCheck(principalCheck(caller)), regionC];'],
+  ['verify: the root caller is never accepted', 'onboarding/aws/verify.mjs', '  const identity = [identityCheck(accountCheck(caller, account)), identityCheck(principalCheck(caller)), regionC];', '  const identity = [identityCheck(accountCheck(caller, account)), regionC];'],
+  ['verify: an identity failure stops the run before discovery', 'onboarding/aws/verify.mjs', '  if (identity.some((c) => c.status === FAIL)) {', '  if (false) {'],
+  ['verify: a region mismatch contacts no AWS', 'onboarding/aws/verify.mjs', '  if (regionC.status === FAIL) {', '  if (false) {'],
+  ['verify: only the read-only wrapper is used', 'onboarding/aws/verify.mjs', "import { readOnlyAws } from './aws-cli.mjs';", "import { planningAws as readOnlyAws } from './aws-cli.mjs';"],
+  ['the read-only allowlist is never widened with a mutating verb', 'onboarding/aws/aws-cli.mjs', "    'describe-instance-information': { '--filters': true }\n  },", "    'describe-instance-information': { '--filters': true },\n    'send-command': { '--instance-ids': true }\n  },"],
+  ['ownership ignores no stack tag', 'onboarding/aws/discover/stacks.mjs', '  reasons.push(...stackTagProblems(st.tags, { scope, slug }));\n', ''],
+  ['verify: a managed resource must hold its own logical id', 'onboarding/aws/verify.mjs', '  if (evaluation.stack?.logicalId === expected) {', '  if (true) {'],
+  ['a StringLike wildcard subject is never evaluated as an exact value', 'onboarding/aws/policy/trust.mjs', "      if (entry.operator === 'StringLike' && hasWildcard(value)) {", '      if (false) {'],
+  ['verify: a forbidden action that simulates ALLOWED fails', 'onboarding/aws/verify.mjs', "    if (r.decision === 'allowed') {\n      findings.push({ severity: p.severity, kind: 'forbidden-access-allowed'", "    if (false) {\n      findings.push({ severity: p.severity, kind: 'forbidden-access-allowed'"],
+  ['verify: negative probes are simulated', 'onboarding/aws/verify.mjs', '      simulation = await simulateProbes(aws, arn, [...probes.required, ...probes.denied]);', '      simulation = await simulateProbes(aws, arn, [...probes.required]);'],
+  ['verify: ALLOW is not read as DENY', 'onboarding/aws/verify.mjs', "    if (r.decision === 'allowed') {\n      continue;", "    if (r.decision !== 'allowed') {\n      continue;"],
+  ['verify: a denial that depends on missing context is not proof', 'onboarding/aws/verify.mjs', "    } else if (r.decision === 'implicitDeny' && r.missingContext.length > 0) {", '    } else if (false) {'],
+  ['verify: a refusal that depends on missing context is not a proven FAIL', 'onboarding/aws/verify.mjs', '    const uncertain = r.missingContext.length > 0 || p.possible;', '    const uncertain = p.possible;'],
+  ['verify: the policy-text breadth backstop is kept', 'onboarding/aws/verify.mjs', '  if (analysis) {\n    const breadth', '  if (false) {\n    const breadth'],
+  ['verify: separation of duties is checked', 'onboarding/aws/verify.mjs', '    separationCheck({ config, roles, target: t }),\n', ''],
+  ['verify: two roles with one RoleId are one identity', 'onboarding/aws/verify.mjs', '    } else if (p.roleId === q.roleId) {', '    } else if (false) {'],
+  ['verify: a managed repository must be IMMUTABLE', 'onboarding/aws/verify.mjs', "  if (mode !== 'managed') {\n    return adopt(base, { why });", "  if (true) {\n    return adopt(base, { why });"],
+  ['verify: the repository is the one in this account and region', 'onboarding/aws/verify.mjs', '  if (result.value.arn !== expectedArn) {', '  if (false) {'],
+  ['verify: the scanning configuration is this registry\'s', 'onboarding/aws/verify.mjs', '  } else if (result.value.registryId !== account) {', '  } else if (false) {'],
+  ['a MANUAL rule is not automatic scanning coverage', 'onboarding/aws/discover/ecr.mjs', "  const automatic = best && best.frequency !== 'MANUAL';", '  const automatic = best;'],
+  ['a wildcard filter matches the whole repository name', 'onboarding/aws/discover/ecr.mjs', '  return new RegExp(`^${body}$`).test(repository);', '  return new RegExp(`^${body}`).test(repository);'],
+  ['verify: Inspector enabled is not Inspector coverage', 'onboarding/aws/verify.mjs', '  if (records.length === 0) {', '  if (false) {'],
+  ['verify: instance pull access is simulated', 'onboarding/aws/verify.mjs', '  const findings = [...required.findings, ...denied.findings];', '  const findings = [...denied.findings];'],
+  ['verify: an unavailable simulation is never PASS', 'onboarding/aws/verify.mjs', "    return { ...c, status: NOT_VERIFIED, findings: [{ severity: NOT_VERIFIED, kind: simulation.error.kind,", "    return { ...c, status: PASS, findings: [{ severity: PASS, kind: simulation.error.kind,"],
+  ['verify: an unrecognised simulation decision is malformed', 'onboarding/aws/discover/iam-role.mjs', '      if (!SIMULATION_DECISIONS.includes(r.EvalDecision)) {', '      if (false) {'],
+  ['verify: a truncated simulation is malformed', 'onboarding/aws/discover/iam-role.mjs', '    if (got.value.IsTruncated === true) {', '    if (false) {'],
+  ['verify: every probe is answered exactly once', 'onboarding/aws/discover/iam-role.mjs', '      if (answers.length !== 1) {', '      if (answers.length === 0) {'],
+  ['verify: a required NOT VERIFIED fails the command', 'onboarding/aws/verify.mjs', "  if (checks.some((c) => c.status === NOT_VERIFIED && c.required)) {\n    return 'NOT_VERIFIED';", "  if (false) {\n    return 'NOT_VERIFIED';"],
+  ['verify: the fixture simulator is independent of the code', 'test/support/aws-verify-fake.mjs', "          EvalDecision: allowed.has(key) ? 'allowed' : 'implicitDeny',", "          EvalDecision: 'allowed',"],
 ];
 
 // Temp-workspace lifecycle
