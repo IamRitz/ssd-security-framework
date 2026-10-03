@@ -600,7 +600,7 @@ describe('ci.yml: the dependency-free import check fails closed', () => {
   // A tree shaped like the repository's, holding only the given .mjs files.
   function tree(files) {
     const root = mkdtempSync(join(WORK, 'import-check-'));
-    for (const dir of ['security/scripts', 'onboarding/lib']) {
+    for (const dir of ['security/scripts', 'onboarding/lib', 'broker/lambda']) {
       mkdirSync(join(root, dir), { recursive: true });
     }
     for (const [path, content] of Object.entries(files)) {
@@ -617,7 +617,7 @@ describe('ci.yml: the dependency-free import check fails closed', () => {
     assert.match(SCRIPT, /grep -rnP\b/, 'the negative lookahead needs -P');
     assert.doesNotMatch(SCRIPT, /grep[^\n|]*-[a-zA-Z]*E/, 'no -E anywhere in the grep invocation');
     assert.doesNotMatch(SCRIPT, /2>\s*\/dev\/null|2>&-/, 'stderr from the checker is never suppressed');
-    assert.ok(SCRIPT.includes('security/scripts') && SCRIPT.includes('onboarding'), 'both trees stay in scope');
+    assert.match(SCRIPT, /security\/scripts onboarding broker\n/, 'the toolkit, onboarding and broker trees stay in scope');
   });
 
   it('no forbidden import (grep exit 1): the control PASSES', () => {
@@ -629,7 +629,8 @@ describe('ci.yml: the dependency-free import check fails closed', () => {
 
   for (const [where, files] of [
     ['security/scripts', { 'security/scripts/a.mjs': THIRD_PARTY, 'onboarding/lib/b.mjs': BUILTINS }],
-    ['onboarding', { 'security/scripts/a.mjs': BUILTINS, 'onboarding/lib/b.mjs': THIRD_PARTY }]
+    ['onboarding', { 'security/scripts/a.mjs': BUILTINS, 'onboarding/lib/b.mjs': THIRD_PARTY }],
+    ['broker', { 'security/scripts/a.mjs': BUILTINS, 'broker/lambda/c.mjs': THIRD_PARTY }]
   ]) {
     it(`a third-party import under ${where} (grep exit 0): the control FAILS`, () => {
       const { code, out } = check(tree(files));
