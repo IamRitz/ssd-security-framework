@@ -43,7 +43,8 @@ export function createBroker({
   slack,
   github,
   signingSecret,
-  approverMap,
+  // { approversFor(repositoryId) } -> an approvers.mjs lookup result.
+  approverSource,
   // async (token) -> verified GitHub identity, or throws IdentityRejected.
   verifyIdentity,
   slackChannelId,
@@ -219,21 +220,23 @@ export function createBroker({
     const decision = extractSlackDecision(interaction);
     if (!decision) return reply('rejected', 'Invalid or stale approval control.');
 
-    // The repository comes from the STORED request's VERIFIED identity, keyed
-    // by the immutable repository_id — never from the click payload, and never
-    // from the display context. No stored identity -> nobody is authorized.
+    // The approver list is the one named by the STORED request's VERIFIED
+    // repository_id — never the click payload, never the display context —
+    // read at click time. No stored identity -> no lookup, nobody authorized.
     const stored = await store.get(decision.requestId);
-    const auth = authorizeSlackInteraction({
-      interaction,
-      repo: stored?.identity?.repositoryId,
-      approverMap
-    });
+    const repositoryId = stored?.identity?.repositoryId;
+    const approvers = repositoryId
+      ? await approverSource.approversFor(repositoryId)
+      : { state: 'misconfigured', reason: 'request has no verified identity', userIds: null };
+    const auth = authorizeSlackInteraction({ interaction, approvers });
     if (!auth.authorized) {
       log({
         event: 'unauthorized',
         requestId: decision.requestId,
-        repositoryId: stored?.identity?.repositoryId ?? null,
-        userId: auth.userId || null
+        repositoryId: repositoryId ?? null,
+        userId: auth.userId || null,
+        approverList: approvers.state,
+        reason: approvers.reason ?? auth.reason ?? null
       });
       return reply('unauthorized', 'You are not an authorized break-glass approver.', {
         requestId: decision.requestId

@@ -14,6 +14,7 @@ import { runMutationCheck } from './mutation-check-onboarding.mjs';
 
 export const TESTS = [
   'test/broker-oidc-identity.test.js',
+  'test/broker-approvers-ssm.test.js',
   'test/broker-lambda.test.js',
   'test/broker-authorize.test.js',
   'test/break-glass-lambda-transport.test.js',
@@ -25,6 +26,7 @@ const OIDC = 'broker/identity/github-oidc.mjs';
 const REQUEST = 'broker/request.mjs';
 const BROKER = 'broker/lambda/broker.mjs';
 const STORE = 'broker/lambda/dynamodb-store.mjs';
+const APPROVERS = 'broker/authorize/approvers.mjs';
 
 // [invariant, file, search, replace]
 export const MUTATIONS = [
@@ -54,9 +56,20 @@ export const MUTATIONS = [
   ['a production request needs a pull_request event', OIDC, "  if (identity?.eventName !== 'pull_request') reject('event_not_allowed');\n", ''],
   ['a payload that disagrees with the token is rejected', REQUEST, '    if (given !== undefined && given !== null && String(given) !== value) disagree(field);\n', ''],
   ['an unknown context field is rejected', REQUEST, "    if (!CONTEXT_FIELDS.has(field)) throw new IdentityRejected(`payload_context_field_not_allowed: ${field}`);\n", ''],
-  ['approvers are looked up by the verified repository_id', BROKER, '      repo: stored?.identity?.repositoryId,', '      repo: stored?.context?.repository,'],
+  ['approvers are looked up by the verified repository_id', BROKER, '    const repositoryId = stored?.identity?.repositoryId;', '    const repositoryId = stored?.context?.repositoryId;'],
   ['the audit comment refuses a request without verified identity', BROKER, "    if (!request?.identity) throw new Error('refusing side effects for a request without verified identity');\n", ''],
   ['an unconfigured verifier fails closed', BROKER, "      if (typeof verifyIdentity !== 'function') throw new IdentityRejected('verifier_not_configured');\n", "      if (typeof verifyIdentity !== 'function') return { identity: {} };\n"],
+  // --- per-repository approvers in SSM (3B) -------------------------------------
+  ['only a present list authorizes anyone', 'broker/authorize/slack-authorize.mjs', "  if (approvers?.state !== 'present' || !(approvers.userIds instanceof Set)) {", '  if (!(approvers?.userIds instanceof Set)) {'],
+  ['an SSM failure is unverified, never absent', APPROVERS, "        if (error?.name === 'ParameterNotFound') return result('absent', 'no approver parameter');", "        return result('absent', 'no approver parameter');"],
+  ['an empty list is reported as empty', APPROVERS, "  if (parsed.length === 0) return result('empty', 'the approver list is empty');\n", ''],
+  ['one bad entry rejects the whole list', APPROVERS, "  if (!parsed.every((id) => typeof id === 'string' && SLACK_USER_ID.test(id))) {\n    return result('malformed', 'an entry is not a Slack user ID');\n  }\n  const userIds = new Set(parsed);", "  const userIds = new Set(parsed.filter((id) => typeof id === 'string' && SLACK_USER_ID.test(id)));"],
+  ['entries must be Slack user IDs', APPROVERS, "typeof id === 'string' && SLACK_USER_ID.test(id))) {", "typeof id === 'string')) {"],
+  ['duplicate approvers are malformed', APPROVERS, "  if (userIds.size !== parsed.length) return result('malformed', 'duplicate approver');\n", ''],
+  ['the approver list is bounded', APPROVERS, "  if (parsed.length > MAX_APPROVERS) return result('malformed', `more than ${MAX_APPROVERS} approvers`);\n", ''],
+  ['the parameter must be a plain String', APPROVERS, "  if (!parameter || parameter.Type !== 'String') return", '  if (!parameter) return'],
+  ['the break-glass environment is validated', APPROVERS, '  if (!BREAK_GLASS_ENVIRONMENTS.includes(environment)) return null;\n', ''],
+  ['the repository_id in the parameter name is validated', APPROVERS, "  if (typeof repositoryId !== 'string' || !REPOSITORY_ID.test(repositoryId)) return null;\n", ''],
   // --- status is bound to the filing run --------------------------------------
   ['status is bound to repository_id', BROKER, '      owner.repositoryId !== auth.identity.repositoryId ||\n', ''],
   ['status is bound to run_id', BROKER, '      owner.runId !== auth.identity.runId ||\n', ''],
