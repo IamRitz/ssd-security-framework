@@ -702,24 +702,46 @@ Once per Slack workspace:
 
 ### 3.4 Per-repo approvers **[REPO]**
 
-Authorization is per repository and fail-closed:
+Authorization is per repository and fail-closed. Full contract:
+[break-glass-setup.md § Authorization](break-glass-setup.md#authorization-is-per-repository-and-fail-closed).
+
+One SSM parameter per repository, named by its immutable GitHub
+`repository_id` (`gh api repos/<owner>/<repo> --jq .id`):
 
 ```
-SLACK_APPROVER_IDS_BY_REPO={"org/repo-a":["U123"],"org/repo-b":["U456","U789"]}
+/ssd/break-glass/<environment>/approvers/<repository_id>     Type: String
+["U0123456789","U0987654321"]
 ```
 
-- A repository **not present as a key authorizes nobody.** There is no fallback
-  to a shared default list. A repo is not onboarded to break-glass until it has
-  an explicit entry.
-- **Malformed JSON is treated as an empty map** — nobody authorized for
-  anything — logged, never thrown. One bad edit cannot crash approvals for every
-  repo at once.
-- The repository identity comes from the **stored pending request**, looked up by
-  request ID when the click arrives — never from the Slack payload, which has no
-  notion of a GitHub repo and so offers nothing to forge.
+`<environment>` is `production` or `synthetic`. It comes from the interaction
+function's `BREAK_GLASS_ENVIRONMENT`, so the two stacks never read each other's
+lists. The value is a JSON array of Slack user IDs (`U…` or `W…`), at most 50,
+with no duplicates.
 
-Changing this is an environment-variable change, which needs a restart of the
-handler to take effect.
+| Parameter | Result |
+| --- | --- |
+| a valid, non-empty list | only those users may decide |
+| missing | **nobody** (`absent`) |
+| `[]` | **nobody** (`empty`) |
+| not a JSON array, a bad or duplicate entry, too many, not type `String` | **nobody** (`malformed`). The list is never partially used. |
+| SSM denied, throttled, failed or took over 2 s | **nobody** (`unverified`, never reported as `absent`) |
+| invalid `BREAK_GLASS_ENVIRONMENT`, or a request with no verified identity | **nobody** (`misconfigured`), and SSM is not called |
+
+- The `repository_id` is the **stored request's verified identity**, taken from
+  the GitHub OIDC token at notify time. It never comes from the Slack payload
+  or the request's display context. Only that one parameter is read, so
+  another repository's list is never consulted.
+- The list is read **at click time**, with no cache. Removing an approver takes
+  effect on the next click, with no restart.
+- Every refusal is logged with the request id, `repository_id`, Slack user id
+  and the list state above.
+- No approver list is read from the environment. Neither the old name-keyed
+  `SLACK_APPROVER_IDS_BY_REPO` nor 3A's `SLACK_APPROVER_IDS_BY_REPOSITORY_ID`
+  exists any more.
+
+The interaction function needs `ssm:GetParameter` on
+`arn:aws:ssm:<region>:<account>:parameter/ssd/break-glass/<environment>/approvers/*`
+and nothing broader. Creating, owning and verifying the parameters is Phase 3C.
 
 ### 3.5 A repo with no Slack
 

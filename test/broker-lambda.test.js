@@ -3,18 +3,18 @@ import { Buffer } from 'node:buffer';
 import { createHmac } from 'node:crypto';
 import { describe, it } from 'node:test';
 
-import { parseApproverMapByRepositoryId } from '../broker/authorize/slack-authorize.mjs';
 import { createJwksCache, verifyGithubOidcToken } from '../broker/identity/github-oidc.mjs';
 import { createBroker } from '../broker/lambda/broker.mjs';
 import { createDynamoStore } from '../broker/lambda/dynamodb-store.mjs';
 import { createCiHandler, createInteractionsHandler } from '../broker/lambda/handlers.mjs';
+import { SLACK_A, SLACK_B, approversById, fakeApproverSource } from './support/fake-approvers.mjs';
 import { createFakeDynamo } from './support/fake-dynamodb.mjs';
 import { REPO_A as ID_A, REPO_B as ID_B, SHA_A, createSigningKey, fakeJwksFetch, githubClaims, signToken } from './support/jwt-fixtures.mjs';
 
 const SIGNING_SECRET = 'test-signing-secret';
 const REPO_A = ID_A.repository;
-// Approvers are keyed by the immutable repository_id (Phase 3A).
-const APPROVERS = JSON.stringify({ [ID_A.repositoryId]: ['U-A'], [ID_B.repositoryId]: ['U-B'] });
+// One SSM approver parameter per immutable repository_id (Phase 3B).
+const APPROVERS = { [ID_A.repositoryId]: [SLACK_A], [ID_B.repositoryId]: [SLACK_B] };
 const KEY = createSigningKey();
 const RESPONSE_URL = 'https://hooks.slack.com/actions/T0/1/abc';
 
@@ -46,7 +46,7 @@ function fakeGithub() {
   return { calls, postComment: async (repo, pr, body) => calls.push({ repo, pr, body }) };
 }
 
-function setup({ approverEnv = APPROVERS, slack = fakeSlack(), now = () => new Date() } = {}) {
+function setup({ approvers = approversById(APPROVERS), slack = fakeSlack(), now = () => new Date() } = {}) {
   const dynamo = createFakeDynamo();
   const github = fakeGithub();
   const jwks = createJwksCache({ fetchImpl: fakeJwksFetch([KEY]).fetchImpl, now: () => now().getTime() });
@@ -55,7 +55,7 @@ function setup({ approverEnv = APPROVERS, slack = fakeSlack(), now = () => new D
     slack,
     github,
     signingSecret: SIGNING_SECRET,
-    approverMap: parseApproverMapByRepositoryId(approverEnv),
+    approverSource: approvers.source,
     verifyIdentity: (token) => verifyGithubOidcToken(token, { jwks, now: () => now().getTime() }),
     slackChannelId: 'C-TEST',
     now,
@@ -89,7 +89,7 @@ function urlEvent(interaction, { secret = SIGNING_SECRET, timestamp, body, base6
   };
 }
 
-const click = (requestId, { userId = 'U-A', action = 'approve' } = {}) => ({
+const click = (requestId, { userId = SLACK_A, action = 'approve' } = {}) => ({
   type: 'block_actions',
   user: { id: userId, username: `user-${userId}` },
   actions: [{ action_id: `breakglass:${requestId}:${action}` }],
@@ -171,9 +171,9 @@ describe('Lambda broker — Slack signature verification at the Function URL', (
   it('accepts a genuinely signed request (plain and base64-encoded bodies)', async () => {
     const env = setup();
     const requestId = await createRequest(env, eligiblePayload());
-    const plain = await env.interactions(urlEvent(click(requestId, { userId: 'U-NOBODY' })));
+    const plain = await env.interactions(urlEvent(click(requestId, { userId: 'UNOBODY0001' })));
     assert.equal(plain.statusCode, 200);
-    const encoded = await env.interactions(urlEvent(click(requestId, { userId: 'U-NOBODY' }), { base64: true }));
+    const encoded = await env.interactions(urlEvent(click(requestId, { userId: 'UNOBODY0001' }), { base64: true }));
     assert.equal(encoded.statusCode, 200);
   });
 
@@ -225,7 +225,7 @@ describe('Lambda broker — decisions', () => {
     assert.equal(env.github.calls[0].repo, REPO_A);
     assert.equal(env.github.calls[0].pr, '51');
     assert.match(env.github.calls[0].body, /Break-glass decision: \*\*APPROVED\*\*/);
-    assert.match(env.github.calls[0].body, /Verified approver: \*\*user-U-A\*\* \(ID: `U-A`\)/);
+    assert.match(env.github.calls[0].body, /Verified approver: \*\*user-UAPPROVERA1\*\* \(ID: `UAPPROVERA1`\)/);
     assert.match(env.github.calls[0].body, /Overridden finding\(s\): sast.high_new: demo.rule/);
     // Buttons removed: the message is replaced in place with no actions block.
     assert.equal(env.slack.calls.update.length, 1);
@@ -236,7 +236,7 @@ describe('Lambda broker — decisions', () => {
     assert.equal((await env.interactions(env.enqueued[0])).done, false);
     assert.equal(env.github.calls.length, 1);
     const status = (await env.status(requestId)).body;
-    assert.equal(status.approver.id, 'U-A');
+    assert.equal(status.approver.id, SLACK_A);
   });
 
   it('denies', async () => {
@@ -249,7 +249,7 @@ describe('Lambda broker — decisions', () => {
   it('an unauthorized user changes nothing and gets an ephemeral reply', async () => {
     const env = setup();
     const requestId = await createRequest(env);
-    const response = await env.interactions(urlEvent(click(requestId, { userId: 'U-STRANGER' })));
+    const response = await env.interactions(urlEvent(click(requestId, { userId: 'USTRANGER01' })));
     assert.equal(response.headers['x-break-glass-outcome'], 'unauthorized');
     assert.equal(await statusOf(env, requestId), 'pending');
     assert.equal(env.enqueued[0].kind, 'ephemeral');
@@ -261,13 +261,13 @@ describe('Lambda broker — decisions', () => {
   it('per-repo scoping: a repo-B approver is rejected on a repo-A request', async () => {
     const env = setup();
     const requestId = await createRequest(env);
-    const response = await env.interactions(urlEvent(click(requestId, { userId: 'U-B' })));
+    const response = await env.interactions(urlEvent(click(requestId, { userId: SLACK_B })));
     assert.equal(response.headers['x-break-glass-outcome'], 'unauthorized');
     assert.equal(await statusOf(env, requestId), 'pending');
   });
 
-  it('a malformed approver map authorizes nobody', async () => {
-    const env = setup({ approverEnv: '{not json' });
+  it('a malformed approver parameter authorizes nobody', async () => {
+    const env = setup({ approvers: fakeApproverSource({ '/ssd/break-glass/production/approvers/1001': '{not json' }) });
     const requestId = await createRequest(env);
     await env.interactions(urlEvent(click(requestId)));
     assert.equal(await statusOf(env, requestId), 'pending');

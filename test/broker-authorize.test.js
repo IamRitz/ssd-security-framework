@@ -12,15 +12,15 @@ import {
   parseSlackInteraction,
   verifySlackSignature
 } from '../broker/authorize/slack-interaction-verify.mjs';
-import {
-  authorizeSlackInteraction,
-  isAuthorizedApprover,
-  parseApproverMapFromEnv
-} from '../broker/authorize/slack-authorize.mjs';
+import { parseApproverList } from '../broker/authorize/approvers.mjs';
+import { authorizeSlackInteraction } from '../broker/authorize/slack-authorize.mjs';
 
 const REPO_A = 'IamRitz/secure-software-delivery';
-const REPO_B = 'org/other-repo';
-const APPROVER_MAP_ENV = JSON.stringify({ [REPO_A]: ['U0BV6TWN60J'], [REPO_B]: ['U111', 'U222'] });
+// Approver lists as the SSM lookup returns them (broker/authorize/approvers.mjs):
+// one per repository_id, so "repo A's list" and "repo B's list" are separate
+// lookups and never one shared map.
+const REPO_A_APPROVERS = parseApproverList(JSON.stringify(['U0BV6TWN60J']));
+const REPO_B_APPROVERS = parseApproverList(JSON.stringify(['U11111111', 'U22222222']));
 
 const SIGNING_SECRET = 'test-signing-secret';
 const REQUEST_ID = '11111111-1111-4111-8111-111111111111';
@@ -143,41 +143,33 @@ describe('Slack payload parsing and authorization', () => {
     assert.deepEqual(extractSlackDecision(interaction), { requestId: REQUEST_ID, action: 'approve' });
   });
 
-  it('authorizes per repo: a repo-A approver is rejected for a repo-B request', () => {
-    const map = parseApproverMapFromEnv(APPROVER_MAP_ENV);
-    // U0BV6TWN60J is listed only under repo A.
-    assert.equal(
-      authorizeSlackInteraction({ interaction: slackInteraction({ userId: 'U0BV6TWN60J' }), repo: REPO_A, approverMap: map }).authorized,
-      true
-    );
-    const crossRepo = authorizeSlackInteraction({
-      interaction: slackInteraction({ userId: 'U0BV6TWN60J' }),
-      repo: REPO_B,
-      approverMap: map
-    });
+  it('authorizes against the request repository\'s list only: repo A\'s approver is not on repo B\'s list', () => {
+    const approver = slackInteraction({ userId: 'U0BV6TWN60J' });
+    assert.equal(authorizeSlackInteraction({ interaction: approver, approvers: REPO_A_APPROVERS }).authorized, true);
+    const crossRepo = authorizeSlackInteraction({ interaction: approver, approvers: REPO_B_APPROVERS });
     assert.equal(crossRepo.authorized, false);
-    assert.equal(crossRepo.repo, REPO_B);
+    assert.equal(crossRepo.reason, 'not an authorized break-glass approver');
   });
 
-  it('rejects every user for a repo with no entry in the map (fail closed)', () => {
-    const map = parseApproverMapFromEnv(APPROVER_MAP_ENV);
-    assert.equal(isAuthorizedApprover('U0BV6TWN60J', 'org/unonboarded', map), false);
-    assert.equal(isAuthorizedApprover('U111', 'org/unonboarded', map), false);
+  it('authorizes nobody unless the list is present: absent, empty, malformed, unverified, misconfigured', () => {
+    const approver = slackInteraction({ userId: 'U0BV6TWN60J' });
+    for (const approvers of [
+      { state: 'absent', userIds: null },
+      parseApproverList('[]'),
+      parseApproverList('{not valid json'),
+      { state: 'unverified', userIds: null },
+      // A non-present state is refused even if a set is (wrongly) attached.
+      { state: 'unverified', userIds: new Set(['U0BV6TWN60J']) },
+      { state: 'misconfigured', userIds: null },
+      undefined
+    ]) {
+      assert.equal(authorizeSlackInteraction({ interaction: approver, approvers }).authorized, false, JSON.stringify(approvers));
+    }
   });
 
-  it('treats malformed JSON (and non-objects) as an empty map — every repo fails closed, no throw', () => {
-    const broken = parseApproverMapFromEnv('{not valid json');
-    assert.equal(broken.size, 0);
-    assert.equal(isAuthorizedApprover('U0BV6TWN60J', REPO_A, broken), false);
-    assert.equal(parseApproverMapFromEnv('["U111"]').size, 0); // JSON array, not an object
-    assert.equal(parseApproverMapFromEnv('').size, 0);
-    assert.equal(parseApproverMapFromEnv(undefined).size, 0);
-  });
-
-  it('preserves single-repo behavior once the demo repo has its one entry', () => {
-    const map = parseApproverMapFromEnv(JSON.stringify({ [REPO_A]: ['U0BV6TWN60J'] }));
-    assert.equal(isAuthorizedApprover('U0BV6TWN60J', REPO_A, map), true);
-    assert.equal(isAuthorizedApprover('U-INTRUDER', REPO_A, map), false);
+  it('a click without a Slack user is never authorized', () => {
+    const interaction = { ...slackInteraction(), user: {} };
+    assert.equal(authorizeSlackInteraction({ interaction, approvers: REPO_A_APPROVERS }).authorized, false);
   });
 });
 
@@ -193,11 +185,8 @@ describe('Shared break-glass decision logic', () => {
       true
     );
     const interaction = parseSlackInteraction(rawBody);
-    const auth = authorizeSlackInteraction({
-      interaction,
-      repo: requests[REQUEST_ID].context.repository, // repo from STORED state, not the click
-      approverMap: parseApproverMapFromEnv(APPROVER_MAP_ENV)
-    });
+    // The list for the STORED request's repository, not anything in the click.
+    const auth = authorizeSlackInteraction({ interaction, approvers: REPO_A_APPROVERS });
     assert.equal(auth.authorized, true);
     const { requestId, action } = extractSlackDecision(interaction);
 
@@ -219,8 +208,7 @@ describe('Shared break-glass decision logic', () => {
     const requests = pendingRequests();
     const auth = authorizeSlackInteraction({
       interaction: slackInteraction({ userId: 'U-INTRUDER' }),
-      repo: REPO_A,
-      approverMap: parseApproverMapFromEnv(APPROVER_MAP_ENV)
+      approvers: REPO_A_APPROVERS
     });
     assert.equal(auth.authorized, false);
     // An authorization failure means claimDecision is never called.

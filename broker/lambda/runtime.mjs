@@ -4,15 +4,18 @@
 // Environment (set by server/break-glass/infra/deploy.sh — no secret VALUES here):
 //   TABLE_NAME                    DynamoDB table
 //   SLACK_CHANNEL_ID              approval channel (ci function)
-//   SLACK_APPROVER_IDS_BY_REPOSITORY_ID  {"<repository_id>":["Uxxx"]} (interactions function)
-//                                 The pre-3A SLACK_APPROVER_IDS_BY_REPO (name-keyed) is
-//                                 deliberately NOT read: until re-keyed, nobody is authorized.
+//   BREAK_GLASS_ENVIRONMENT       production | synthetic (interactions function): selects
+//                                 /ssd/break-glass/<environment>/approvers/<repository_id>.
+//                                 Missing or anything else -> nobody is authorized.
+//                                 No approver map is read from the environment (neither the
+//                                 name-keyed SLACK_APPROVER_IDS_BY_REPO nor the 3A
+//                                 SLACK_APPROVER_IDS_BY_REPOSITORY_ID).
 //   SLACK_BOT_TOKEN_SECRET_ARN    both functions
 //   SLACK_SIGNING_SECRET_ARN      interactions function only
 //   GITHUB_TOKEN_SECRET_ARN       interactions function only
 import { Buffer } from 'node:buffer';
 
-import { parseApproverMapByRepositoryId } from '../authorize/slack-authorize.mjs';
+import { createApproverSource } from '../authorize/approvers.mjs';
 import { createJwksCache, verifyGithubOidcToken } from '../identity/github-oidc.mjs';
 import { createGithubClient } from '../github.mjs';
 import { createSlackClient } from '../slack.mjs';
@@ -24,7 +27,8 @@ async function loadSdk() {
   sdk ??= {
     dynamodb: await import('@aws-sdk/client-dynamodb'),
     secrets: await import('@aws-sdk/client-secrets-manager'),
-    lambda: await import('@aws-sdk/client-lambda')
+    lambda: await import('@aws-sdk/client-lambda'),
+    ssm: await import('@aws-sdk/client-ssm')
   };
   return sdk;
 }
@@ -34,6 +38,10 @@ async function readSecret(client, secrets, arn) {
   const result = await client.send(new secrets.GetSecretValueCommand({ SecretId: arn }));
   return result.SecretString;
 }
+
+// Slack expects its ack within 3 s; an approver lookup slower than this is
+// treated as unverified (nobody authorized) rather than stalling the ack.
+const APPROVER_LOOKUP_TIMEOUT_MS = 2000;
 
 let brokerPromise;
 export function getBroker(env = process.env) {
@@ -46,7 +54,7 @@ export function getBroker(env = process.env) {
 }
 
 async function buildBroker(env) {
-  const { dynamodb, secrets } = await loadSdk();
+  const { dynamodb, secrets, ssm } = await loadSdk();
   const secretsClient = new secrets.SecretsManagerClient({});
   const [botToken, signingSecret, githubToken] = await Promise.all([
     readSecret(secretsClient, secrets, env.SLACK_BOT_TOKEN_SECRET_ARN),
@@ -55,6 +63,7 @@ async function buildBroker(env) {
   ]);
 
   const jwks = createJwksCache();
+  const ssmClient = new ssm.SSMClient({});
   const ddb = new dynamodb.DynamoDBClient({});
   const client = { call: (operation, input) => ddb.send(new dynamodb[`${operation}Command`](input)) };
 
@@ -64,8 +73,17 @@ async function buildBroker(env) {
     github: createGithubClient({ token: githubToken }),
     // Missing secret -> verifySlackSignature returns false -> every request 401.
     signingSecret,
-    // Malformed or absent map -> empty map -> nobody authorized.
-    approverMap: parseApproverMapByRepositoryId(env.SLACK_APPROVER_IDS_BY_REPOSITORY_ID),
+    // One SSM parameter per repository_id, read at click time; every failure
+    // authorizes nobody (broker/authorize/approvers.mjs).
+    approverSource: createApproverSource({
+      environment: env.BREAK_GLASS_ENVIRONMENT,
+      getParameter: async (name) =>
+        (
+          await ssmClient.send(new ssm.GetParameterCommand({ Name: name, WithDecryption: false }), {
+            abortSignal: globalThis.AbortSignal.timeout(APPROVER_LOOKUP_TIMEOUT_MS)
+          })
+        ).Parameter
+    }),
     // GitHub's JWKS from its fixed URL, cached per warm container.
     verifyIdentity: (token) => verifyGithubOidcToken(token, { jwks }),
     slackChannelId: env.SLACK_CHANNEL_ID

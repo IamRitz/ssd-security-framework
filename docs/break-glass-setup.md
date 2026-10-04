@@ -303,33 +303,48 @@ request for the same run:
    - **pending requests filed before the hardening** have no stored identity.
      They match no status caller and authorize no approver, so they simply
      expire. That is fail-closed by design.
-3. **Re-key the approver map** at the same time (below). Until then, nobody is
-   authorized.
+3. **Create each repository's approver parameter** (below) before its first
+   request. Until then, nobody is authorized for it.
 
 ## Authorization is per repository and fail-closed
 
+One SSM parameter per repository, named by its immutable GitHub
+`repository_id` (`gh api repos/<owner>/<repo> --jq .id`):
+
 ```
-SLACK_APPROVER_IDS_BY_REPOSITORY_ID={"1001":["U123"],"1002":["U456","U789"]}
+/ssd/break-glass/<environment>/approvers/<repository_id>     Type: String
+["U0123456789","U0987654321"]
 ```
 
-Keys are GitHub `repository_id`s (`gh api repos/<owner>/<repo> --jq .id`).
+`<environment>` is `production` or `synthetic`. It comes from the interaction
+function's `BREAK_GLASS_ENVIRONMENT`, so the two stacks never read each other's
+lists. The value is a JSON array of Slack user IDs (`U…` or `W…`), at most 50,
+with no duplicates.
 
-- A repository **not present as a key authorizes nobody.** There is no fallback
-  to a shared default list. A repository is not onboarded to break-glass until
-  it has an explicit entry.
-- **Malformed JSON is treated as an empty map**: nobody is authorized for
-  anything. It is logged, never thrown, so one bad edit cannot take down
-  approvals for every repository at once.
-- A key that is not a repository id is ignored, including an `"owner/repo"` key
-  from the pre-hardening `SLACK_APPROVER_IDS_BY_REPO` format. That variable is
-  no longer read.
-- The repository is the **stored request's verified identity**, looked up by
-  request id when the click arrives. It is never read from the Slack interaction
-  payload or from the display context. The clicking user is checked against
-  that repository's set only.
+| Parameter | Result |
+| --- | --- |
+| a valid, non-empty list | only those users may decide |
+| missing | **nobody** (`absent`) |
+| `[]` | **nobody** (`empty`) |
+| not a JSON array, a bad or duplicate entry, too many, not type `String` | **nobody** (`malformed`). The list is never partially used. |
+| SSM denied, throttled, failed or took over 2 s | **nobody** (`unverified`, never reported as `absent`) |
+| invalid `BREAK_GLASS_ENVIRONMENT`, or a request with no verified identity | **nobody** (`misconfigured`), and SSM is not called |
 
-Changing the map is an environment change and needs the handler restarted.
-(Phase 3B moves it to one SSM parameter per repository.)
+- The `repository_id` is the **stored request's verified identity**, taken from
+  the GitHub OIDC token at notify time. It never comes from the Slack payload
+  or the request's display context. Only that one parameter is read, so
+  another repository's list is never consulted.
+- The list is read **at click time**, with no cache. Removing an approver takes
+  effect on the next click, with no restart.
+- Every refusal is logged with the request id, `repository_id`, Slack user id
+  and the list state above.
+- No approver list is read from the environment. Neither the old name-keyed
+  `SLACK_APPROVER_IDS_BY_REPO` nor 3A's `SLACK_APPROVER_IDS_BY_REPOSITORY_ID`
+  exists any more.
+
+The interaction function needs `ssm:GetParameter` on
+`arn:aws:ssm:<region>:<account>:parameter/ssd/break-glass/<environment>/approvers/*`
+and nothing broader. Creating, owning and verifying the parameters is Phase 3C.
 
 ## A repository with no Slack
 

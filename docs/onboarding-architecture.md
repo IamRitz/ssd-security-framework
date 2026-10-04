@@ -1382,8 +1382,9 @@ Contract and rollout: [break-glass-setup.md § Who is asking](break-glass-setup.
 **Carried forward. These are not part of 3A, and the hardened broker is not
 deployed until they land:**
 
-1. **3B:** the approver map moves from the interaction function's environment
-   to one SSM parameter per repository (E.3).
+1. **3B (done in broker code):** the approver map moved from the interaction
+   function's environment to one SSM parameter per repository (E.3). 3C still
+   has to create the parameters and grant the `ssm:GetParameter` scope.
 2. **3C:** CloudFormation/IAM deployment of the production and synthetic
    stacks. The CI broker execution role's `dynamodb:PutItem` on the table
    (used by the replay record) and TTL on `ttl` are, today, verified only
@@ -1416,6 +1417,14 @@ is a shared-resource mutation per repo) into per-repository SSM parameters,
 user IDs), read with `ssm:GetParameter` on that path prefix only. Onboarding a
 repository = one per-repo stack: its invoker role + its parameter. The interaction
 function's missing/malformed parameter semantics stay fail-closed (nobody authorized).
+
+**Status: implemented in Phase 3B (broker code; parameters and IAM are 3C).**
+`broker/authorize/approvers.mjs` reads
+`/ssd/break-glass/<BREAK_GLASS_ENVIRONMENT>/approvers/<verified repository_id>`
+at click time, with no cache and a 2 s timeout. A missing, empty or malformed
+parameter authorizes nobody, and so does a failed lookup: a failure is
+`unverified`, kept distinct from `absent`. No environment-variable approver map
+remains. Contract: [break-glass-setup.md § Authorization](break-glass-setup.md#authorization-is-per-repository-and-fail-closed).
 
 ### E.4 Production vs synthetic
 

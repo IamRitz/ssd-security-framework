@@ -13,7 +13,6 @@ import { createHmac, sign } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { describe, it } from 'node:test';
 
-import { parseApproverMapByRepositoryId } from '../broker/authorize/slack-authorize.mjs';
 import {
   ALLOWED_JOB_WORKFLOW_PATHS,
   FRAMEWORK_REPOSITORY,
@@ -30,6 +29,7 @@ import { createBroker } from '../broker/lambda/broker.mjs';
 import { TOKEN_RECORD_GRACE_SECONDS, createDynamoStore } from '../broker/lambda/dynamodb-store.mjs';
 import { createCiHandler, createInteractionsHandler } from '../broker/lambda/handlers.mjs';
 import { notifyBreakGlass } from '../security/scripts/break-glass-notify.mjs';
+import { SLACK_A, SLACK_B, approversById } from './support/fake-approvers.mjs';
 import { createFakeDynamo } from './support/fake-dynamodb.mjs';
 import {
   FRAMEWORK_SHA,
@@ -384,7 +384,7 @@ describe('pull-request binding: the PR number comes from the verified ref', () =
 
 const SIGNING_SECRET = 'identity-test-signing-secret';
 const RESPONSE_URL = 'https://hooks.slack.com/actions/T0/1/abc';
-const APPROVERS = JSON.stringify({ [REPO_A.repositoryId]: ['U-A'], [REPO_B.repositoryId]: ['U-B'] });
+const APPROVERS = { [REPO_A.repositoryId]: [SLACK_A], [REPO_B.repositoryId]: [SLACK_B] };
 
 const payloadFor = (repo = REPO_A, { pullRequest = '51', sha = SHA_A, ...context } = {}) => ({
   schemaVersion: 1,
@@ -395,7 +395,7 @@ const payloadFor = (repo = REPO_A, { pullRequest = '51', sha = SHA_A, ...context
 });
 
 function brokerEnv(options = {}) {
-  const { approverEnv = APPROVERS } = options;
+  const { approvers = approversById(APPROVERS) } = options;
   let clock = NOW_MS;
   const now = () => new Date(clock);
   const dynamo = createFakeDynamo();
@@ -437,7 +437,7 @@ function brokerEnv(options = {}) {
     },
     github: { postComment: async (repo, pr, body) => github.push({ repo, pr, body }) },
     signingSecret: SIGNING_SECRET,
-    approverMap: parseApproverMapByRepositoryId(approverEnv),
+    approverSource: approvers.source,
     verifyIdentity: 'verifyIdentity' in options ? options.verifyIdentity : v.verify,
     slackChannelId: 'C',
     now,
@@ -649,7 +649,7 @@ describe('replay: a token is accepted once', () => {
     const env = brokerEnv();
     const once = env.tokenFor();
     const requestId = (await env.notify(payloadFor(REPO_A), once)).body.requestId;
-    await env.interactions(signedClick(requestId, 'U-A'));
+    await env.interactions(signedClick(requestId, SLACK_A));
     assert.match((await env.notify(payloadFor(REPO_A), once)).error, /token_replayed/);
   });
 
@@ -671,7 +671,7 @@ describe('replay: a token is accepted once', () => {
     const [record] = env.tokenRecords();
     assert.equal(await env.store.get(record.requestId.S), undefined, 'the store itself refuses to parse it');
     assert.equal(await env.broker.status(record.requestId.S, env.tokenFor()).then((r) => r.statusCode), 404);
-    const click = await env.interactions(signedClick(record.requestId.S, 'U-A'));
+    const click = await env.interactions(signedClick(record.requestId.S, SLACK_A));
     assert.notEqual(click.headers['x-break-glass-outcome'], 'claimed');
   });
 });
@@ -799,7 +799,7 @@ describe('approval and audit: keyed by the verified repository_id', () => {
   it('the right approver decides, and the audit comment goes to the token repository and PR', async () => {
     const env = brokerEnv();
     const requestId = await fileRequest(env, { pullRequest: '77' });
-    const response = await env.interactions(signedClick(requestId, 'U-A'));
+    const response = await env.interactions(signedClick(requestId, SLACK_A));
     assert.equal(response.headers['x-break-glass-outcome'], 'claimed');
     await env.interactions(env.enqueued.find((job) => job.kind === 'side-effects'));
     assert.deepEqual(env.github.map(({ repo, pr }) => ({ repo, pr })), [{ repo: REPO_A.repository, pr: '77' }]);
@@ -811,25 +811,10 @@ describe('approval and audit: keyed by the verified repository_id', () => {
   it('an approver authorized only for another repository is a no-op', async () => {
     const env = brokerEnv();
     const requestId = await fileRequest(env);
-    const response = await env.interactions(signedClick(requestId, 'U-B'));
+    const response = await env.interactions(signedClick(requestId, SLACK_B));
     assert.equal(response.headers['x-break-glass-outcome'], 'unauthorized');
     assert.equal(JSON.parse(env.requests()[0].doc.S).status, 'pending');
     assert.ok(env.logs.some((entry) => entry.event === 'unauthorized' && entry.repositoryId === REPO_A.repositoryId));
-  });
-
-  it('a name-keyed (pre-3A) approver map authorizes nobody', async () => {
-    const env = brokerEnv({ approverEnv: JSON.stringify({ [REPO_A.repository]: ['U-A'] }) });
-    const requestId = await fileRequest(env);
-    const response = await env.interactions(signedClick(requestId, 'U-A'));
-    assert.equal(response.headers['x-break-glass-outcome'], 'unauthorized');
-  });
-
-  it('a malformed approver map authorizes nobody', async () => {
-    for (const approverEnv of ['{not json', '[]', JSON.stringify({ [REPO_A.repositoryId]: 'U-A' })]) {
-      const env = brokerEnv({ approverEnv });
-      const requestId = await fileRequest(env);
-      assert.equal((await env.interactions(signedClick(requestId, 'U-A'))).headers['x-break-glass-outcome'], 'unauthorized');
-    }
   });
 
   it('a request stored before this hardening (no identity) is unusable: no status, no approval, no comment', async () => {
@@ -851,7 +836,7 @@ describe('approval and audit: keyed by the verified repository_id', () => {
       doc: { S: JSON.stringify(legacy) }
     });
     assert.equal((await env.status(requestId, env.tokenFor())).statusCode, 403);
-    assert.equal((await env.interactions(signedClick(requestId, 'U-A'))).headers['x-break-glass-outcome'], 'unauthorized');
+    assert.equal((await env.interactions(signedClick(requestId, SLACK_A))).headers['x-break-glass-outcome'], 'unauthorized');
     // Even if such a request were somehow decided, the audit comment refuses it.
     env.dynamo.table.set(requestId, {
       ...env.dynamo.table.get(requestId),
