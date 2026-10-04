@@ -31,6 +31,23 @@ export const SHARED_STACKS = Object.freeze({
 // Phase 3 break-glass test stack, architecture E.4).
 export const DELIVERY_ENVIRONMENT = 'production';
 
+// Phase 3C: the two shared break-glass stacks, one per environment. Each holds
+// its own functions, table, secrets and execution roles; nothing is shared
+// between them but the (immutable) code artifact. The environment is part of
+// the name AND the ssd:environment tag, and ownership requires both to agree.
+export const BREAK_GLASS_ENVIRONMENTS = Object.freeze(['production', 'synthetic']);
+export const BREAK_GLASS_STACKS = Object.freeze({
+  production: 'ssd-break-glass-production',
+  synthetic: 'ssd-break-glass-synthetic'
+});
+// The plan stack kind of each environment's stack (plan/scope.mjs).
+export const breakGlassStackKind = (environment) => `break-glass-${environment}`;
+// stack kind -> environment, or null for a kind that is not a break-glass stack.
+export function breakGlassEnvironmentOf(stackKind) {
+  const environment = typeof stackKind === 'string' && stackKind.startsWith('break-glass-') ? stackKind.slice('break-glass-'.length) : null;
+  return BREAK_GLASS_ENVIRONMENTS.includes(environment) ? environment : null;
+}
+
 const PREFIX = 'ssd-delivery-';
 const MAX_STACK_NAME = 128;
 export const STACK_NAME = /^[A-Za-z][A-Za-z0-9-]{0,127}$/;

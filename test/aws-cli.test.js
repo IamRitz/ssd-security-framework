@@ -178,18 +178,21 @@ describe('read-only allowlist', () => {
 
   it('the allowlist names no mutating operation, and there is no mutating wrapper', () => {
     const MUTATING = /^(put|create|update|delete|attach|detach|tag|untag|set|execute|send|start|stop|enable|disable|register|deregister|import|modify|run|terminate|reboot|batch-delete|upload|complete|initiate|add|remove|reset|associate|disassociate|cancel|restore|replace)-/;
-    for (const [service, operations] of Object.entries(READ_ONLY_OPERATIONS)) {
-      for (const operation of Object.keys(operations)) {
-        assert.doesNotMatch(operation, MUTATING, `${service} ${operation}`);
+    for (const table of [READ_ONLY_OPERATIONS, awsCli.BREAK_GLASS_READ_OPERATIONS]) {
+      for (const [service, operations] of Object.entries(table)) {
+        for (const operation of Object.keys(operations)) {
+          assert.doesNotMatch(operation, MUTATING, `${service} ${operation}`);
+        }
       }
     }
     // The only factories are the read-only one (doctor), the planning one
-    // (aws plan, test/aws-plan-wrapper.test.js) and the per-plan apply one
-    // (aws apply, test/aws-apply-wrapper.test.js); there is no generic
-    // mutating wrapper.
+    // (aws plan, test/aws-plan-wrapper.test.js), the per-plan apply one
+    // (aws apply, test/aws-apply-wrapper.test.js) and the two Phase 3C
+    // break-glass ones (read-only verify and planning,
+    // test/aws-break-glass-plan.test.js); there is no generic mutating wrapper.
     assert.deepEqual(Object.keys(awsCli).sort(), [
-      'AwsCliError', 'DEFAULT_DEADLINE_MS', 'DEFAULT_MAX_BUFFER', 'DEFAULT_TIMEOUT_MS', 'MAX_TEMPLATE_BODY', 'PLANNING_OPERATIONS', 'READ_ONLY_OPERATIONS',
-      'applyAws', 'applyOperations', 'assertApply', 'assertPlanning', 'assertReadOnly', 'classifyFailure', 'execAws', 'executeArgv', 'planningAws', 'readOnlyAws', 'redact'
+      'AwsCliError', 'BREAK_GLASS_PLANNING_OPERATIONS', 'BREAK_GLASS_READ_OPERATIONS', 'DEFAULT_DEADLINE_MS', 'DEFAULT_MAX_BUFFER', 'DEFAULT_TIMEOUT_MS', 'MAX_TEMPLATE_BODY', 'PLANNING_OPERATIONS', 'READ_ONLY_OPERATIONS',
+      'applyAws', 'applyOperations', 'assertApply', 'assertBreakGlassPlanning', 'assertBreakGlassRead', 'assertPlanning', 'assertReadOnly', 'breakGlassPlanningAws', 'breakGlassReadAws', 'classifyFailure', 'execAws', 'executeArgv', 'planningAws', 'readOnlyAws', 'redact'
     ]);
   });
 

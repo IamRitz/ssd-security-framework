@@ -113,9 +113,9 @@ export function awsPlanBlocks(report) {
     section(
       'Target',
       rows([
-        row('Repository', t.repository, { strong: true }),
+        t.environment ? row('Break-glass', t.environment, { strong: true }) : row('Repository', t.repository, { strong: true }),
         row('Account', t.account),
-        row('Region', `${t.region} (${t.regionSource === 'flag' ? '--region' : 'delivery.aws.region'})`),
+        row('Region', `${t.region} (${t.regionSource === 'flag' ? '--region' : t.environment ? 'aws.region' : 'delivery.aws.region'})`),
         row('Scope', report.scope),
         row('Caller', t.caller ? t.caller.arn : '(not contacted)'),
         row('Framework', `${report.framework.repository}@${report.framework.ref}`)

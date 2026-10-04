@@ -16,7 +16,7 @@
 // resource with the right name — or even the right tags — but not in the
 // expected stack is `exists-not-owned`. Nothing is adopted, or inferred, by
 // name or ARN.
-import { DELIVERY_ENVIRONMENT, STACK_NAME, canonicalSlug } from '../stack-names.mjs';
+import { BREAK_GLASS_ENVIRONMENTS, DELIVERY_ENVIRONMENT, STACK_NAME, canonicalSlug } from '../stack-names.mjs';
 import { tagList } from './oidc-provider.mjs';
 import { absent, present, read, unverified } from './result.mjs';
 
@@ -56,7 +56,7 @@ const tagValue = (tags, key) => tags.find((t) => t.key === key)?.value;
 // region: where the lookup ran (delivery.aws.region). CloudFormation stacks are
 // regional while IAM roles and OIDC providers are global, so a conclusion names
 // the region it is about (L2).
-export function evaluateOwnership({ discovered, resourceTags = null, expectedType, slug, scope, expectedStackName, region = null }) {
+export function evaluateOwnership({ discovered, resourceTags = null, expectedType, slug, scope, expectedStackName, region = null, environment = null }) {
   if (typeof expectedStackName !== 'string' || !STACK_NAME.test(expectedStackName)) {
     throw new Error('evaluateOwnership: an expected stack name is required');
   }
@@ -97,9 +97,9 @@ export function evaluateOwnership({ discovered, resourceTags = null, expectedTyp
   if (!LIVE.has(st.status)) {
     reasons.push(`stack ${st.name} is ${st.status ?? 'in an unknown state'} (not a settled, successful state)`);
   }
-  reasons.push(...stackTagProblems(st.tags, { scope, slug }));
-  const environment = tagValue(st.tags, SSD_TAGS.environment);
-  const expectedConsumer = canonicalSlug(slug);
+  reasons.push(...stackTagProblems(st.tags, { scope, slug, environment }));
+  const stackEnvironment = tagValue(st.tags, SSD_TAGS.environment);
+  const expectedConsumer = scope === 'repo' ? canonicalSlug(slug) : null;
   const resourceConsumer = resourceTags ? tagValue(resourceTags, SSD_TAGS.consumer) : undefined;
   if (scope === 'repo' && resourceConsumer !== undefined && resourceConsumer.toLowerCase() !== expectedConsumer) {
     reasons.push(`the resource's own ${SSD_TAGS.consumer} tag is '${resourceConsumer}' (expected '${expectedConsumer}')`);
@@ -107,26 +107,39 @@ export function evaluateOwnership({ discovered, resourceTags = null, expectedTyp
   if (reasons.length > 0) {
     return { ownership: 'exists-not-owned', reasons, stack: { ...sr, status: st.status } };
   }
-  return { ownership: 'managed', reasons: [`physical resource ${sr.logicalId} of stack ${st.name}${where} (${st.status}), tagged for ${scope === 'repo' ? slug : 'the shared scope'} (${environment})`], stack: { ...sr, status: st.status } };
+  return { ownership: 'managed', reasons: [`physical resource ${sr.logicalId} of stack ${st.name}${where} (${st.status}), tagged for ${scope === 'repo' ? slug : scope === 'break-glass' ? 'the break-glass scope' : 'the shared scope'} (${stackEnvironment})`], stack: { ...sr, status: st.status } };
 }
 
 // The stack-tag half of ownership, shared by doctor (evaluateOwnership) and
 // plan (planStack). -> reasons[] (empty when the tags prove SSD ownership).
-export function stackTagProblems(tags, { scope, slug }) {
+//
+// The expected ssd:environment is `production` for every Phase 2 scope; a
+// break-glass stack must carry exactly its own environment (production or
+// synthetic) — a synthetic-tagged stack is never the production owner, and
+// the reverse. A break-glass scope without a valid environment proves nothing.
+export function stackTagProblems(tags, { scope, slug, environment = null }) {
   const reasons = [];
   for (const [key, value] of [SSD_TAGS.framework, SSD_TAGS.managedBy]) {
     if (tagValue(tags, key) !== value) {
       reasons.push(`stack tag ${key} is ${tagValue(tags, key) === undefined ? 'missing' : `'${tagValue(tags, key)}'`} (expected '${value}')`);
     }
   }
-  const environment = tagValue(tags, SSD_TAGS.environment);
-  if (environment !== DELIVERY_ENVIRONMENT) {
-    reasons.push(`stack tag ${SSD_TAGS.environment} is ${environment === undefined ? 'missing' : `'${environment}'`} (expected '${DELIVERY_ENVIRONMENT}')`);
+  const expected = scope === 'break-glass' ? (BREAK_GLASS_ENVIRONMENTS.includes(environment) ? environment : null) : DELIVERY_ENVIRONMENT;
+  const tagged = tagValue(tags, SSD_TAGS.environment);
+  if (expected === null) {
+    reasons.push(`no break-glass environment was given, so stack tag ${SSD_TAGS.environment} cannot prove ownership`);
+  } else if (tagged !== expected) {
+    reasons.push(`stack tag ${SSD_TAGS.environment} is ${tagged === undefined ? 'missing' : `'${tagged}'`} (expected '${expected}')`);
   }
-  const canonical = canonicalSlug(slug);
   const consumer = tagValue(tags, SSD_TAGS.consumer);
-  if (scope === 'repo' && consumer !== canonical) {
-    reasons.push(`stack tag ${SSD_TAGS.consumer} is ${consumer === undefined ? 'missing' : `'${consumer}'`} (expected '${canonical}')`);
+  if (scope === 'repo') {
+    const canonical = canonicalSlug(slug);
+    if (consumer !== canonical) {
+      reasons.push(`stack tag ${SSD_TAGS.consumer} is ${consumer === undefined ? 'missing' : `'${consumer}'`} (expected '${canonical}')`);
+    }
+  } else if (scope === 'break-glass' && consumer !== undefined) {
+    // A break-glass stack is shared: it is never one repository's.
+    reasons.push(`stack tag ${SSD_TAGS.consumer} is '${consumer}', but a break-glass stack is shared and names no consumer repository`);
   }
   return reasons;
 }
@@ -188,7 +201,7 @@ export async function discoverStackResources(aws, name) {
 //   anything else                             -> blocked (never UPDATE an
 //                                                unowned or unsettled stack)
 // Returns { type, baseStack, problems[] }; type is null when blocked.
-export function planStack({ stack, expectedStackName, scope, slug }) {
+export function planStack({ stack, expectedStackName, scope, slug, environment = null }) {
   if (typeof expectedStackName !== 'string' || !STACK_NAME.test(expectedStackName)) {
     throw new Error('planStack: an expected stack name is required');
   }
@@ -204,9 +217,9 @@ export function planStack({ stack, expectedStackName, scope, slug }) {
   if (st.name !== expectedStackName) {
     problems.push(`describe-stacks returned stack '${st.name}', not '${expectedStackName}'`);
   }
-  const tagReasons = stackTagProblems(st.tags, { scope, slug });
+  const tagReasons = stackTagProblems(st.tags, { scope, slug, environment });
   if (tagReasons.length > 0) {
-    problems.push(`stack ${expectedStackName} exists but is NOT an ssd-onboard stack for this ${scope === 'repo' ? 'repository' : 'scope'}: ${tagReasons.join('; ')}. It is never updated or adopted`);
+    problems.push(`stack ${expectedStackName} exists but is NOT an ssd-onboard stack for this ${scope === 'repo' ? 'repository' : scope === 'break-glass' ? `break-glass environment (${environment})` : 'scope'}: ${tagReasons.join('; ')}. It is never updated or adopted`);
   }
   if (st.status !== 'REVIEW_IN_PROGRESS' && !LIVE.has(st.status)) {
     problems.push(`stack ${expectedStackName} is ${st.status}: only an absent stack, an ssd-onboard REVIEW_IN_PROGRESS placeholder or a settled, successful stack can be planned`);

@@ -25,6 +25,7 @@
 //                      different stack or an unknown state is failure.
 import { LIVE, stackTagProblems } from '../discover/stacks.mjs';
 import { canonicalJson } from '../templates/common.mjs';
+import { breakGlassEnvironmentOf } from '../stack-names.mjs';
 
 const finding = (kind, message) => ({ kind, message });
 
@@ -78,7 +79,7 @@ export function checkStack({ record, stack, slug }) {
   if (st.name !== binding.stackName) {
     findings.push(finding('stack-replaced', `describe-stacks returned stack '${st.name}', not '${binding.stackName}'`));
   }
-  const tags = stackTagProblems(st.tags, { scope: plan.scope, slug });
+  const tags = stackTagProblems(st.tags, { scope: plan.scope, slug, environment: breakGlassEnvironmentOf(plan.stackKind) });
   if (tags.length > 0) {
     findings.push(finding('stack-not-owned', `stack ${binding.stackName} no longer carries the SSD ownership tags: ${tags.join('; ')}`));
   }

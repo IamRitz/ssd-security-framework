@@ -1221,6 +1221,12 @@ conformance reports the control N/A with that reason. Phase 3 reintroduces it
 with observed evidence
 ([architecture § B.8](onboarding-architecture.md#b8-break-glass-is-not-generated-choice-b)).
 
+The shared break-glass broker stacks (production and synthetic) are provisioned
+with `aws plan --scope break-glass`, `aws apply` and `aws verify --scope
+break-glass`. They are driven by a separate operator configuration, never by
+`.ssd/onboarding.yml`, and Phase 1 still generates nothing for break-glass. See
+[break-glass-provisioning.md](break-glass-provisioning.md).
+
 ## OIDC: generated callers hold no token
 
 Generated source callers use **`_source-scan.yml`**, the OIDC-free source

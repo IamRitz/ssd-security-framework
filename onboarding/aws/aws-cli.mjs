@@ -41,6 +41,20 @@
 //     anything).
 import { execFile } from 'node:child_process';
 
+// The stack names ssd-onboard plans (stack-names.mjs): per repository and the
+// two Phase 2 shared stacks; the two Phase 3C break-glass stacks are planned
+// only through the break-glass allowlists below.
+const STACK_NAMES = /^(?:ssd-delivery-[a-z0-9-]*[0-9a-f]{8}|ssd-shared-github-oidc|ssd-shared-ecr-scanning)$/;
+const BREAK_GLASS_STACK_NAMES = /^ssd-break-glass-(?:production|synthetic)$/;
+// Break-glass reads are confined to break-glass names: verify has no reason to
+// describe any other secret, and never reads a secret VALUE (there is no
+// get-secret-value anywhere in these allowlists).
+const BREAK_GLASS_SECRET_ID = /^(?:arn:(?:aws|aws-cn|aws-us-gov):secretsmanager:[a-z0-9-]+:\d{12}:secret:)?ssd\/break-glass\/(?:production|synthetic)\/[a-z-]+(?:-[A-Za-z0-9]{6})?$/;
+const BREAK_GLASS_FUNCTION = /^ssd-break-glass-(?:production|synthetic)-(?:ci|interactions)$/;
+const BREAK_GLASS_TABLE = /^ssd-break-glass-(?:production|synthetic)-requests$/;
+const BREAK_GLASS_LOG_PREFIX = /^\/aws\/lambda\/ssd-break-glass-(?:production|synthetic)-(?:ci|interactions)$/;
+const is = (re) => (value) => re.test(value);
+
 // service -> operation -> the flags it may be called with. A flag listed with
 // `true` takes a value; `false` is a bare switch. Anything absent is refused.
 export const READ_ONLY_OPERATIONS = Object.freeze({
@@ -87,7 +101,6 @@ export const READ_ONLY_OPERATIONS = Object.freeze({
 // A planning flag is `true` (any value, as for reads) or a predicate the value
 // must satisfy. Values are still refused when they look like an option or an
 // AWS CLI file/URL reference.
-const STACK_NAMES = /^(?:ssd-delivery-[a-z0-9-]*[0-9a-f]{8}|ssd-shared-github-oidc|ssd-shared-ecr-scanning)$/;
 const CHANGE_SET_NAME = /^ssd-plan-[0-9a-f]{64}$/;
 // CloudFormation's limit for an inline template body.
 export const MAX_TEMPLATE_BODY = 51_200;
@@ -150,6 +163,82 @@ export const PLANNING_OPERATIONS = Object.freeze(
   )
 );
 
+// --- the break-glass allowlists (Phase 3C) -----------------------------------------
+
+// Break-glass discovery: configuration and metadata reads of the break-glass
+// resources only, each confined by name. NOT added to READ_ONLY_OPERATIONS:
+// doctor, the delivery plan and the delivery verify keep exactly their
+// Phase 2 tables. Only `aws plan --scope break-glass` (breakGlassPlanningAws)
+// and `aws verify --scope break-glass` (breakGlassReadAws) receive them.
+const BREAK_GLASS_READS = {
+  cloudformation: {
+    'describe-stack-resources': { '--stack-name': is(BREAK_GLASS_STACK_NAMES) }
+  },
+  dynamodb: {
+    'describe-table': { '--table-name': is(BREAK_GLASS_TABLE) },
+    'describe-time-to-live': { '--table-name': is(BREAK_GLASS_TABLE) },
+    'describe-continuous-backups': { '--table-name': is(BREAK_GLASS_TABLE) }
+  },
+  lambda: {
+    // NOT get-function: its answer carries a presigned URL to the code.
+    'get-function-configuration': { '--function-name': is(BREAK_GLASS_FUNCTION) },
+    'get-function-url-config': { '--function-name': is(BREAK_GLASS_FUNCTION) },
+    'get-policy': { '--function-name': is(BREAK_GLASS_FUNCTION) },
+    'get-function-concurrency': { '--function-name': is(BREAK_GLASS_FUNCTION) },
+    'get-function-event-invoke-config': { '--function-name': is(BREAK_GLASS_FUNCTION) }
+  },
+  secretsmanager: {
+    // Metadata (name, ARN, tags, whether a version exists) — never the value.
+    'describe-secret': { '--secret-id': is(BREAK_GLASS_SECRET_ID) }
+  },
+  logs: {
+    'describe-log-groups': { '--log-group-name-prefix': is(BREAK_GLASS_LOG_PREFIX) }
+  },
+  s3api: {
+    // The published Lambda artifact: object version metadata (never the
+    // object), and the bucket's versioning and public-access posture.
+    'head-object': { '--bucket': true, '--key': true, '--version-id': true, '--checksum-mode': is(/^ENABLED$/) },
+    'get-bucket-versioning': { '--bucket': true },
+    'get-public-access-block': { '--bucket': true },
+    'get-bucket-policy-status': { '--bucket': true }
+  }
+};
+
+// Union of two tables (flags of an operation listed in both are merged).
+function union(a, b) {
+  const out = {};
+  for (const service of new Set([...Object.keys(a), ...Object.keys(b)])) {
+    const ops = {};
+    for (const op of new Set([...Object.keys(a[service] ?? {}), ...Object.keys(b[service] ?? {})])) {
+      ops[op] = Object.freeze({ ...(a[service]?.[op] ?? {}), ...(b[service]?.[op] ?? {}) });
+    }
+    out[service] = Object.freeze(ops);
+  }
+  return Object.freeze(out);
+}
+
+// `aws verify --scope break-glass`: the read-only table plus break-glass reads.
+export const BREAK_GLASS_READ_OPERATIONS = union(READ_ONLY_OPERATIONS, BREAK_GLASS_READS);
+
+// `aws plan --scope break-glass`: reads, plus the planning CloudFormation calls
+// confined to the two break-glass stacks (never a delivery or Phase 2 shared
+// stack). Like planningAws, nothing here executes a change set.
+export const BREAK_GLASS_PLANNING_OPERATIONS = union(READ_ONLY_OPERATIONS, union(BREAK_GLASS_READS, {
+  cloudformation: {
+    'describe-stacks': { '--stack-name': true },
+    'validate-template': { '--template-body': templateBody },
+    'create-change-set': {
+      '--stack-name': matches(BREAK_GLASS_STACK_NAMES),
+      '--change-set-name': matches(CHANGE_SET_NAME),
+      '--change-set-type': matches(/^(?:CREATE|UPDATE)$/),
+      '--template-body': templateBody,
+      '--tags': ssdTags,
+      '--capabilities': matches(/^CAPABILITY_NAMED_IAM$/)
+    },
+    'describe-change-set': { '--stack-name': matches(BREAK_GLASS_STACK_NAMES), '--change-set-name': matches(CHANGE_SET_NAME) }
+  }
+}));
+
 // --- the apply allowlist (Phase 2C) ------------------------------------------------
 
 // Every value is the recorded plan's own: compared for equality, never matched
@@ -162,7 +251,7 @@ const CHANGE_SET_ARN = /^arn:(?:aws|aws-cn|aws-us-gov):cloudformation:[a-z0-9-]+
 function assertBinding(binding) {
   const { stackName, stackId, changeSetArn } = binding ?? {};
   const strings = [stackName, stackId, changeSetArn].every((v) => typeof v === 'string');
-  if (!strings || !STACK_NAMES.test(stackName) || STACK_ID.exec(stackId)?.[1] !== stackName || !CHANGE_SET_ARN.test(changeSetArn)) {
+  if (!strings || !(STACK_NAMES.test(stackName) || BREAK_GLASS_STACK_NAMES.test(stackName)) || STACK_ID.exec(stackId)?.[1] !== stackName || !CHANGE_SET_ARN.test(changeSetArn)) {
     throw new AwsCliError('refused', "refusing to create an apply wrapper without the recorded plan's exact stack name, stack id (of that stack) and ssd-plan change-set ARN");
   }
 }
@@ -422,6 +511,17 @@ export function assertPlanning(argv) {
   assertAllowed(argv, PLANNING_OPERATIONS, PLANNING_WORDS);
 }
 
+const BREAK_GLASS_READ_WORDS = { list: 'the break-glass read-only allowlist (aws verify --scope break-glass makes no AWS changes and reads no secret value)', kind: 'read' };
+const BREAK_GLASS_PLANNING_WORDS = { list: 'the break-glass planning allowlist (aws plan --scope break-glass never executes a change set and uploads nothing)', kind: 'planning' };
+
+export function assertBreakGlassRead(argv) {
+  assertAllowed(argv, BREAK_GLASS_READ_OPERATIONS, BREAK_GLASS_READ_WORDS);
+}
+
+export function assertBreakGlassPlanning(argv) {
+  assertAllowed(argv, BREAK_GLASS_PLANNING_OPERATIONS, BREAK_GLASS_PLANNING_WORDS);
+}
+
 // --- execution ----------------------------------------------------------------------
 
 // The real executor: execFile, argv array, no shell. Resolves with
@@ -470,6 +570,15 @@ export function readOnlyAws(options = {}) {
 // only by `aws plan`; doctor never receives it.
 export function planningAws(options = {}) {
   return wrapper(assertPlanning, options);
+}
+
+// Phase 3C: the break-glass wrappers, same contract over their own tables.
+export function breakGlassReadAws(options = {}) {
+  return wrapper(assertBreakGlassRead, options);
+}
+
+export function breakGlassPlanningAws(options = {}) {
+  return wrapper(assertBreakGlassPlanning, options);
 }
 
 // applyAws({ region, binding, ...readOnlyAws options }) — the same contract

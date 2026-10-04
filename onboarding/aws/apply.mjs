@@ -56,6 +56,8 @@ import { SUCCESS, checkStack, compareChangeSet, compareTemplate, stackProgress }
 import { REPO_LOGICAL_IDS } from './templates/repo-ecr-delivery.mjs';
 import { canonicalJson } from './templates/common.mjs';
 import { roleName } from './discover/iam-role.mjs';
+import { breakGlassNames } from './break-glass/names.mjs';
+import { breakGlassEnvironmentOf } from './stack-names.mjs';
 
 export const SCHEMA_VERSION = 1;
 export const APPLY_RECORD_SCHEMA_VERSION = 1;
@@ -82,13 +84,14 @@ export class ApplyError extends Error {
 const FAIL = 'FAIL';
 const PASS = 'PASS';
 
-function newReport({ planId, account, region, config, framework }) {
+function newReport({ planId, account, region, config, operator, framework }) {
+  const bound = operator ?? config;
   return {
     schemaVersion: SCHEMA_VERSION,
     command: 'aws apply',
     planId,
-    target: { repository: config.repository.slug, account, region, stackName: null, stackKind: null, scope: null, operation: null, caller: null, plannedBy: null },
-    framework: { repository: config.framework.repository, ref: config.framework.ref, checkout: framework?.sha ?? null },
+    target: { repository: config?.repository.slug ?? null, account, region, stackName: null, stackKind: null, scope: null, operation: null, caller: null, plannedBy: null },
+    framework: { repository: bound?.framework.repository ?? null, ref: bound?.framework.ref ?? null, checkout: framework?.sha ?? null },
     outcome: null,
     verification: [],
     findings: [],
@@ -228,6 +231,9 @@ async function stackResources(aws, record) {
 // edits it: the generated stacks have no outputs and create resources under
 // the names the configuration already holds, so normally nothing changes.
 function nextSteps(config, record, resources) {
+  if (record.plan.scope === 'break-glass') {
+    return breakGlassNextSteps(record);
+  }
   const steps = [];
   if (record.plan.stackKind === 'repo' && resources) {
     const d = config.delivery;
@@ -248,6 +254,18 @@ function nextSteps(config, record, resources) {
   }
   steps.push('Run `ssd-onboard aws doctor` to confirm delivery readiness.');
   return steps;
+}
+
+// After a break-glass stack is applied: the out-of-band steps the plan
+// deliberately does not perform (no secret value ever passes through ssd-onboard).
+function breakGlassNextSteps(record) {
+  const environment = breakGlassEnvironmentOf(record.plan.stackKind);
+  const n = breakGlassNames(environment);
+  return [
+    `Put each secret value out of band, from a file descriptor, never argv — e.g. \`aws secretsmanager put-secret-value --secret-id ${n.secrets.slackBotToken} --secret-string file:///dev/stdin\`, and the same for ${n.secrets.slackSigningSecret} and ${n.secrets.githubToken}. Until then the broker cannot start (fail closed).`,
+    `Set the Slack Request URL of the ${environment} Slack app to the Function URL of ${n.functions.interactions} (aws lambda get-function-url-config). Only after the secrets are in place: Slack verifies the URL when it is saved.`,
+    `Run \`ssd-onboard aws verify --scope break-glass --environment ${environment} --operator-config <file>\` to prove the deployed boundary (TTL, PutItem, separation, CodeSha256).`
+  ];
 }
 
 function applyRecord(report, record, { appliedAt, waited }) {
@@ -291,7 +309,8 @@ function applyRecord(report, record, { appliedAt, waited }) {
 //   onExecute     observer called just before execute-change-set
 //   exec/env/now/deadlineMs  applyAws()        sleep/waitMs  the wait (step 8)
 export async function awsApply({
-  config,
+  config = null,
+  operator = null,
   planId,
   account,
   region,
@@ -309,8 +328,8 @@ export async function awsApply({
   now = Date.now,
   sleep = defaultSleep
 }) {
-  const report = newReport({ planId, account, region, config, framework });
-  const slug = config.repository.slug;
+  const report = newReport({ planId, account, region, config, operator, framework });
+  const slug = config?.repository.slug ?? null;
 
   // 1. The plan directory.
   const read = await readPlan(root, planId);
@@ -332,7 +351,7 @@ export async function awsApply({
   report.changes = { counts: record.counts, destructive: record.destructive, items: record.changes };
 
   // 3. Intent, configuration and framework binding.
-  if (!step(report, 'intent', 'Account, region, repository, stack, configuration and framework match', checkIntent({ plan, config, framework, account, region }))) {
+  if (!step(report, 'intent', 'Account, region, repository, stack, configuration and framework match', checkIntent({ plan, config, operator, framework, account, region }))) {
     return refuse(report);
   }
 

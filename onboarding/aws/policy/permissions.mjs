@@ -111,7 +111,12 @@ export function policyStatements(policies) {
 // `complete` false when any could not be read (then nothing is PASS).
 // Returns { status, required[], findings[] }.
 export function analyzePermissions(role, target, { policies, complete, enhanced = false, simulation = null }) {
-  const req = roleRequirements(role, target, { enhanced });
+  return analyzeRequirements(roleRequirements(role, target, { enhanced }), { policies, complete, simulation });
+}
+
+// The analysis itself, over any { required, forbidden } contract (the delivery
+// roles above; the break-glass execution roles in policy/break-glass.mjs).
+export function analyzeRequirements(req, { policies, complete, simulation = null }) {
   const { statements: stmts, problems } = policyStatements(policies);
   const findings = [...problems];
   const required = req.required.map((r) => {
