@@ -21,6 +21,31 @@ export const LAMBDA_ARCHITECTURE = 'arm64';
 export const LAMBDA_MEMORY_MB = 256;
 export const LAMBDA_TIMEOUT_SECONDS = 20;
 export const LOG_RETENTION_DAYS = 90;
+// Reserved concurrency of the INTERACTION function (both environments). Its
+// Function URL is public and Slack's HMAC is checked inside the invocation, so
+// unauthenticated traffic consumes concurrency before it is rejected; the
+// reservation caps what that traffic can take from the account (the CI broker
+// and every other function keep their concurrency) — over the cap, requests
+// are throttled before the function runs.
+// Sizing — the pool is shared by two kinds of execution:
+//   synchronous  Slack's POST: verify, authorize, claim, finalize, ack (< 3 s);
+//                at most 2 in flight legitimately (two approvers racing)
+//   asynchronous the follow-up enqueued as an Event self-invocation (Slack
+//                update + audit comment); the POST does NOT wait for it, so a
+//                cap can never deadlock the two. At most 2 (one per POST)
+//   = 4, + 1 for a cold start (Secrets Manager reads) or the inline fallback
+//   that runs when enqueue fails. Synthetic gets the same 5: the Phase 3E
+//   concurrent-claim race test exercises exactly that peak.
+// Under a flood: legitimate clicks are throttled too — break-glass is then
+// unavailable and the BLOCK stands (fail closed). Throttled follow-ups go back
+// to Lambda's async queue and are retried until MaximumEventAgeInSeconds (900 s);
+// a flood longer than that drops them (the decision itself is already final in
+// DynamoDB). The CI broker gets no reservation: it has no public surface (IAM
+// lambda:InvokeFunction only), so unauthenticated traffic cannot reach it.
+export const INTERACTIONS_RESERVED_CONCURRENCY = 5;
+// Lambda keeps at least this much account concurrency unreserved: a
+// reservation that would leave less is refused by Lambda, so plan blocks first.
+export const MIN_UNRESERVED_CONCURRENCY = 100;
 // The zip's root holds broker/ (as `git archive … broker/` lays it out); both
 // functions ship the same bundle and differ by handler (broker/lambda/index.mjs).
 export const HANDLERS = Object.freeze({ ci: 'broker/lambda/index.ciHandler', interactions: 'broker/lambda/index.interactionsHandler' });

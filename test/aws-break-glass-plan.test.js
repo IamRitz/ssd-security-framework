@@ -18,7 +18,7 @@ import { FRAMEWORK, capture, config, tempDir } from './support/onboarding-fixtur
 import { awsError, fakeAws, ok } from './support/aws-fake.mjs';
 import { applyWorld, mutations } from './support/aws-apply-fake.mjs';
 import { changeSets, stackIdOf, withStack } from './support/aws-plan-fake.mjs';
-import { ACCOUNT, ARTIFACT, CHANNELS, OPERATOR_YAML, REGION, artifactReads, deployedBreakGlass, existingResource, greenfieldBreakGlass, operator, tagsFor } from './support/break-glass-fake.mjs';
+import { ACCOUNT, ARTIFACT, CHANNELS, OPERATOR_YAML, REGION, accountConcurrency, artifactReads, deployedBreakGlass, existingResource, greenfieldBreakGlass, operator, tagsFor } from './support/break-glass-fake.mjs';
 
 const quiet = async () => {};
 const planFake = (world) => fakeAws(world, { allowlist: assertBreakGlassPlanning });
@@ -102,11 +102,11 @@ describe('aws plan --scope break-glass: a greenfield plan', () => {
     assert.ok(unit.residual.some((r) => r.includes('file:///dev/stdin')));
   });
 
-  it('S3 holding no checksum is NOT VERIFIED (proven later by CodeSha256), not a block', async (t) => {
-    const world = artifactReads(greenfieldBreakGlass(), { checksum: null });
-    const { report, unit } = await run(t, world);
+  it('the template reserves the interaction function\'s concurrency, and the account has room for it', async (t) => {
+    const { report, created } = await run(t, greenfieldBreakGlass());
     assert.equal(report.outcome, 'PLANNED');
-    assert.ok(unit.findings.some((f) => f.kind === 'artifact-checksum-absent' && f.severity === 'NOT VERIFIED'));
+    assert.equal(created[0].template.Resources.InteractionsFunction.Properties.ReservedConcurrentExecutions, 5);
+    assert.equal(created[0].template.Resources.CiFunction.Properties.ReservedConcurrentExecutions, undefined);
   });
 });
 
@@ -148,6 +148,25 @@ describe('aws plan --scope break-glass: what blocks', () => {
     });
   }
 
+  // The configured sha256 is trusted only once S3's full-object SHA-256 of the
+  // exact object version equals it: anything less blocks the change set.
+  for (const [what, options] of [
+    ['S3 stores no SHA-256 for the version', { checksum: null }],
+    ['S3\'s SHA-256 is COMPOSITE (multipart)', { checksum: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=-2', checksumType: 'COMPOSITE' }],
+    ['S3 reports a COMPOSITE type even for a digest-shaped value', { checksumType: 'COMPOSITE' }],
+    ['S3 reports no checksum type', { checksumType: null }]
+  ]) {
+    it(`the artifact: ${what}`, async (t) => {
+      const kind = options.checksum === null ? 'artifact-checksum-absent' : 'artifact-checksum-not-full-object';
+      await blocked(t, artifactReads(greenfieldBreakGlass(), options), kind);
+    });
+  }
+
+  it('the account cannot fit the interaction function\'s reserved concurrency (Lambda keeps 100 unreserved)', async (t) => {
+    await blocked(t, accountConcurrency(greenfieldBreakGlass(), { limit: 10, unreserved: 10 }), 'concurrency-quota');
+    await blocked(t, accountConcurrency(greenfieldBreakGlass(), { limit: 1000, unreserved: 104 }), 'concurrency-quota');
+  });
+
   it('the artifact: a public access block with one setting off', async (t) => {
     const world = greenfieldBreakGlass();
     world[`s3api get-public-access-block --bucket ${ARTIFACT.bucket}`] = ok({ PublicAccessBlockConfiguration: { BlockPublicAcls: true, IgnorePublicAcls: true, BlockPublicPolicy: false, RestrictPublicBuckets: true } });
@@ -158,6 +177,21 @@ describe('aws plan --scope break-glass: what blocks', () => {
     const world = greenfieldBreakGlass();
     world[`s3api head-object --bucket ${ARTIFACT.bucket} --key ${ARTIFACT.key} --version-id ${ARTIFACT.versionId} --checksum-mode ENABLED`] = awsError('403', 'HeadObject', 'Forbidden');
     await blocked(t, world, 'artifact-unreadable');
+  });
+});
+
+describe('aws plan --scope break-glass: concurrency quota', () => {
+  it('exactly 100 left unreserved fits; a reservation already held is not counted twice', async (t) => {
+    const { report } = await run(t, accountConcurrency(greenfieldBreakGlass(), { unreserved: 105 }));
+    assert.equal(report.outcome, 'PLANNED');
+  });
+
+  it('an unreadable account setting is NOT VERIFIED (apply would roll back), not a silent pass', async (t) => {
+    const world = greenfieldBreakGlass();
+    world['lambda get-account-settings'] = awsError('AccessDeniedException', 'GetAccountSettings', 'denied');
+    const { report, unit } = await run(t, world);
+    assert.equal(report.outcome, 'PLANNED');
+    assert.ok(unit.findings.some((f) => f.kind === 'concurrency-quota-unverified' && f.severity === 'NOT VERIFIED'));
   });
 });
 

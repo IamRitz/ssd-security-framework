@@ -41,8 +41,49 @@ loader also each refuse a pair that would coincide.
 Pinned runtime inputs: `nodejs24.x`, `arm64`, 256 MB, 20 s, handlers
 `broker/lambda/index.ciHandler` and `broker/lambda/index.interactionsHandler`.
 There is no VPC, because the functions reach Slack, the GitHub API and GitHub's
-JWKS over the internet. No reserved concurrency is set; `aws verify` warns about
-that but does not fail.
+JWKS over the internet.
+
+### Reserved concurrency: 5 on the interaction function, both environments
+
+The interaction function's Function URL is public, and the Slack signature is
+checked **inside** the invocation. Unauthenticated traffic therefore consumes
+Lambda concurrency before it is rejected. The stack gives the interaction
+function `ReservedConcurrentExecutions: 5`, which caps what that traffic can
+take. Requests over the cap are throttled before the function runs, so the CI
+broker and every other function in the account keep their concurrency.
+
+**Sizing.** One pool serves two kinds of execution:
+
+| | What runs | Legitimate peak |
+| --- | --- | --- |
+| synchronous | Slack's POST: verify, authorize, claim, finalize, ack (< 3 s) | 2 (two approvers clicking the same request) |
+| asynchronous | the follow-up `enqueueSelf` sends as an `Event` self-invocation: Slack message update and audit comment | 2 (one per POST) |
+
+That is a peak of 4, plus 1 for a cold start (Secrets Manager reads) or the
+inline fallback that runs when enqueue fails, which makes 5. The POST does not
+wait for its follow-up, so a cap can never deadlock the two. Synthetic gets the
+same 5, because the Phase 3E concurrent-claim race test exercises exactly that
+peak.
+
+**Under a flood:**
+- **Clicks.** Legitimate clicks are throttled too. Break-glass is then
+  unavailable and the BLOCK stands, which is fail closed.
+- **Follow-ups.** Throttled follow-ups go back on Lambda's async queue and are
+  retried until the configured `MaximumEventAgeInSeconds` (900 s).
+- **Longer floods.** A flood that lasts longer than that drops them. The
+  decision is already final in DynamoDB, but its Slack update and audit comment
+  are lost.
+
+**Account precondition.** Lambda keeps at least 100 units of account
+concurrency unreserved. `aws plan` reads `lambda get-account-settings` and
+blocks (`concurrency-quota`) when the reservation would leave less, so the
+public function is never deployed without its cap. A new account with a
+concurrency limit of 10 needs a quota increase first.
+
+**CI broker.** It has no reservation: it has no public surface (IAM
+`lambda:InvokeFunction` only), so `bg.ci-concurrency` is an advisory WARN.
+`bg.interactions-concurrency` is **required**: absent, or anything other than
+5, FAILs.
 
 Every resource carries `DeletionPolicy: Retain`, as all ssd-onboard resources do.
 A replacement or removal is still classified and counted by the plan, and
@@ -120,9 +161,22 @@ The zip's root holds `broker/`, as `git archive --format=zip <commit> broker/`
 lays it out. The broker has no dependencies to bundle: the Lambda Node.js
 runtime provides the AWS SDK v3.
 
-`aws plan` blocks unless the version exists in a private, versioned bucket. When
-S3 stores a full-object SHA-256 checksum for the version, the plan also compares
-it with `sha256`.
+**The configured `sha256` is never trusted on its own.** A break-glass change
+set is created only if all of these hold:
+
+- the object version exists;
+- the bucket is private and versioned;
+- S3 exposes a **full-object** SHA-256 for that version (`ChecksumType
+  FULL_OBJECT`);
+- that SHA-256 equals `sha256`.
+
+No checksum, a `COMPOSITE` (multipart) checksum, or no checksum type each block
+the plan. SHA-256 is full-object only for a single-part upload, so publish the
+bundle with one `PutObject` and `--checksum-algorithm SHA256`. S3's
+`ChecksumSHA256` and Lambda's `CodeSha256` are both base64 of the raw digest.
+
+After deployment, `aws verify` compares the live `CodeSha256` with the same
+digest. That is a second, independent check of what Lambda actually loaded.
 
 **`CodeSha256`.** Lambda reports `CodeSha256` as the standard, padded **base64
 of the raw SHA-256 digest of the .zip bytes**, not hex. The Terraform AWS
@@ -134,8 +188,8 @@ in the AWS CLI examples is 44 characters, which is base64 of 32 bytes.
 
 **Publishing** a deterministic bundle is a separate prerequisite. It is not part
 of 3C and has no ssd-onboard command yet. A follow-up will standardise it: fixed
-entry order and timestamps, built from a reviewed framework commit, uploaded with
-`--checksum-algorithm SHA256`.
+entry order and timestamps, built from a reviewed framework commit, uploaded in
+one `PutObject` with `--checksum-algorithm SHA256`.
 
 ## The operator configuration
 
@@ -214,9 +268,10 @@ The run is read-only. Each fact is its own check:
 | `bg.ci-exposure` | the CI broker has **no** Function URL and **no** resource policy |
 | `bg.interactions-exposure` | one Function URL (`NONE`) and exactly the two URL-scoped public statements. A public `InvokeFunction` without the via-URL condition would deliver a non-URL event, which the handler trusts as its own follow-up. |
 | `bg.interactions-async` | 0 retries |
-| `bg.<fn>-concurrency` | advisory WARN when no cap is set |
+| `bg.interactions-concurrency` | **required**: reserved concurrency exactly 5 (FAIL when absent or different) |
+| `bg.ci-concurrency` | advisory WARN when no cap is set (IAM-only function) |
 | `bg.secrets` | each secret is this environment's (name, ARN, tag), not deleted; WARN when empty |
-| `bg.artifact` | the object version is in a private, versioned bucket |
+| `bg.artifact` | the object version is in a private, versioned bucket, and S3's full-object SHA-256 equals `sha256` |
 | `bg.<role>-role`, `bg.<role>-policy-document` | Lambda-only trust; exactly its one inline policy; no wildcard beyond the three documented forms |
 | `bg.<role>-required-access` | simulated ALLOW, including **`dynamodb:PutItem` on its own table** for the CI role |
 | `bg.<role>-negative-access` | simulated DENY on the other environment's table, secrets, approvers and functions; no Put/Delete for the interaction role; no Scan/Query/DeleteTable/UpdateTimeToLive, PassRole, PutSecretValue or UpdateFunctionCode |
@@ -256,6 +311,16 @@ pre-production requirements, not follow-ups:
 
 ## Residual limitations
 
+- **Quota headroom is not always proven at plan time.** When `lambda
+  get-account-settings` cannot be read, `aws plan` reports
+  `concurrency-quota-unverified` (NOT VERIFIED) and still creates the change
+  set. This is a deliberate trade-off: planning stays available without that
+  read permission. The cost is that a reservation that does not fit fails at
+  apply and CloudFormation rolls back. Insufficient headroom that *is* read
+  always blocks.
+- A flood of unauthenticated requests longer than 900 s drops throttled
+  follow-ups, so a final decision may then lack its Slack update and audit
+  comment. There is no dead-letter queue or failure destination in 3C.
 - A retained `AWS::Lambda::Permission` that a future change replaces leaves its
   old statement behind; verify then fails `bg.interactions-exposure` until the
   extra statement is removed.

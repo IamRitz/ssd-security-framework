@@ -43,7 +43,7 @@ import { BREAK_GLASS_LOGICAL_IDS as L, BREAK_GLASS_RESOURCE_TYPES } from '../tem
 import { FAIL, NOT_VERIFIED, PASS, WARN, adopt, check, deniedAccessCheck, identityCheck, report, requiredAccessCheck, worst } from '../verify.mjs';
 import { artifactFindings } from './artifact.mjs';
 import { discoverArtifact, discoverBackups, discoverConcurrency, discoverEventInvokeConfig, discoverFunction, discoverFunctionPolicy, discoverFunctionUrl, discoverLogGroup, discoverSecret, discoverTable, discoverTimeToLive } from './discover.mjs';
-import { HANDLERS, LAMBDA_ARCHITECTURE, LAMBDA_MEMORY_MB, LAMBDA_RUNTIME, LAMBDA_TIMEOUT_SECONDS, LOG_RETENTION_DAYS, SECRET_KEYS, TABLE_KEY, TTL_ATTRIBUTE, breakGlassArns, breakGlassNames, codeSha256Of, otherEnvironment, separationIdentifiers, separationProblems } from './names.mjs';
+import { HANDLERS, INTERACTIONS_RESERVED_CONCURRENCY, LAMBDA_ARCHITECTURE, LAMBDA_MEMORY_MB, LAMBDA_RUNTIME, LAMBDA_TIMEOUT_SECONDS, LOG_RETENTION_DAYS, SECRET_KEYS, TABLE_KEY, TTL_ATTRIBUTE, breakGlassArns, breakGlassNames, codeSha256Of, otherEnvironment, separationIdentifiers, separationProblems } from './names.mjs';
 
 // The only AWS wrapper break-glass verification ever receives.
 export const breakGlassVerifyAws = breakGlassReadAws;
@@ -271,15 +271,30 @@ export function asyncCheck({ config }) {
   return done(c, findings, [`retries ${config.value.maximumRetryAttempts}, max age ${config.value.maximumEventAgeInSeconds}s`]);
 }
 
+// The PUBLIC interaction function must hold exactly its deliberate reservation
+// (break-glass/names.mjs explains the sizing): without it, unauthenticated
+// traffic — rejected only inside the invocation — can consume the account's
+// concurrency. Absent or different is a production-readiness FAIL. The CI
+// broker has no public surface; a cap there is advisory.
 export function concurrencyCheck({ role, concurrency }) {
+  const required = role === 'interactions';
   const c = check(`bg.${role}-concurrency`, FN_SECTION[role], 'Concurrency cap', {
-    required: false,
-    why: 'a reserved-concurrency cap bounds cost and blast radius; the stack sets none by default (an explicit operator value is a future option)',
-    expected: ['a reserved concurrency (advisory)']
+    required,
+    why: required
+      ? 'the Function URL is public and the Slack signature is checked inside the invocation: the reservation bounds what unauthenticated traffic can consume (synchronous clicks and async follow-ups share it)'
+      : 'the CI broker is reachable only through IAM; a cap would bound cost, and is advisory',
+    expected: [required ? `reserved concurrency exactly ${INTERACTIONS_RESERVED_CONCURRENCY}` : 'a reserved concurrency (advisory)']
   });
   if (concurrency.state !== 'present') return done(c, [{ ...unreadable('reserved concurrency', concurrency), severity: NOT_VERIFIED }]);
   const reserved = concurrency.value.reserved;
-  return done(c, reserved === null ? [warn('no-concurrency-cap', 'no reserved concurrency is configured: the function can scale to the account\'s unreserved limit')] : [], [reserved === null ? 'none' : `reserved ${reserved}`]);
+  const observed = [reserved === null ? 'none' : `reserved ${reserved}`];
+  if (!required) {
+    return done(c, reserved === null ? [warn('no-concurrency-cap', 'no reserved concurrency is configured: the function can scale to the account\'s unreserved limit')] : [], observed);
+  }
+  if (reserved === null) {
+    return done(c, [fail('no-concurrency-cap', 'the public interaction function has NO reserved concurrency: unauthenticated traffic can consume the account\'s unreserved concurrency before Slack verification rejects it')], observed, ['Restore ReservedConcurrentExecutions through the stack (`aws plan` then `aws apply`).']);
+  }
+  return done(c, reserved === INTERACTIONS_RESERVED_CONCURRENCY ? [] : [fail('managed-drift', `reserved concurrency is ${reserved}, but the stack declares ${INTERACTIONS_RESERVED_CONCURRENCY}`)], observed, ['Restore ReservedConcurrentExecutions through the stack (`aws plan` then `aws apply`).']);
 }
 
 export function secretsCheck({ environment, target, secrets }) {

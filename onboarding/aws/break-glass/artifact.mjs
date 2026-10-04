@@ -9,15 +9,21 @@
 //     the same key is a different version and changes nothing deployed);
 //   - its bucket has versioning Enabled (never Suspended), a public access
 //     block with all four settings on, and no public bucket policy;
-//   - when S3 holds a full-object SHA-256 checksum for the version, it equals
-//     the configured sha256. When it holds none (or a composite multipart
-//     checksum), that is NOT VERIFIED here — the authoritative comparison is
-//     verify's: the deployed function's CodeSha256 against the same digest.
+//   - S3 exposes a FULL-OBJECT SHA-256 for that version (ChecksumType
+//     FULL_OBJECT) and it equals the configured sha256. The configured digest
+//     is never trusted on its own: no checksum, a COMPOSITE (multipart)
+//     checksum or no checksum type all FAIL, so a break-glass change set is
+//     created only for bytes S3 itself vouches for. S3's ChecksumSHA256 and
+//     Lambda's CodeSha256 are both base64 of the raw digest, so one conversion
+//     (codeSha256Of) serves both. SHA-256 is full-object only for a
+//     single-part upload (multipart SHA-256 is always COMPOSITE): publish the
+//     bundle with one PutObject and --checksum-algorithm SHA256.
+//   After deployment, verify compares the live CodeSha256 to the same digest:
+//   a second, independent check of what Lambda actually loaded.
 import { describeError } from '../discover/result.mjs';
 import { codeSha256Of } from './names.mjs';
 
 const FAIL = 'FAIL';
-const NOT_VERIFIED = 'NOT VERIFIED';
 const f = (severity, kind, message) => ({ severity, kind, message });
 const PUBLIC_ACCESS_SETTINGS = ['BlockPublicAcls', 'IgnorePublicAcls', 'BlockPublicPolicy', 'RestrictPublicBuckets'];
 
@@ -38,9 +44,9 @@ export function artifactFindings(discovered, artifact) {
     const expected = codeSha256Of(artifact.sha256);
     const checksum = head.value.checksumSha256;
     if (typeof checksum !== 'string') {
-      findings.push(f(NOT_VERIFIED, 'artifact-checksum-absent', `${where}: S3 stores no SHA-256 checksum for this version, so the configured sha256 is proven only by aws verify (live CodeSha256)`));
-    } else if (head.value.checksumType === 'COMPOSITE' || checksum.includes('-')) {
-      findings.push(f(NOT_VERIFIED, 'artifact-checksum-composite', `${where}: S3 holds a composite (multipart) checksum, which is not a digest of the object; the sha256 is proven only by aws verify`));
+      findings.push(f(FAIL, 'artifact-checksum-absent', `${where}: S3 stores no SHA-256 checksum for this version, so the configured sha256 cannot be compared with the object. Re-upload it in one PutObject with --checksum-algorithm SHA256`));
+    } else if (head.value.checksumType !== 'FULL_OBJECT' || checksum.includes('-')) {
+      findings.push(f(FAIL, 'artifact-checksum-not-full-object', `${where}: S3's SHA-256 is ${head.value.checksumType === 'COMPOSITE' || checksum.includes('-') ? 'a COMPOSITE (multipart) checksum' : `of checksum type ${head.value.checksumType ?? '(not reported)'}`}, not a full-object digest. Re-upload it in one PutObject with --checksum-algorithm SHA256`));
     } else if (checksum !== expected) {
       findings.push(f(FAIL, 'artifact-digest-mismatch', `${where}: S3's SHA-256 is ${checksum}, but the configured sha256 is ${artifact.sha256} (base64 ${expected})`));
     } else {

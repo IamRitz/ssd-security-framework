@@ -95,6 +95,15 @@ export async function discoverConcurrency(aws, name) {
   return present({ reserved: Number.isInteger(got.value.ReservedConcurrentExecutions) ? got.value.ReservedConcurrentExecutions : null });
 }
 
+// -> { limit, unreserved } account concurrency.
+export async function discoverAccountConcurrency(aws) {
+  const got = await read(aws, ['lambda', 'get-account-settings']);
+  if (got.state !== 'present') return got;
+  const limit = got.value.AccountLimit?.ConcurrentExecutions;
+  const unreserved = got.value.AccountLimit?.UnreservedConcurrentExecutions;
+  return Number.isInteger(limit) && Number.isInteger(unreserved) ? present({ limit, unreserved }) : malformed('lambda get-account-settings', 'no AccountLimit concurrency figures');
+}
+
 export async function discoverEventInvokeConfig(aws, name) {
   const got = await read(aws, ['lambda', 'get-function-event-invoke-config', '--function-name', name], { notFound: ['ResourceNotFoundException'] });
   if (got.state !== 'present') return got;

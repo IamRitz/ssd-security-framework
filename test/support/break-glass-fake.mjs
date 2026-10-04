@@ -77,11 +77,11 @@ export const tagsFor = (environment) => [
 ];
 
 // The published artifact, readable, in a private, versioned bucket.
-export function artifactReads(world, { artifact = ARTIFACT, checksum = codeSha256Of(artifact.sha256), versioning = 'Enabled', publicAccess = true, policyPublic = null } = {}) {
+export function artifactReads(world, { artifact = ARTIFACT, checksum = codeSha256Of(artifact.sha256), checksumType = 'FULL_OBJECT', versioning = 'Enabled', publicAccess = true, policyPublic = null } = {}) {
   world[`s3api head-object --bucket ${artifact.bucket} --key ${artifact.key} --version-id ${artifact.versionId} --checksum-mode ENABLED`] = ok({
     VersionId: artifact.versionId,
     ContentLength: 48211,
-    ...(checksum ? { ChecksumSHA256: checksum, ChecksumType: 'FULL_OBJECT' } : {})
+    ...(checksum ? { ChecksumSHA256: checksum, ...(checksumType ? { ChecksumType: checksumType } : {}) } : {})
   });
   world[`s3api get-bucket-versioning --bucket ${artifact.bucket}`] = ok(versioning ? { Status: versioning } : {});
   world[`s3api get-public-access-block --bucket ${artifact.bucket}`] = publicAccess
@@ -100,9 +100,20 @@ export function greenfieldBreakGlass(environment = 'production') {
   for (const s of Object.values(n.secrets)) world[`secretsmanager describe-secret --secret-id ${s}`] = notFound('DescribeSecret');
   for (const g of Object.values(n.logGroups)) world[`logs describe-log-groups --log-group-name-prefix ${g}`] = ok({ logGroups: [] });
   for (const r of Object.values(n.roles)) world[`iam get-role --role-name ${r}`] = awsError('NoSuchEntity', 'GetRole', `The role with name ${r} cannot be found.`);
-  for (const f of Object.values(n.functions)) world[`lambda get-function-configuration --function-name ${f}`] = notFound('GetFunctionConfiguration');
+  for (const f of Object.values(n.functions)) {
+    world[`lambda get-function-configuration --function-name ${f}`] = notFound('GetFunctionConfiguration');
+    world[`lambda get-function-concurrency --function-name ${f}`] = notFound('GetFunctionConcurrency');
+  }
   artifactReads(world);
+  accountConcurrency(world);
   return changeSets(world);
+}
+
+// The account's Lambda concurrency (lambda get-account-settings): by default a
+// standard 1000 with nothing reserved.
+export function accountConcurrency(world, { limit = 1000, unreserved = 1000 } = {}) {
+  world['lambda get-account-settings'] = ok({ AccountLimit: { ConcurrentExecutions: limit, UnreservedConcurrentExecutions: unreserved, TotalCodeSize: 80530636800, CodeSizeUnzipped: 262144000, CodeSizeZipped: 52428800 }, AccountUsage: { TotalCodeSize: 0, FunctionCount: 0 } });
+  return world;
 }
 
 // A named resource of `environment` that exists and belongs to `stackName`
@@ -192,7 +203,7 @@ export function deployedBreakGlass(environment = 'production', { op = operator()
   };
   for (const role of ['ci', 'interactions']) {
     world[`lambda get-function-configuration --function-name ${n.functions[role]}`] = () => ok(world.__functions[role]);
-    world[`lambda get-function-concurrency --function-name ${n.functions[role]}`] = ok({});
+    world[`lambda get-function-concurrency --function-name ${n.functions[role]}`] = ok(role === 'interactions' ? { ReservedConcurrentExecutions: 5 } : {});
   }
   world.__urls = { ci: null, interactions: { FunctionUrl: 'https://abc123.lambda-url.us-east-1.on.aws/', AuthType: 'NONE', FunctionArn: a.functions.interactions } };
   world.__policies = {
@@ -212,6 +223,7 @@ export function deployedBreakGlass(environment = 'production', { op = operator()
     world[`logs describe-log-groups --log-group-name-prefix ${n.logGroups[role]}`] = ok({ logGroups: [{ logGroupName: n.logGroups[role], arn: `arn:aws:logs:${REGION}:${ACCOUNT}:log-group:${n.logGroups[role]}:*`, retentionInDays: 90 }] });
   }
   artifactReads(world, { artifact: env.artifact });
+  accountConcurrency(world, { unreserved: 990 });
 
   // Execution roles: the deployed documents, and a simulator over them.
   world.__roles = {};

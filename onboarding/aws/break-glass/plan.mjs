@@ -22,7 +22,11 @@
 //      stack. A resource that merely has the name — including one owned by the
 //      OTHER environment's stack — blocks (never adopted);
 //   6. the artifact: the configured object version exists in a private,
-//      versioned bucket (break-glass/artifact.mjs);
+//      versioned bucket, and S3's full-object SHA-256 of it equals the
+//      configured sha256 (break-glass/artifact.mjs);
+//   6b. the interaction function's reserved concurrency fits the account
+//      (Lambda keeps 100 unreserved; a reservation that does not fit would
+//      only fail at apply);
 //   7. render; the two execution roles' trust/permission diffs; then
 //      recordPlans().
 import { breakGlassPlanningAws } from '../aws-cli.mjs';
@@ -34,8 +38,8 @@ import { ssdTags } from '../templates/common.mjs';
 import { BREAK_GLASS_LOGICAL_IDS as L, renderBreakGlassTemplate } from '../templates/shared-break-glass.mjs';
 import { frameworkProblems } from '../../lib/framework.mjs';
 import { artifactFindings } from './artifact.mjs';
-import { discoverArtifact, discoverFunction, discoverLogGroup, discoverSecret, discoverTable } from './discover.mjs';
-import { breakGlassArns, breakGlassNames } from './names.mjs';
+import { discoverAccountConcurrency, discoverArtifact, discoverConcurrency, discoverFunction, discoverLogGroup, discoverSecret, discoverTable } from './discover.mjs';
+import { INTERACTIONS_RESERVED_CONCURRENCY, MIN_UNRESERVED_CONCURRENCY, breakGlassArns, breakGlassNames } from './names.mjs';
 import { operatorDigestOf } from './operator-config.mjs';
 
 const FAIL = 'FAIL';
@@ -59,6 +63,30 @@ function namedResources(environment, target) {
     { label: 'CI broker function', logicalId: L.ciFunction, type: 'AWS::Lambda::Function', name: n.functions.ci, discover: (aws) => discoverFunction(aws, n.functions.ci), physical },
     { label: 'Interaction function', logicalId: L.interactionsFunction, type: 'AWS::Lambda::Function', name: n.functions.interactions, discover: (aws) => discoverFunction(aws, n.functions.interactions), physical }
   ];
+}
+
+// Does the interaction function's reservation fit? The account's unreserved
+// pool already excludes any reservation the function holds now, so only the
+// increase counts. -> findings[]
+async function concurrencyQuotaFindings(ctx, functionName) {
+  const account = await discoverAccountConcurrency(ctx.aws);
+  if (account.state !== 'present') {
+    return [finding('NOT VERIFIED', 'concurrency-quota-unverified', `the account's Lambda concurrency could not be read (${account.state === 'unverified' ? account.error.code ?? account.error.kind : account.code}); if the reservation of ${INTERACTIONS_RESERVED_CONCURRENCY} does not fit, apply fails and CloudFormation rolls back`)];
+  }
+  const current = await discoverConcurrency(ctx.aws, functionName);
+  const held = current.state === 'present' ? (current.value.reserved ?? 0) : 0;
+  const increase = Math.max(0, INTERACTIONS_RESERVED_CONCURRENCY - held);
+  const left = account.value.unreserved - increase;
+  if (left < MIN_UNRESERVED_CONCURRENCY) {
+    return [
+      finding(
+        FAIL,
+        'concurrency-quota',
+        `reserving ${INTERACTIONS_RESERVED_CONCURRENCY} for ${functionName} would leave ${left} unreserved (account limit ${account.value.limit}, unreserved ${account.value.unreserved}); Lambda requires at least ${MIN_UNRESERVED_CONCURRENCY}. Request a Lambda concurrency quota increase — the public interaction function is never deployed without its cap`
+      )
+    ];
+  }
+  return [];
 }
 
 async function prepareBreakGlassUnit(ctx) {
@@ -96,6 +124,8 @@ async function prepareBreakGlassUnit(ctx) {
   const art = artifactFindings(await discoverArtifact(ctx.aws, artifact), artifact);
   unit.findings.push(...art.findings);
   unit.checks.push({ id: 'artifact', title: 'Published Lambda artifact', observed: art.observed, findings: art.findings });
+
+  unit.findings.push(...(await concurrencyQuotaFindings(ctx, breakGlassNames(environment).functions.interactions)));
 
   unit.residual.push(
     'Secret values are never planned: after apply, put each secret value out of band (aws secretsmanager put-secret-value --secret-string file:///dev/stdin); until then the broker cannot start (fail closed).',

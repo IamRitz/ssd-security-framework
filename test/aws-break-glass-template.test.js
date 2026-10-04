@@ -199,7 +199,7 @@ describe('the template', () => {
     assert.deepEqual(ci.Code, { S3Bucket: ARTIFACT.bucket, S3Key: ARTIFACT.key, S3ObjectVersion: ARTIFACT.versionId });
     assert.deepEqual(ci.Environment.Variables, { TABLE_NAME: 'ssd-break-glass-production-requests', SLACK_CHANNEL_ID: CHANNELS.production, SLACK_BOT_TOKEN_SECRET_ARN: { Ref: 'SlackBotTokenSecret' } });
     assert.equal(ci.VpcConfig, undefined);
-    assert.equal(ci.ReservedConcurrentExecutions, undefined, 'no concurrency cap by default');
+    assert.equal(ci.ReservedConcurrentExecutions, undefined, 'the IAM-only CI broker has no reservation');
     for (const [id, res] of Object.entries(r)) {
       if (['AWS::Lambda::Url', 'AWS::Lambda::Permission', 'AWS::Lambda::EventInvokeConfig'].includes(res.Type)) {
         const target = res.Properties.TargetFunctionArn ?? res.Properties.FunctionName;
@@ -223,6 +223,8 @@ describe('the template', () => {
     assert.deepEqual(r.InteractionsUrlPermission.Properties, { FunctionName: { Ref: 'InteractionsFunction' }, Action: 'lambda:InvokeFunctionUrl', Principal: '*', FunctionUrlAuthType: 'NONE' });
     assert.deepEqual(r.InteractionsUrlInvokePermission.Properties, { FunctionName: { Ref: 'InteractionsFunction' }, Action: 'lambda:InvokeFunction', Principal: '*', InvokedViaFunctionUrl: true });
     assert.equal(r.InteractionsEventInvokeConfig.Properties.MaximumRetryAttempts, 0);
+    assert.equal(i.ReservedConcurrentExecutions, 5, 'the public function is capped');
+    assert.equal(resources('production').InteractionsFunction.Properties.ReservedConcurrentExecutions, 5, 'production too');
   });
 
   it('tags: framework, managed-by and the stack\'s own environment on every taggable resource; no consumer repository', () => {

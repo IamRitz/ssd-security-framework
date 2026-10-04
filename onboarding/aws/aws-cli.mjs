@@ -185,7 +185,10 @@ const BREAK_GLASS_READS = {
     'get-function-url-config': { '--function-name': is(BREAK_GLASS_FUNCTION) },
     'get-policy': { '--function-name': is(BREAK_GLASS_FUNCTION) },
     'get-function-concurrency': { '--function-name': is(BREAK_GLASS_FUNCTION) },
-    'get-function-event-invoke-config': { '--function-name': is(BREAK_GLASS_FUNCTION) }
+    'get-function-event-invoke-config': { '--function-name': is(BREAK_GLASS_FUNCTION) },
+    // Account concurrency limits: whether the interaction function's
+    // reservation fits (plan) — numbers only.
+    'get-account-settings': {}
   },
   secretsmanager: {
     // Metadata (name, ARN, tags, whether a version exists) — never the value.

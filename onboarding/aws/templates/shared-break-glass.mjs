@@ -35,11 +35,13 @@
 // it); `aws verify` compares the live CodeSha256 to it.
 //
 // No VPC: both functions reach Slack, GitHub and GitHub's JWKS over the public
-// internet. No reserved concurrency (aws verify WARNs that none is set). The
+// internet. The interaction function has a deliberate reserved concurrency
+// (INTERACTIONS_RESERVED_CONCURRENCY, break-glass/names.mjs explains the
+// sizing); the IAM-only CI broker has none (aws verify WARNs). The
 // approver map is never set in the environment: the interaction function reads
 // /ssd/break-glass/<environment>/approvers/<repository_id> (Phase 3B, PR #17);
 // against pre-3B broker code nobody is authorized (fail closed).
-import { assertSeparated, breakGlassArns, breakGlassNames, HANDLERS, LAMBDA_ARCHITECTURE, LAMBDA_MEMORY_MB, LAMBDA_RUNTIME, LAMBDA_TIMEOUT_SECONDS, LOG_RETENTION_DAYS, TABLE_KEY, TTL_ATTRIBUTE } from '../break-glass/names.mjs';
+import { assertSeparated, breakGlassArns, breakGlassNames, HANDLERS, INTERACTIONS_RESERVED_CONCURRENCY, LAMBDA_ARCHITECTURE, LAMBDA_MEMORY_MB, LAMBDA_RUNTIME, LAMBDA_TIMEOUT_SECONDS, LOG_RETENTION_DAYS, TABLE_KEY, TTL_ATTRIBUTE } from '../break-glass/names.mjs';
 import { executionRolePolicy, executionTrustPolicy } from '../policy/break-glass.mjs';
 import { retained, ssdTags, template } from './common.mjs';
 
@@ -141,7 +143,7 @@ export function renderBreakGlassTemplate({ operator, environment, partition }) {
     policies[L[`${role}Role`]] = { role, arn: a.roles[role], trust, permissions };
   }
 
-  const fn = (role, variables) => ({
+  const fn = (role, variables, extra = {}) => ({
     ...retained('AWS::Lambda::Function', {
       FunctionName: n.functions[role],
       Description: `ssd-onboard ${environment} break-glass ${role === 'ci' ? 'CI broker (IAM invoke only, no URL)' : 'Slack interaction handler'}`,
@@ -153,6 +155,7 @@ export function renderBreakGlassTemplate({ operator, environment, partition }) {
       Timeout: LAMBDA_TIMEOUT_SECONDS,
       Code: { S3Bucket: env.artifact.bucket, S3Key: env.artifact.key, S3ObjectVersion: env.artifact.versionId },
       Environment: { Variables: variables },
+      ...extra,
       Tags: tags
     }),
     DependsOn: [L[`${role}LogGroup`]]
@@ -168,7 +171,7 @@ export function renderBreakGlassTemplate({ operator, environment, partition }) {
     SLACK_BOT_TOKEN_SECRET_ARN: ref(L.slackBotToken),
     SLACK_SIGNING_SECRET_ARN: ref(L.slackSigningSecret),
     GITHUB_TOKEN_SECRET_ARN: ref(L.githubToken)
-  });
+  }, { ReservedConcurrentExecutions: INTERACTIONS_RESERVED_CONCURRENCY });
 
   resources[L.url] = retained('AWS::Lambda::Url', { TargetFunctionArn: arnOf(L.interactionsFunction), AuthType: 'NONE' });
   resources[L.urlPermission] = retained('AWS::Lambda::Permission', {

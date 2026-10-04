@@ -431,7 +431,17 @@ const MUTATIONS = [
   ['verify: an attached managed policy fails', 'onboarding/aws/break-glass/verify.mjs', "      if (!(p.kind === 'inline' && p.name === `inline:${n.rolePolicies[role]}`)) findings.push(", '      if (false) findings.push('],
   ['verify: async retries must be 0', 'onboarding/aws/break-glass/verify.mjs', "  if (config.value.maximumRetryAttempts !== 0) findings.push(", '  if (false) findings.push('],
   ['verify: no concurrency cap is WARN, not PASS', 'onboarding/aws/break-glass/verify.mjs', "  return done(c, reserved === null ? [warn('no-concurrency-cap',", "  return done(c, false ? [warn('no-concurrency-cap',"],
-  ['Lambda CodeSha256 is base64, not hex', 'onboarding/aws/break-glass/names.mjs', "  return Buffer.from(hex, 'hex').toString('base64');", '  return hex;']
+  ['Lambda CodeSha256 is base64, not hex', 'onboarding/aws/break-glass/names.mjs', "  return Buffer.from(hex, 'hex').toString('base64');", '  return hex;'],
+  ['a missing S3 SHA-256 blocks the plan', 'onboarding/aws/break-glass/artifact.mjs', "      findings.push(f(FAIL, 'artifact-checksum-absent',", "      findings.push(f('NOT VERIFIED', 'artifact-checksum-absent',"],
+  ['a composite S3 SHA-256 blocks the plan', 'onboarding/aws/break-glass/artifact.mjs', "      findings.push(f(FAIL, 'artifact-checksum-not-full-object',", "      findings.push(f('NOT VERIFIED', 'artifact-checksum-not-full-object',"],
+  ['only a FULL_OBJECT S3 SHA-256 is trusted', 'onboarding/aws/break-glass/artifact.mjs', "head.value.checksumType !== 'FULL_OBJECT' || checksum.includes('-')", "head.value.checksumType === 'COMPOSITE'"],
+  ['the public interaction function is provisioned with reserved concurrency', 'onboarding/aws/templates/shared-break-glass.mjs', '  }, { ReservedConcurrentExecutions: INTERACTIONS_RESERVED_CONCURRENCY });', '  });'],
+  ['the reservation is the reviewed number', 'onboarding/aws/break-glass/names.mjs', 'export const INTERACTIONS_RESERVED_CONCURRENCY = 5;', 'export const INTERACTIONS_RESERVED_CONCURRENCY = 1000;'],
+  ['verify: a missing interaction reservation FAILS, never WARNs', 'onboarding/aws/break-glass/verify.mjs', "    return done(c, [fail('no-concurrency-cap', 'the public interaction", "    return done(c, [warn('no-concurrency-cap', 'the public interaction"],
+  ['verify: the interaction reservation must equal the contract', 'onboarding/aws/break-glass/verify.mjs', 'reserved === INTERACTIONS_RESERVED_CONCURRENCY ? []', 'true ? []'],
+  ['verify: the interaction concurrency check is required', 'onboarding/aws/break-glass/verify.mjs', "  const required = role === 'interactions';", '  const required = false;'],
+  ['plan: a reservation that does not fit the account blocks', 'onboarding/aws/break-glass/plan.mjs', '  if (left < MIN_UNRESERVED_CONCURRENCY) {', '  if (false) {'],
+  ['plan: Lambda keeps 100 unreserved', 'onboarding/aws/break-glass/names.mjs', 'export const MIN_UNRESERVED_CONCURRENCY = 100;', 'export const MIN_UNRESERVED_CONCURRENCY = 0;']
 ];
 
 // Temp-workspace lifecycle

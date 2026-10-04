@@ -10,7 +10,7 @@ import { assertBreakGlassRead } from '../onboarding/aws/aws-cli.mjs';
 import { awsVerifyBreakGlass } from '../onboarding/aws/break-glass/verify.mjs';
 import { breakGlassArns, breakGlassNames } from '../onboarding/aws/break-glass/names.mjs';
 import { fakeAws } from './support/aws-fake.mjs';
-import { ACCOUNT, TARGET, deployedBreakGlass, operator, secretArnOf } from './support/break-glass-fake.mjs';
+import { ACCOUNT, TARGET, artifactReads, deployedBreakGlass, operator, secretArnOf } from './support/break-glass-fake.mjs';
 
 async function verify(world, { environment = 'production', op = operator(), region = null } = {}) {
   const f = fakeAws(world, { allowlist: assertBreakGlassRead });
@@ -26,10 +26,12 @@ const interactions = (world) => world.__roles['ssd-break-glass-production-intera
 
 describe('aws verify --scope break-glass: the deployed stack', () => {
   for (const environment of ['production', 'synthetic']) {
-    it(`${environment} verifies; the only non-PASS is the advisory concurrency cap`, async () => {
-      const { report } = await verify(deployedBreakGlass(environment), { environment });
+    it(`${environment} verifies; the only non-PASS is the CI broker's advisory concurrency cap`, async () => {
+      const { report, byId } = await verify(deployedBreakGlass(environment), { environment });
       const problems = report.checks.filter((c) => c.status !== 'PASS');
-      assert.deepEqual(problems.map((c) => [c.id, c.status]), [['bg.ci-concurrency', 'WARN'], ['bg.interactions-concurrency', 'WARN']], JSON.stringify(problems.map((c) => c.findings)));
+      assert.deepEqual(problems.map((c) => [c.id, c.status]), [['bg.ci-concurrency', 'WARN']], JSON.stringify(problems.map((c) => c.findings)));
+      assert.equal(byId('bg.interactions-concurrency').status, 'PASS');
+      assert.equal(byId('bg.interactions-concurrency').required, true);
       assert.equal(report.outcome, 'VERIFIED_WITH_WARNINGS');
       assert.equal(report.target.environment, environment);
     });
@@ -92,6 +94,10 @@ describe('aws verify --scope break-glass: drift fails', () => {
     ['an approver map in the interaction environment', (w) => (w.__functions.interactions.Environment.Variables.SLACK_APPROVER_IDS_BY_REPOSITORY_ID = '{"1":["U1"]}'), 'bg.interactions-function'],
     ['a layer on the CI broker', (w) => (w.__functions.ci.Layers = [{ Arn: 'arn:aws:lambda:us-east-1:111111111111:layer:x:1' }]), 'bg.ci-function'],
     ['a secret tagged for the other environment', (w) => (w.__secrets.slackBotToken.Tags = [{ Key: 'ssd:environment', Value: 'synthetic' }]), 'bg.secrets'],
+    ['the public interaction function has no reserved concurrency', (w) => (w['lambda get-function-concurrency --function-name ssd-break-glass-production-interactions'] = { stdout: '{}', stderr: '', exitCode: 0 }), 'bg.interactions-concurrency'],
+    ['the interaction function\'s reservation drifted', (w) => (w['lambda get-function-concurrency --function-name ssd-break-glass-production-interactions'] = { stdout: '{"ReservedConcurrentExecutions":50}', stderr: '', exitCode: 0 }), 'bg.interactions-concurrency'],
+    ['S3 stores no SHA-256 for the artifact version', (w) => artifactReads(w, { checksum: null }), 'bg.artifact'],
+    ['S3\'s SHA-256 for the artifact is COMPOSITE', (w) => artifactReads(w, { checksumType: 'COMPOSITE' }), 'bg.artifact'],
     ['an unexpected resource in the stack', (w) => w.__stackResources.push({ LogicalResourceId: 'InvokerRole', PhysicalResourceId: 'x', ResourceType: 'AWS::IAM::Role' }), 'bg.stack']
   ];
   for (const [what, mutate, id] of cases) {
