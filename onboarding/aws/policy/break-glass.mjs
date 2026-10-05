@@ -130,8 +130,10 @@ export function executionRequirements(role, environment, target) {
           probe('ssm:GetParameter', a.approverParameterSample, `approvers are read from ${environment}'s per-repository parameter (Phase 3B)`)
         ]
       : []),
-    ...LOG_ACTIONS.map((action) => probe(action, a.logStreamSamples[role], 'the function writes its own logs'))
+    // Probed on the group's own ARN, not a stream ARN: see breakGlassArns().logGroupProbes.
+    ...LOG_ACTIONS.map((action) => probe(action, a.logGroupProbes[role], 'the function writes its own logs'))
   ];
+  const otherRole = role === 'ci' ? 'interactions' : 'ci';
   const FAIL = 'FAIL';
   const forbidden = [
     // Cross-environment: never the other environment's state, secrets,
@@ -140,6 +142,9 @@ export function executionRequirements(role, environment, target) {
     ...Object.keys(o.secretSamples).map((k) => probe('secretsmanager:GetSecretValue', o.secretSamples[k], `the ${environment} ${role} role must never read ${other}'s ${k}`, FAIL)),
     probe('ssm:GetParameter', o.approverParameterSample, `the ${environment} ${role} role must never read ${other}'s approvers`, FAIL),
     ...Object.values(o.functions).map((fn) => probe('lambda:InvokeFunction', fn, `the ${environment} ${role} role must never invoke a ${other} function`, FAIL)),
+    ...EXECUTION_ROLES.flatMap((r) => LOG_ACTIONS.map((action) => probe(action, o.logGroupProbes[r], `the ${environment} ${role} role must never write ${other}'s ${r} logs`, FAIL))),
+    // Same environment: only its OWN log group.
+    ...LOG_ACTIONS.map((action) => probe(action, a.logGroupProbes[otherRole], `the ${role} function never writes the ${otherRole} function's logs`, FAIL)),
     // Same environment, beyond what this function does.
     ...NEVER_TABLE.map((action) => probe(action, a.table, `the ${role} function never ${action.split(':')[1]}s the table`, FAIL)),
     ...(role === 'interactions'

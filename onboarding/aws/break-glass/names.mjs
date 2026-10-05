@@ -108,9 +108,16 @@ export function breakGlassArns(environment, { partition = 'aws', account, region
       ci: `arn:${partition}:logs:${region}:${account}:log-group:${n.logGroups.ci}:*`,
       interactions: `arn:${partition}:logs:${region}:${account}:log-group:${n.logGroups.interactions}:*`
     }),
-    logStreamSamples: Object.freeze({
-      ci: `arn:${partition}:logs:${region}:${account}:log-group:${n.logGroups.ci}:log-stream:2026/10/04/[$LATEST]0123456789abcdef`,
-      interactions: `arn:${partition}:logs:${region}:${account}:log-group:${n.logGroups.interactions}:log-stream:2026/10/04/[$LATEST]0123456789abcdef`
+    // What `aws verify` simulates the logging grants against: each log group's
+    // own ARN as AWS reports it (describe-log-groups `arn`). Not a log-stream
+    // ARN: IAM's simulator answers implicitDeny for CreateLogStream /
+    // PutLogEvents on every log-stream ARN under a group name containing '/'
+    // (all /aws/lambda/* groups), whatever the grant — observed live, Phase 3C
+    // synthetic verify, 2026-10-05. Whether real writes succeed is proven only
+    // when the function runs.
+    logGroupProbes: Object.freeze({
+      ci: `arn:${partition}:logs:${region}:${account}:log-group:${n.logGroups.ci}:*`,
+      interactions: `arn:${partition}:logs:${region}:${account}:log-group:${n.logGroups.interactions}:*`
     }),
     approverParameters: `arn:${partition}:ssm:${region}:${account}:parameter${n.approverPrefix}*`,
     approverParameterSample: `arn:${partition}:ssm:${region}:${account}:parameter${n.approverPrefix}1001`,

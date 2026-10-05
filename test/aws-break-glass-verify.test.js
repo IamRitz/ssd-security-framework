@@ -153,6 +153,72 @@ describe('aws verify --scope break-glass: cross-environment reuse fails', () => 
   });
 });
 
+// Logging access. IAM's simulator never allows CreateLogStream / PutLogEvents
+// on a log-stream ARN under a '/aws/lambda/…' group (observed live 2026-10-05;
+// the fake reproduces it), so verify probes each group's own ARN
+// (`…:log-group:<name>:*`) — and requires ONLY the function's own group.
+describe('aws verify --scope break-glass: logging access (own log group only)', () => {
+  const logs = (role, environment = 'production') => breakGlassArns(environment, TARGET).logGroupProbes[role];
+  const writeOwnLogs = (role) => role.policy.Statement.find((st) => st.Sid === 'WriteOwnLogs');
+  const roleOf = (world, environment, role) => world.__roles[`ssd-break-glass-${environment}-${role}-execution`];
+  const simulate = (world, roleArn, action, resource) =>
+    JSON.parse(world['iam simulate-principal-policy *'](['iam', 'simulate-principal-policy', '--policy-source-arn', roleArn, '--action-names', JSON.stringify([action]), '--resource-arns', JSON.stringify([resource])]).stdout).EvaluationResults[0].EvalDecision;
+
+  it('the fake reproduces the live simulator: no grant, not even Resource "*", allows a stream under /aws/lambda', () => {
+    const world = deployedBreakGlass();
+    const role = ci(world);
+    role.policy.Statement.push({ Sid: 'Broad', Effect: 'Allow', Action: ['logs:CreateLogStream', 'logs:PutLogEvents'], Resource: '*' });
+    const stream = `${logs('ci').slice(0, -2)}:log-stream:2026/10/04/[$LATEST]0123456789abcdef`;
+    for (const action of ['logs:CreateLogStream', 'logs:PutLogEvents']) {
+      assert.equal(simulate(world, role.arn, action, stream), 'implicitDeny');
+      assert.equal(simulate(world, role.arn, action, logs('ci')), 'allowed');
+    }
+  });
+
+  for (const environment of ['production', 'synthetic']) {
+    it(`${environment}: the generated policies pass, own group allowed, every other group denied`, async () => {
+      const { report, byId } = await verify(deployedBreakGlass(environment), { environment });
+      const other = environment === 'production' ? 'synthetic' : 'production';
+      for (const role of ['ci', 'interactions']) {
+        const otherRole = role === 'ci' ? 'interactions' : 'ci';
+        assert.equal(byId(`bg.${role}-required-access`).status, 'PASS');
+        assert.equal(byId(`bg.${role}-negative-access`).status, 'PASS');
+        for (const action of ['logs:CreateLogStream', 'logs:PutLogEvents']) {
+          assert.ok(byId(`bg.${role}-required-access`).observed.includes(`${action} on ${logs(role, environment)}: allowed`));
+          assert.ok(byId(`bg.${role}-negative-access`).observed.includes(`${action} on ${logs(otherRole, environment)}: implicitDeny`), 'cross-function probed and denied');
+          for (const r of ['ci', 'interactions']) {
+            assert.ok(byId(`bg.${role}-negative-access`).observed.includes(`${action} on ${logs(r, other)}: implicitDeny`), `${other} ${r} probed and denied`);
+          }
+        }
+      }
+      assert.notEqual(report.outcome, 'FAILED');
+    });
+  }
+
+  const drift = [
+    ['CI without logs:CreateLogStream', 'production', (w) => (writeOwnLogs(roleOf(w, 'production', 'ci')).Action = ['logs:PutLogEvents']), ['bg.ci-required-access']],
+    ['interactions without logs:PutLogEvents', 'production', (w) => (writeOwnLogs(roleOf(w, 'production', 'interactions')).Action = ['logs:CreateLogStream']), ['bg.interactions-required-access']],
+    ['CI writing to a log group that is not its own', 'production', (w) => (writeOwnLogs(roleOf(w, 'production', 'ci')).Resource = `arn:aws:logs:${TARGET.region}:${ACCOUNT}:log-group:/aws/lambda/some-other-function:*`), ['bg.ci-required-access']],
+    ['CI granted the interaction function\'s group INSTEAD of its own', 'production', (w) => (writeOwnLogs(roleOf(w, 'production', 'ci')).Resource = logs('interactions')), ['bg.ci-required-access', 'bg.ci-negative-access']],
+    ['CI granted the interaction function\'s group AS WELL', 'production', (w) => (writeOwnLogs(roleOf(w, 'production', 'ci')).Resource = [logs('ci'), logs('interactions')]), ['bg.ci-negative-access']],
+    ['interactions granted the CI group as well', 'production', (w) => (writeOwnLogs(roleOf(w, 'production', 'interactions')).Resource = [logs('interactions'), logs('ci')]), ['bg.interactions-negative-access']],
+    ['synthetic interactions granted production\'s interactions group', 'synthetic', (w) => (writeOwnLogs(roleOf(w, 'synthetic', 'interactions')).Resource = [logs('interactions', 'synthetic'), logs('interactions', 'production')]), ['bg.interactions-negative-access']],
+    ['synthetic CI granted production\'s CI group', 'synthetic', (w) => (writeOwnLogs(roleOf(w, 'synthetic', 'ci')).Resource = [logs('ci', 'synthetic'), logs('ci', 'production')]), ['bg.ci-negative-access']],
+    ['a broad Resource "*" Logs grant', 'production', (w) => roleOf(w, 'production', 'ci').policy.Statement.push({ Sid: 'Broad', Effect: 'Allow', Action: ['logs:CreateLogStream', 'logs:PutLogEvents'], Resource: '*' }), ['bg.ci-policy-document', 'bg.ci-negative-access']],
+    ['an account-wide log-group:* grant', 'production', (w) => roleOf(w, 'production', 'ci').policy.Statement.push({ Sid: 'AllGroups', Effect: 'Allow', Action: ['logs:CreateLogStream', 'logs:PutLogEvents'], Resource: `arn:aws:logs:${TARGET.region}:${ACCOUNT}:log-group:*` }), ['bg.ci-policy-document', 'bg.ci-negative-access']],
+    ['a logs:* action on its own group', 'production', (w) => (writeOwnLogs(roleOf(w, 'production', 'ci')).Action = ['logs:*']), ['bg.ci-policy-document']]
+  ];
+  for (const [what, environment, mutate, ids] of drift) {
+    it(`FAILS: ${what}`, async () => {
+      const world = deployedBreakGlass(environment);
+      mutate(world);
+      const { report } = await verify(world, { environment });
+      assert.equal(report.outcome, 'FAILED');
+      for (const id of ids) assert.ok(failing(report).includes(id), `${id} not in ${JSON.stringify(failing(report))}`);
+    });
+  }
+});
+
 describe('aws verify --scope break-glass: warnings and uncertainty', () => {
   it('an unpopulated secret is a WARN (fail closed), never a PASS or a FAIL', async () => {
     const world = deployedBreakGlass();

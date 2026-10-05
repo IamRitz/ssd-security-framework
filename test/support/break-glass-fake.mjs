@@ -141,7 +141,19 @@ export function existingResource(world, { kind, environment, stackName = null, p
 
 const glob = (pattern, flags) => new RegExp(`^${String(pattern).split('').map((c) => (c === '*' ? '.*' : c === '?' ? '.' : c.replace(/[\\^$.|+()[\]{}]/g, '\\$&'))).join('')}$`, flags);
 const list = (v) => (v === undefined ? [] : Array.isArray(v) ? v : [v]);
+// Observed live (Phase 3C synthetic verify, 2026-10-05): IAM's
+// simulate-principal-policy answers implicitDeny for logs:CreateLogStream /
+// logs:PutLogEvents on ANY log-stream ARN whose log-group name contains '/' —
+// every /aws/lambda/* group — whatever the grant, even Resource "*" (supplied
+// via --policy-input-list, and applied). The same grant IS evaluated on the
+// group's own ARN (`…:log-group:<name>:*`) and on a stream under a group name
+// without '/'. The fake reproduces that, so verify cannot rely on a probe the
+// real simulator never allows.
+const UNSIMULATABLE_LOG_STREAM = /^arn:[^:]+:logs:[^:]+:\d+:log-group:[^:]*\/[^:]*:log-stream:/;
 function decide(doc, action, resource) {
+  if (['logs:createlogstream', 'logs:putlogevents'].includes(action.toLowerCase()) && UNSIMULATABLE_LOG_STREAM.test(resource)) {
+    return 'implicitDeny';
+  }
   let allowed = false;
   for (const s of list(doc?.Statement)) {
     const act = list(s.Action).some((p) => glob(p, 'i').test(action));
