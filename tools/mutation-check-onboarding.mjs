@@ -289,7 +289,14 @@ const MUTATIONS = [
   ['a stale UPDATE base revision refuses', 'onboarding/aws/apply/live.mjs', '    if (st.status !== base.stackStatus || st.lastUpdatedTime !== (base.lastUpdatedTime ?? null)) {', '    if (false) {'],
   ['another stack at the name (placeholder id) refuses', 'onboarding/aws/apply/live.mjs', '  if (st.stackId !== binding.stackId) {', '  if (false) {'],
   ['a CREATE placeholder must still be REVIEW_IN_PROGRESS', 'onboarding/aws/apply/live.mjs', "    if (st.status !== 'REVIEW_IN_PROGRESS') {", '    if (false) {'],
-  ['a stack that lost its SSD ownership tags refuses', 'onboarding/aws/apply/live.mjs', '  if (tags.length > 0) {', '  if (false) {'],
+  ['an UPDATE stack that lost its SSD ownership tags refuses', 'onboarding/aws/apply/live.mjs', '  if (tags.length > 0) {', '  if (false) {'],
+  // CREATE placeholders are untagged until execute (observed live, Phase 3C):
+  // ownership is the reviewed change set's tags plus the placeholder's identity.
+  ['an untagged CREATE placeholder is accepted (the live AWS shape)', 'onboarding/aws/apply/live.mjs', '    if (st.tags.length > 0) {', '    if (true) {'],
+  ['a CREATE change set must carry the SSD ownership tags', 'onboarding/aws/apply/live.mjs', '    if (changeSetTags.length > 0) {', '    if (false) {'],
+  ['a tagged CREATE placeholder must carry only the SSD tags', 'onboarding/aws/apply/live.mjs', '      if (placeholderTags.length > 0) {', '      if (false) {'],
+  ["an existing placeholder's revision is protected", 'onboarding/aws/apply/live.mjs', "    if (base.state === 'present' && st.lastUpdatedTime !== (base.lastUpdatedTime ?? null)) {", '    if (false) {'],
+  ['the live stack name must be the recorded one', 'onboarding/aws/apply/live.mjs', '  if (st.name !== binding.stackName) {', '  if (false) {'],
   ['destructive changes cannot be ignored', 'onboarding/aws/apply/plan-check.mjs', '  if (destructive === 0 && (allowDestructive === null || allowDestructive === 0)) {', '  if (true) {'],
   ['a wrong --allow-destructive count refuses', 'onboarding/aws/apply/plan-check.mjs', '  if (allowDestructive !== destructive) {', '  if (false) {'],
   ['the typed account and region must match exactly', 'onboarding/aws/apply.mjs', 'typed?.account === account && typed?.region === region ? [] :', 'true ? [] :'],
