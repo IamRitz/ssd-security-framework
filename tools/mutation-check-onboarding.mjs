@@ -253,6 +253,9 @@ const MUTATIONS = [
   ['replacements count as destructive', 'onboarding/aws/plan/change-set.mjs', 'destructive: counts.DELETE + counts.REPLACE', 'destructive: counts.DELETE'],
   ['a Dynamic / Import / unknown action fails closed', 'onboarding/aws/plan/change-set.mjs', "        throw new ChangeSetError('unexpected-action',", "        return { ...base, action: 'UPDATE' }; throw new ChangeSetError('unexpected-action',"],
   ['only the documented no-change reason is no-changes', 'onboarding/aws/plan/change-set.mjs', '      if (isNoChangeReason(described.StatusReason)) {', '      if (true) {'],
+  // Live AWS: get-function-concurrency with no reservation prints nothing.
+  ['an empty concurrency response means no reservation (not malformed)', 'onboarding/aws/aws-cli.mjs', '    return run(argv, { allowEmpty: EMPTY_SUCCESS_OPERATIONS.has(`${argv[0]} ${argv[1]}`) });', '    return run(argv);'],
+  ['only get-function-concurrency may answer with empty stdout', 'onboarding/aws/aws-cli.mjs', "new Set(['lambda get-function-concurrency'])", "new Set(['lambda get-function-concurrency', 'lambda get-function-configuration'])"],
   ['the described change set carries exactly the planned tags', 'onboarding/aws/plan/change-set.mjs', "  if (!Array.isArray(described.Tags) || !sameTags(described.Tags, tags)) problems.push('Tags');\n", ''],
   ['a described change set importing existing resources is refused', 'onboarding/aws/plan/change-set.mjs', "  if (described.ImportExistingResources === true) problems.push('ImportExistingResources');\n", ''],
   ['the plan id binds the base stack revision', 'onboarding/aws/plan/record.mjs', "    baseStack: baseStack.state === 'absent' ? { state: 'absent' } : { state: 'present', stackId: baseStack.stackId, stackStatus: baseStack.stackStatus, lastUpdatedTime: baseStack.lastUpdatedTime ?? null },", '    baseStack: { state: baseStack.state },'],

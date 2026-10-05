@@ -95,6 +95,7 @@ describe('aws verify --scope break-glass: drift fails', () => {
     ['a layer on the CI broker', (w) => (w.__functions.ci.Layers = [{ Arn: 'arn:aws:lambda:us-east-1:111111111111:layer:x:1' }]), 'bg.ci-function'],
     ['a secret tagged for the other environment', (w) => (w.__secrets.slackBotToken.Tags = [{ Key: 'ssd:environment', Value: 'synthetic' }]), 'bg.secrets'],
     ['the public interaction function has no reserved concurrency', (w) => (w['lambda get-function-concurrency --function-name ssd-break-glass-production-interactions'] = { stdout: '{}', stderr: '', exitCode: 0 }), 'bg.interactions-concurrency'],
+    ['the public interaction function has no reserved concurrency (the live empty response)', (w) => (w['lambda get-function-concurrency --function-name ssd-break-glass-production-interactions'] = { stdout: '', stderr: '', exitCode: 0 }), 'bg.interactions-concurrency'],
     ['the interaction function\'s reservation drifted', (w) => (w['lambda get-function-concurrency --function-name ssd-break-glass-production-interactions'] = { stdout: '{"ReservedConcurrentExecutions":50}', stderr: '', exitCode: 0 }), 'bg.interactions-concurrency'],
     ['S3 stores no SHA-256 for the artifact version', (w) => artifactReads(w, { checksum: null }), 'bg.artifact'],
     ['S3\'s SHA-256 for the artifact is COMPOSITE', (w) => artifactReads(w, { checksumType: 'COMPOSITE' }), 'bg.artifact'],
@@ -158,6 +159,38 @@ describe('aws verify --scope break-glass: warnings and uncertainty', () => {
     world.__secrets.githubToken.VersionIdsToStages = {};
     const { byId } = await verify(world);
     assert.equal(byId('bg.secrets').status, 'WARN');
+  });
+
+  // Live AWS (2026-10-05): no reservation = exit 0 with EMPTY stdout. That is a
+  // successful read meaning "no cap" — the advisory WARN — never NOT VERIFIED.
+  it('the CI broker with no reservation (empty successful response) is the advisory WARN, not NOT VERIFIED', async () => {
+    const world = deployedBreakGlass();
+    assert.deepEqual(world['lambda get-function-concurrency --function-name ssd-break-glass-production-ci'], { stdout: '', stderr: '', exitCode: 0 }, 'the fake models the live response');
+    const { byId } = await verify(world);
+    const c = byId('bg.ci-concurrency');
+    assert.equal(c.status, 'WARN');
+    assert.ok(c.findings.some((f) => f.kind === 'no-concurrency-cap'));
+  });
+
+  it('a malformed concurrency response is NOT VERIFIED (CI), never a WARN or PASS', async () => {
+    for (const stdout of ['not json', '[]', 'null']) {
+      const world = deployedBreakGlass();
+      world['lambda get-function-concurrency --function-name ssd-break-glass-production-ci'] = { stdout, stderr: '', exitCode: 0 };
+      const { byId } = await verify(world);
+      assert.equal(byId('bg.ci-concurrency').status, 'NOT VERIFIED', stdout);
+    }
+  });
+
+  it('a malformed concurrency response on the interaction function never passes', async () => {
+    const world = deployedBreakGlass();
+    world['lambda get-function-concurrency --function-name ssd-break-glass-production-interactions'] = { stdout: 'not json', stderr: '', exitCode: 0 };
+    const { byId } = await verify(world);
+    assert.notEqual(byId('bg.interactions-concurrency').status, 'PASS');
+  });
+
+  it('the interaction function with exactly 5 reserved passes', async () => {
+    const { byId } = await verify(deployedBreakGlass());
+    assert.equal(byId('bg.interactions-concurrency').status, 'PASS');
   });
 
   it('a configured concurrency cap clears the WARN', async () => {

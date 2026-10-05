@@ -602,6 +602,13 @@ export function applyAws({ binding, ...options } = {}) {
   });
 }
 
+// Read operations whose SUCCESSFUL response may be empty stdout, which then
+// means "nothing configured" ({}), not malformed output. Observed live (Phase
+// 3C synthetic verify, 2026-10-05): `aws lambda get-function-concurrency` on a
+// function with no reserved concurrency exits 0 and prints nothing. Any other
+// read with empty stdout, and any non-empty non-JSON output, stays malformed.
+export const EMPTY_SUCCESS_OPERATIONS = Object.freeze(new Set(['lambda get-function-concurrency']));
+
 // extend(aws, run) is the only way to reach `run` (the unchecked executor); only
 // applyAws() passes one, to bind its single fixed execute argv.
 function wrapper(assertCall, { region, exec = execAws, env = process.env, timeoutMs = DEFAULT_TIMEOUT_MS, deadlineMs = DEFAULT_DEADLINE_MS, now = Date.now, onCall = () => {} } = {}, extend = () => {}) {
@@ -612,7 +619,7 @@ function wrapper(assertCall, { region, exec = execAws, env = process.env, timeou
   const spent = (operation) => new AwsCliError('deadline', `the run's overall AWS time budget (${Math.round(deadlineMs / 1000)}s) is spent`, { operation });
   const aws = async function aws(argv) {
     assertCall(argv);
-    return run(argv);
+    return run(argv, { allowEmpty: EMPTY_SUCCESS_OPERATIONS.has(`${argv[0]} ${argv[1]}`) });
   };
   // Executes an argv the caller has already checked. Reachable only through
   // aws() above or, via `extend`, applyAws().executeChangeSet().

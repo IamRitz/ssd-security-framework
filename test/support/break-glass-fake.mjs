@@ -203,7 +203,9 @@ export function deployedBreakGlass(environment = 'production', { op = operator()
   };
   for (const role of ['ci', 'interactions']) {
     world[`lambda get-function-configuration --function-name ${n.functions[role]}`] = () => ok(world.__functions[role]);
-    world[`lambda get-function-concurrency --function-name ${n.functions[role]}`] = ok(role === 'interactions' ? { ReservedConcurrentExecutions: 5 } : {});
+    // Live AWS (2026-10-05): with no reservation, get-function-concurrency exits 0
+    // and prints NOTHING (not "{}"). The CI broker deliberately has none.
+    world[`lambda get-function-concurrency --function-name ${n.functions[role]}`] = role === 'interactions' ? ok({ ReservedConcurrentExecutions: 5 }) : { stdout: '', stderr: '', exitCode: 0 };
   }
   world.__urls = { ci: null, interactions: { FunctionUrl: 'https://abc123.lambda-url.us-east-1.on.aws/', AuthType: 'NONE', FunctionArn: a.functions.interactions } };
   world.__policies = {
