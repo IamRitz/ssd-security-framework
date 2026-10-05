@@ -133,6 +133,23 @@ describe('aws apply: plan integrity (refused before AWS)', () => {
     });
   }
 
+  // The reviewed change set's tags are bound EXACTLY, before any AWS call:
+  // change-set.json must carry precisely plan.json's SSD tags (no extra, none
+  // missing), and plan.json's tags are themselves bound by the plan id.
+  for (const [what, file, edit, kind] of [
+    ['an extra tag on the recorded change set', 'change-set.json', (cs) => ({ ...cs, Tags: [...cs.Tags, { Key: 'owner', Value: 'someone-else' }] }), 'plan-inconsistent'],
+    ['a required SSD tag missing from the recorded change set', 'change-set.json', (cs) => ({ ...cs, Tags: cs.Tags.filter((tag) => tag.Key !== 'ssd:managed-by') }), 'plan-inconsistent'],
+    ['plan.json tags that are not the SSD tags the plan id binds', 'plan.json', (plan) => ({ ...plan, tags: plan.tags.map((tag) => (tag.Key === 'ssd:managed-by' ? { ...tag, Value: 'terraform' } : tag)) }), 'plan-not-applicable']
+  ]) {
+    it(`a resealed CREATE record with ${what} is refused before AWS`, async (t) => {
+      const p = await planned(t);
+      reseal(p, file, edit);
+      const r = await apply(p);
+      refusedWithoutMutation(r, kind);
+      assert.equal(r.fake.calls.length, 0, 'no AWS call at all');
+    });
+  }
+
   it('an already-applied plan is refused and never executed twice', async (t) => {
     const p = await planned(t);
     assert.equal((await apply(p)).report.outcome, 'APPLIED');

@@ -253,6 +253,7 @@ const MUTATIONS = [
   ['replacements count as destructive', 'onboarding/aws/plan/change-set.mjs', 'destructive: counts.DELETE + counts.REPLACE', 'destructive: counts.DELETE'],
   ['a Dynamic / Import / unknown action fails closed', 'onboarding/aws/plan/change-set.mjs', "        throw new ChangeSetError('unexpected-action',", "        return { ...base, action: 'UPDATE' }; throw new ChangeSetError('unexpected-action',"],
   ['only the documented no-change reason is no-changes', 'onboarding/aws/plan/change-set.mjs', '      if (isNoChangeReason(described.StatusReason)) {', '      if (true) {'],
+  ['the described change set carries exactly the planned tags', 'onboarding/aws/plan/change-set.mjs', "  if (!Array.isArray(described.Tags) || !sameTags(described.Tags, tags)) problems.push('Tags');\n", ''],
   ['a described change set importing existing resources is refused', 'onboarding/aws/plan/change-set.mjs', "  if (described.ImportExistingResources === true) problems.push('ImportExistingResources');\n", ''],
   ['the plan id binds the base stack revision', 'onboarding/aws/plan/record.mjs', "    baseStack: baseStack.state === 'absent' ? { state: 'absent' } : { state: 'present', stackId: baseStack.stackId, stackStatus: baseStack.stackStatus, lastUpdatedTime: baseStack.lastUpdatedTime ?? null },", '    baseStack: { state: baseStack.state },'],
   ['the plan id binds the template hash', 'onboarding/aws/plan/record.mjs', '    templateSha256,\n    parametersSha256,\n    tagsSha256,\n', '    parametersSha256,\n    tagsSha256,\n'],
