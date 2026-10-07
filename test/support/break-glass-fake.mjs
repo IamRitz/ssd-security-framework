@@ -210,7 +210,7 @@ export function deployedBreakGlass(environment = 'production', { op = operator()
   const code = codeSha256Of(env.artifact.sha256);
   const fn = (role, Variables) => ({ FunctionName: n.functions[role], FunctionArn: a.functions[role], Role: a.roles[role], Runtime: 'nodejs24.x', Handler: `broker/lambda/index.${role === 'ci' ? 'ciHandler' : 'interactionsHandler'}`, Architectures: ['arm64'], MemorySize: 256, Timeout: 20, CodeSha256: code, PackageType: 'Zip', Environment: { Variables }, State: 'Active' });
   world.__functions = {
-    ci: fn('ci', { TABLE_NAME: n.table, SLACK_CHANNEL_ID: env.slackChannelId, SLACK_BOT_TOKEN_SECRET_ARN: secretArns.slackBotToken }),
+    ci: fn('ci', { TABLE_NAME: n.table, SLACK_CHANNEL_ID: env.slackChannelId, BREAK_GLASS_ENVIRONMENT: environment, SLACK_BOT_TOKEN_SECRET_ARN: secretArns.slackBotToken }),
     interactions: fn('interactions', { TABLE_NAME: n.table, BREAK_GLASS_ENVIRONMENT: environment, SLACK_BOT_TOKEN_SECRET_ARN: secretArns.slackBotToken, SLACK_SIGNING_SECRET_ARN: secretArns.slackSigningSecret, GITHUB_TOKEN_SECRET_ARN: secretArns.githubToken })
   };
   for (const role of ['ci', 'interactions']) {

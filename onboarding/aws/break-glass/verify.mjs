@@ -156,7 +156,7 @@ const PINNED = (role) => ({ runtime: LAMBDA_RUNTIME, handler: HANDLERS[role], ar
 export function expectedVariables(role, environment, { slackChannelId, secretArns }) {
   const n = breakGlassNames(environment);
   return role === 'ci'
-    ? { TABLE_NAME: n.table, SLACK_CHANNEL_ID: slackChannelId, SLACK_BOT_TOKEN_SECRET_ARN: secretArns.slackBotToken }
+    ? { TABLE_NAME: n.table, SLACK_CHANNEL_ID: slackChannelId, BREAK_GLASS_ENVIRONMENT: environment, SLACK_BOT_TOKEN_SECRET_ARN: secretArns.slackBotToken }
     : {
         TABLE_NAME: n.table,
         BREAK_GLASS_ENVIRONMENT: environment,

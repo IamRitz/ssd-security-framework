@@ -11,13 +11,17 @@
 //                 putPending (PutItem), setSlackRef (UpdateItem),
 //                 deletePending (DeleteItem); status: consumeTokenId
 //                 (PutItem), get (GetItem), expire (UpdateItem).
-//                 Secrets: SLACK_BOT_TOKEN only.
+//                 Secrets: SLACK_BOT_TOKEN only. ssm:GetParameter on its own
+//                 environment's ONE framework policy parameter (notify and
+//                 status check the commit, Phase 3D).
 //   interactions  get (GetItem); claim / finalize / expire / claimSideEffects
 //                 (UpdateItem). It never creates or deletes an item: no PutItem,
 //                 no DeleteItem. Secrets: bot token, signing secret, GitHub
 //                 token. lambda:InvokeFunction on ITSELF (the async follow-up,
 //                 runtime.mjs enqueueSelf). ssm:GetParameter on its own
-//                 environment's approver path (Phase 3B contract, PR #17).
+//                 environment's approver path (Phase 3B contract, PR #17) and
+//                 on its ONE framework policy parameter (the click-time
+//                 re-check, Phase 3D).
 //   both          CloudWatch Logs: CreateLogStream / PutLogEvents on its own
 //                 log group, which the stack creates (so no CreateLogGroup).
 //
@@ -94,6 +98,9 @@ export function executionRolePolicy(role, environment, target) {
       { Sid: 'ReadApprovers', Effect: 'Allow', Action: 'ssm:GetParameter', Resource: a.approverParameters }
     );
   }
+  // Both functions check the framework commit (Phase 3D): one exact ARN,
+  // read-only, this environment's only.
+  statements.push({ Sid: 'ReadFrameworkPolicy', Effect: 'Allow', Action: 'ssm:GetParameter', Resource: a.frameworkPolicyParameter });
   statements.push({ Sid: 'WriteOwnLogs', Effect: 'Allow', Action: [...LOG_ACTIONS], Resource: a.logStreams[role] });
   return { Version: '2012-10-17', Statement: statements };
 }
@@ -130,6 +137,7 @@ export function executionRequirements(role, environment, target) {
           probe('ssm:GetParameter', a.approverParameterSample, `approvers are read from ${environment}'s per-repository parameter (Phase 3B)`)
         ]
       : []),
+    probe('ssm:GetParameter', a.frameworkPolicyParameter, role === 'ci' ? `notify and every status call check the framework commit against ${environment}'s allowed set (Phase 3D)` : `an approver's click re-checks the request's framework commit against ${environment}'s allowed set (Phase 3D)`),
     // Probed on the group's own ARN, not a stream ARN: see breakGlassArns().logGroupProbes.
     ...LOG_ACTIONS.map((action) => probe(action, a.logGroupProbes[role], 'the function writes its own logs'))
   ];
@@ -141,6 +149,8 @@ export function executionRequirements(role, environment, target) {
     ...[...TABLE_ACTIONS.ci, ...NEVER_TABLE].map((action) => probe(action, o.table, `the ${environment} ${role} role must never touch the ${other} table`, FAIL)),
     ...Object.keys(o.secretSamples).map((k) => probe('secretsmanager:GetSecretValue', o.secretSamples[k], `the ${environment} ${role} role must never read ${other}'s ${k}`, FAIL)),
     probe('ssm:GetParameter', o.approverParameterSample, `the ${environment} ${role} role must never read ${other}'s approvers`, FAIL),
+    probe('ssm:GetParameter', o.frameworkPolicyParameter, `the ${environment} ${role} role must never read ${other}'s allowed framework commits`, FAIL),
+    ...['ssm:PutParameter', 'ssm:DeleteParameter'].map((action) => probe(action, o.frameworkPolicyParameter, `the ${environment} ${role} role must never change ${other}'s allowed framework commits`, FAIL)),
     ...Object.values(o.functions).map((fn) => probe('lambda:InvokeFunction', fn, `the ${environment} ${role} role must never invoke a ${other} function`, FAIL)),
     ...EXECUTION_ROLES.flatMap((r) => LOG_ACTIONS.map((action) => probe(action, o.logGroupProbes[r], `the ${environment} ${role} role must never write ${other}'s ${r} logs`, FAIL))),
     // Same environment: only its OWN log group.
@@ -161,6 +171,13 @@ export function executionRequirements(role, environment, target) {
           probe('lambda:InvokeFunction', a.functions.interactions, 'the CI broker never invokes the interaction function', FAIL),
           probe('lambda:InvokeFunction', a.functions.ci, 'the CI broker never invokes itself', FAIL)
         ]),
+    // The framework policy is read, exactly, and never written: only the
+    // governance stack (the scoped deployer) changes it.
+    ...['ssm:PutParameter', 'ssm:DeleteParameter', 'ssm:LabelParameterVersion', 'ssm:AddTagsToResource'].map((action) => probe(action, a.frameworkPolicyParameter, `a broker function never changes ${environment}'s allowed framework commits`, FAIL)),
+    probe('ssm:GetParameter', a.governanceSiblingSample, 'the framework policy grant is one parameter, never governance/*', FAIL),
+    probe('ssm:GetParameters', a.frameworkPolicyParameter, 'the broker reads the framework policy with GetParameter only', FAIL),
+    probe('ssm:GetParametersByPath', a.frameworkPolicyParameter, 'the broker never lists the governance path', FAIL),
+    probe('ssm:PutParameter', a.approverParameterSample, 'a broker function never changes approvers', FAIL),
     ...Object.values(a.secretSamples).map((s) => probe('secretsmanager:PutSecretValue', s, 'a broker function never writes a secret', FAIL)),
     probe('lambda:UpdateFunctionCode', a.functions[role], 'a broker function never replaces its own code', FAIL),
     probe('iam:PassRole', '*', 'an execution role never passes roles', FAIL)

@@ -40,7 +40,10 @@
 // sizing); the IAM-only CI broker has none (aws verify WARNs). The
 // approver map is never set in the environment: the interaction function reads
 // /ssd/break-glass/<environment>/approvers/<repository_id> (Phase 3B, PR #17);
-// against pre-3B broker code nobody is authorized (fail closed).
+// against pre-3B broker code nobody is authorized (fail closed). Both functions
+// get BREAK_GLASS_ENVIRONMENT and read exactly
+// /ssd/break-glass/<environment>/governance/allowed-framework-shas (Phase 3D),
+// which the governance stack owns; this stack never creates it.
 import { assertSeparated, breakGlassArns, breakGlassNames, HANDLERS, INTERACTIONS_RESERVED_CONCURRENCY, LAMBDA_ARCHITECTURE, LAMBDA_MEMORY_MB, LAMBDA_RUNTIME, LAMBDA_TIMEOUT_SECONDS, LOG_RETENTION_DAYS, TABLE_KEY, TTL_ATTRIBUTE } from '../break-glass/names.mjs';
 import { executionRolePolicy, executionTrustPolicy } from '../policy/break-glass.mjs';
 import { retained, ssdTags, template } from './common.mjs';
@@ -163,6 +166,8 @@ export function renderBreakGlassTemplate({ operator, environment, partition }) {
   resources[L.ciFunction] = fn('ci', {
     TABLE_NAME: n.table,
     SLACK_CHANNEL_ID: env.slackChannelId,
+    // Phase 3D: selects this environment's framework policy parameter.
+    BREAK_GLASS_ENVIRONMENT: environment,
     SLACK_BOT_TOKEN_SECRET_ARN: ref(L.slackBotToken)
   });
   resources[L.interactionsFunction] = fn('interactions', {

@@ -14,7 +14,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const TESTS = [
+export const TESTS = [
   'test/onboarding-config.test.js',
   'test/onboarding-coverage.test.js',
   'test/onboarding-render.test.js',
@@ -50,7 +50,7 @@ const TESTS = [
 ];
 
 // [invariant, file, search, replace]
-const MUTATIONS = [
+export const MUTATIONS = [
   ['generated Gitleaks config keeps the default ruleset', 'onboarding/lib/render.mjs', "'useDefault = true'", "'useDefault = false'"],
   ['delivery never runs log-only', 'onboarding/lib/render.mjs', "const gateMode = phase === 'delivery' ? 'enforce' : config.rollout.gateMode;", 'const gateMode = config.rollout.gateMode;'],
   ['no delivery workflow exists while log-only', 'onboarding/lib/render.mjs', "if (isEcrProfile(config.profile) && config.rollout.gateMode === 'enforce') {", 'if (isEcrProfile(config.profile)) {'],
@@ -457,7 +457,28 @@ const MUTATIONS = [
   ['verify: the interaction reservation must equal the contract', 'onboarding/aws/break-glass/verify.mjs', 'reserved === INTERACTIONS_RESERVED_CONCURRENCY ? []', 'true ? []'],
   ['verify: the interaction concurrency check is required', 'onboarding/aws/break-glass/verify.mjs', "  const required = role === 'interactions';", '  const required = false;'],
   ['plan: a reservation that does not fit the account blocks', 'onboarding/aws/break-glass/plan.mjs', '  if (left < MIN_UNRESERVED_CONCURRENCY) {', '  if (false) {'],
-  ['plan: Lambda keeps 100 unreserved', 'onboarding/aws/break-glass/names.mjs', 'export const MIN_UNRESERVED_CONCURRENCY = 100;', 'export const MIN_UNRESERVED_CONCURRENCY = 0;']
+  ['plan: Lambda keeps 100 unreserved', 'onboarding/aws/break-glass/names.mjs', 'export const MIN_UNRESERVED_CONCURRENCY = 100;', 'export const MIN_UNRESERVED_CONCURRENCY = 0;'],
+  // --- Phase 3D (C4): the shared stacks' framework-policy read and CI environment ---
+  ["C4: the CI function names its environment", 'onboarding/aws/templates/shared-break-glass.mjs', "    // Phase 3D: selects this environment's framework policy parameter.\n    BREAK_GLASS_ENVIRONMENT: environment,\n", ""],
+  ["C4: the CI function names ITS OWN environment", 'onboarding/aws/templates/shared-break-glass.mjs', "    BREAK_GLASS_ENVIRONMENT: environment,\n    SLACK_BOT_TOKEN_SECRET_ARN: ref(L.slackBotToken)\n  });", "    BREAK_GLASS_ENVIRONMENT: 'production',\n    SLACK_BOT_TOKEN_SECRET_ARN: ref(L.slackBotToken)\n  });"],
+  ["C4: verify requires the CI environment variable", 'onboarding/aws/break-glass/verify.mjs', "SLACK_CHANNEL_ID: slackChannelId, BREAK_GLASS_ENVIRONMENT: environment, SLACK_BOT_TOKEN_SECRET_ARN", "SLACK_CHANNEL_ID: slackChannelId, SLACK_BOT_TOKEN_SECRET_ARN"],
+  ["C4: both functions get the governance read", 'onboarding/aws/policy/break-glass.mjs', "  statements.push({ Sid: 'ReadFrameworkPolicy', Effect: 'Allow', Action: 'ssm:GetParameter', Resource: a.frameworkPolicyParameter });\n", ""],
+  ["C4: the interaction function gets the governance read", 'onboarding/aws/policy/break-glass.mjs', "  statements.push({ Sid: 'ReadFrameworkPolicy', Effect: 'Allow', Action: 'ssm:GetParameter', Resource: a.frameworkPolicyParameter });", "  if (role === 'ci') statements.push({ Sid: 'ReadFrameworkPolicy', Effect: 'Allow', Action: 'ssm:GetParameter', Resource: a.frameworkPolicyParameter });"],
+  ["C4: the CI function gets the governance read", 'onboarding/aws/policy/break-glass.mjs', "  statements.push({ Sid: 'ReadFrameworkPolicy', Effect: 'Allow', Action: 'ssm:GetParameter', Resource: a.frameworkPolicyParameter });", "  if (role === 'interactions') statements.push({ Sid: 'ReadFrameworkPolicy', Effect: 'Allow', Action: 'ssm:GetParameter', Resource: a.frameworkPolicyParameter });"],
+  ["C4: the governance read is one ARN, never governance/*", 'onboarding/aws/policy/break-glass.mjs', "Resource: a.frameworkPolicyParameter });", "Resource: a.frameworkPolicyParameter.replace(/allowed-framework-shas$/, '*') });"],
+  ["C4: the governance read is never Resource *", 'onboarding/aws/policy/break-glass.mjs', "Resource: a.frameworkPolicyParameter });", "Resource: '*' });"],
+  ["C4: the governance read never admits the other environment", 'onboarding/aws/policy/break-glass.mjs', "Resource: a.frameworkPolicyParameter });", "Resource: [a.frameworkPolicyParameter, breakGlassArns(otherEnvironment(environment), target).frameworkPolicyParameter] });"],
+  ["C4: the governance read is never ssm:*", 'onboarding/aws/policy/break-glass.mjs', "Sid: 'ReadFrameworkPolicy', Effect: 'Allow', Action: 'ssm:GetParameter',", "Sid: 'ReadFrameworkPolicy', Effect: 'Allow', Action: 'ssm:*',"],
+  ["C4: the governance read never writes", 'onboarding/aws/policy/break-glass.mjs', "Sid: 'ReadFrameworkPolicy', Effect: 'Allow', Action: 'ssm:GetParameter',", "Sid: 'ReadFrameworkPolicy', Effect: 'Allow', Action: ['ssm:GetParameter', 'ssm:PutParameter'],"],
+  ["C4: the CI function never reads approvers", 'onboarding/aws/policy/break-glass.mjs', "  // Both functions check the framework commit (Phase 3D): one exact ARN,", "  if (role === 'ci') statements.push({ Sid: 'ReadApprovers', Effect: 'Allow', Action: 'ssm:GetParameter', Resource: a.approverParameters });\n  // Both functions check the framework commit (Phase 3D): one exact ARN,"],
+  ["C4: the interaction function keeps its approver read", 'onboarding/aws/policy/break-glass.mjs', ",\n      { Sid: 'ReadApprovers', Effect: 'Allow', Action: 'ssm:GetParameter', Resource: a.approverParameters }\n", "\n"],
+  ["C4: the governance read is a required probe", 'onboarding/aws/policy/break-glass.mjs', "    probe('ssm:GetParameter', a.frameworkPolicyParameter, role === 'ci'", "    probe('ssm:GetParameter', a.approverParameterSample, role === 'ci'"],
+  ["C4: the other environment's governance read is a denied probe", 'onboarding/aws/policy/break-glass.mjs', "    probe('ssm:GetParameter', o.frameworkPolicyParameter, `the ${environment} ${role} role must never read ${other}'s allowed framework commits`, FAIL),\n", ""],
+  ["C4: writing the governance parameter is a denied probe", 'onboarding/aws/policy/break-glass.mjs', "    ...['ssm:PutParameter', 'ssm:DeleteParameter', 'ssm:LabelParameterVersion', 'ssm:AddTagsToResource'].map(", "    ...[].map("],
+  ["C4: governance/* is a denied probe", 'onboarding/aws/policy/break-glass.mjs', "    probe('ssm:GetParameter', a.governanceSiblingSample, 'the framework policy grant is one parameter, never governance/*', FAIL),\n", ""],
+  ["C4: the governance parameter is per environment", 'onboarding/aws/break-glass/names.mjs', "    frameworkPolicyParameter: `/ssd/break-glass/${environment}/governance/allowed-framework-shas`", "    frameworkPolicyParameter: '/ssd/break-glass/governance/allowed-framework-shas'"],
+  ["C4: the governance parameter name matches the broker", 'onboarding/aws/break-glass/names.mjs', "    frameworkPolicyParameter: `/ssd/break-glass/${environment}/governance/allowed-framework-shas`", "    frameworkPolicyParameter: `/ssd/break-glass/${environment}/governance/allowed-shas`"],
+  ["C4: the rendered template has no unrelated change", 'onboarding/aws/templates/shared-break-glass.mjs', "ssd-onboard ${environment} break-glass ${role === 'ci' ? 'CI broker (IAM invoke only, no URL)'", "ssd-onboard ${environment} break-glass ${role === 'ci' ? 'CI broker (IAM invoke only)'"],
 ];
 
 // Temp-workspace lifecycle
