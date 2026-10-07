@@ -7,10 +7,21 @@ name: Lambda break-glass (reusable)
 #   break-glass:
 #     needs: source-security
 #     if: ${{ always() && needs.source-security.outputs.break_glass_delegated == 'true' }}
-#     uses: IamRitz/ssd-security-framework/.github/workflows/_break-glass-lambda.yml@v1
+#     uses: IamRitz/ssd-security-framework/.github/workflows/_break-glass-lambda.yml@<40-hex SHA>
 #     permissions:
 #       contents: read
 #       id-token: write
+#
+# CALL IT BY EXACT SHA (recommended supply-chain hardening). A tag or branch
+# also works, but only while it resolves to a framework commit the broker's
+# environment admits: the broker authorizes the resolved `job_workflow_sha`,
+# never the ref spelling (docs/break-glass-repositories.md).
+#
+# FRAMEWORK BINDING. Before any framework code runs, the first step reads this
+# workflow's own commit (`job_workflow_sha`) from a GitHub OIDC token and the
+# toolkit is checked out at exactly that commit; `toolkit_ref` selects nothing.
+# Every `run:` step of a job with `id-token: write` can mint tokens, so scripts
+# from any other ref would act under this commit's identity.
 #
 # CREDENTIAL BOUNDARY. This job obtains AWS credentials, so it runs NOTHING the
 # consumer controls:
@@ -33,9 +44,10 @@ name: Lambda break-glass (reusable)
 # credential in its own right and reaches the notifier step ONLY; the Lambda
 # transport itself needs no secret.
 #
-# RECOMMENDED AWS TRUST POLICY: pin the invoker role's `job_workflow_ref` claim
-# to this file (IamRitz/ssd-security-framework/.github/workflows/_break-glass-lambda.yml@<ref>),
-# so only this reviewed job can assume it — not any job in the consumer repo.
+# AWS TRUST. The invoker role (provisioned by `ssd-onboard aws plan --scope
+# break-glass-repo`) trusts the repository's `pull_request` runs and may only
+# invoke the CI broker. Which job and which framework commit may file a request
+# is decided by the broker from the verified identity token, not by the role.
 #
 # OUTCOME. The job fails unless a verified approval for this exact gate exists.
 # Denied, expired, timeout, refused, malformed, and unreachable all fail. The
@@ -47,9 +59,10 @@ on:
     inputs:
       toolkit_ref:
         description: >-
-          Ref of IamRitz/ssd-security-framework to load the toolkit from. MUST match the ref this
-          workflow is called at (see docs/versioning.md). The repository itself is fixed: this job
-          holds credentials, so its validation code cannot be pointed at another repository.
+          IGNORED for checkout, kept for v1 compatibility. This workflow always loads the toolkit
+          from its own commit (job_workflow_sha, read from a GitHub OIDC token before any framework
+          code runs); a different value only produces a notice. The repository is fixed too: this
+          job holds credentials, so neither its code nor its commit can be chosen by a caller.
         type: string
         default: v1
       node_version:
@@ -164,24 +177,96 @@ jobs:
       request_id: ${{ steps.result.outputs.request_id }}
 
     steps:
+      # ---- binding: this workflow's own commit, before ANY framework code ----
+
+      - name: Bind to this workflow's own framework commit
+        # The FIRST step, and inline: no action, no checkout, no framework
+        # script has run yet. It mints a GitHub OIDC token for an audience
+        # nothing accepts (AWS needs sts.amazonaws.com, the broker
+        # ssd-break-glass), masks it at once, and reads two claims:
+        #   job_workflow_sha  must be 40 lower-case hex: THE framework commit;
+        #   job_workflow_ref  must name this repository (case-insensitively, as
+        #                     GitHub names are) and exactly this workflow path.
+        #                     Its ref part (SHA, tag or branch) authorizes nothing.
+        # The token never reaches argv, a file, an output or the log.
+        # It is NOT signature-verified here: the claims are those GitHub's OIDC
+        # issuance endpoint returned to this job over HTTPS. The broker's own
+        # verification of the ssd-break-glass token stays the independent
+        # cryptographic check.
+        id: bind-framework-commit
+        env:
+          BINDING_AUDIENCE: ssd-framework-binding
+          FRAMEWORK_REPOSITORY: IamRitz/ssd-security-framework
+          WORKFLOW_PATH: .github/workflows/_break-glass-lambda.yml
+        run: |
+          set -euo pipefail
+          fail() {
+            echo "::error::Framework binding refused: $1. No framework code has run; the BLOCK stands." >&2
+            exit 1
+          }
+          url="${ACTIONS_ID_TOKEN_REQUEST_URL:-}"
+          request_token="${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}"
+          [ -n "$url" ] && [ -n "$request_token" ] || fail "GitHub OIDC is not available to this job"
+          case "$url" in https://*) ;; *) fail "the OIDC token URL is not HTTPS" ;; esac
+          case "$url" in *\?*) url="$url&audience=$BINDING_AUDIENCE" ;; *) url="$url?audience=$BINDING_AUDIENCE" ;; esac
+          # The request credential goes in on stdin, never in argv.
+          response="$(curl --silent --show-error --fail --max-time 15 --header @- "$url" <<<"Authorization: bearer $request_token")" \
+            || fail "the OIDC token request failed"
+          unset request_token
+          token="$(jq -r 'if (.value | type) == "string" then .value else empty end' <<<"$response" 2>/dev/null || true)"
+          unset response
+          [[ "$token" =~ ^[A-Za-z0-9_-]+\.([A-Za-z0-9_-]+)\.[A-Za-z0-9_-]+$ ]] || fail "the OIDC token response carries no token"
+          payload="${BASH_REMATCH[1]}"
+          echo "::add-mask::$token"
+          unset token
+          payload="${payload//-/+}"
+          payload="${payload//_//}"
+          while (( ${#payload} % 4 )); do payload="$payload="; done
+          claims="$(base64 --decode <<<"$payload" 2>/dev/null)" || fail "the OIDC token payload is not base64url"
+          # A claim is read only if it is a string with no control character:
+          # command substitution strips trailing newlines, so "<sha>\n" must
+          # never come back as "<sha>".
+          claim() {
+            jq -r --arg name "$1" 'if (.[$name] | type) == "string" and (.[$name] | test("[\u0000-\u001f\u007f]") | not) then .[$name] else empty end' <<<"$claims" 2>/dev/null || true
+          }
+          sha="$(claim job_workflow_sha)"
+          ref="$(claim job_workflow_ref)"
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || fail "job_workflow_sha is not a 40-character lower-case commit SHA"
+          [[ "$ref" =~ ^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/(.+)$ ]] || fail "job_workflow_ref is malformed"
+          repository="${BASH_REMATCH[1]}"
+          rest="${BASH_REMATCH[2]}"
+          [ "${repository,,}" = "${FRAMEWORK_REPOSITORY,,}" ] || fail "job_workflow_ref names another repository"
+          called_as="${rest#"$WORKFLOW_PATH@"}"
+          [ "$called_as" != "$rest" ] || fail "job_workflow_ref names another workflow"
+          [ -n "$called_as" ] || fail "job_workflow_ref carries no ref"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Bound to framework commit $sha."
+
       # ---- before any credential: framework code and this run's evidence only ----
 
       - name: Check out the security framework toolkit
         # The ONLY checkout in this job, and it is the framework — never the
-        # consumer. The repository is fixed, not an input.
+        # consumer. The repository is fixed, and the commit is the one the
+        # binding step read from GitHub's OIDC claims: never a caller-supplied ref.
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: IamRitz/ssd-security-framework
-          ref: ${{ inputs.toolkit_ref }}
+          ref: ${{ steps.bind-framework-commit.outputs.sha }}
           path: .ssd-toolkit-checkout
           persist-credentials: false
 
       - name: Place the toolkit outside the workspace
+        # SSD_TOOLKIT exists only after HEAD is proven to be the bound commit,
+        # so no framework script can run from anything else.
         env:
+          BOUND_SHA: ${{ steps.bind-framework-commit.outputs.sha }}
           TOOLKIT_REF: ${{ inputs.toolkit_ref }}
         run: |
           set -euo pipefail
-          test -n "$TOOLKIT_REF" || { echo "toolkit_ref is empty." >&2; exit 1; }
+          [[ "$BOUND_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::No bound framework commit." >&2; exit 1; }
+          head="$(git -C .ssd-toolkit-checkout rev-parse HEAD)"
+          [ "$head" = "$BOUND_SHA" ] || { echo "::error::The toolkit checkout is $head, not the bound framework commit $BOUND_SHA." >&2; exit 1; }
+          if [ "$TOOLKIT_REF" != "$BOUND_SHA" ]; then echo "::notice::toolkit_ref is ignored: this workflow always loads the toolkit from its own commit, $BOUND_SHA."; fi
           rm -rf "$RUNNER_TEMP/ssd-toolkit"
           mv .ssd-toolkit-checkout "$RUNNER_TEMP/ssd-toolkit"
           version="$(cat "$RUNNER_TEMP/ssd-toolkit/VERSION" 2>/dev/null || true)"

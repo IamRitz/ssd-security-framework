@@ -892,9 +892,25 @@ describe('the OIDC boundary is unchanged by Phase 3A', () => {
   });
 
   it('no workflow references the identity-token minter directly; only the notify/poll scripts do', () => {
-    for (const file of ['_source-scan.yml', '_source-security.yml', '_break-glass-lambda.yml']) {
+    for (const file of ['_source-scan.yml', '_source-security.yml']) {
       assert.doesNotMatch(read(`.github/workflows/${file}`), /break-glass-oidc-token|ACTIONS_ID_TOKEN_REQUEST/);
     }
+    assert.doesNotMatch(read('.github/workflows/_break-glass-lambda.yml'), /break-glass-oidc-token/);
+  });
+
+  it('_break-glass-lambda.yml mints inline only in its binding step, and only for the inert audience', () => {
+    // Phase 3D: the first step reads job_workflow_sha from a token whose
+    // audience neither AWS (sts.amazonaws.com) nor the broker (ssd-break-glass)
+    // accepts. Broker tokens still come only from the notify/poll scripts.
+    const text = read('.github/workflows/_break-glass-lambda.yml');
+    const bindStart = text.indexOf("      - name: Bind to this workflow's own framework commit\n");
+    const bindEnd = text.indexOf('\n      - name: ', bindStart + 1);
+    assert.ok(bindStart > 0 && bindEnd > bindStart);
+    const uses = [...text.matchAll(/ACTIONS_ID_TOKEN_REQUEST/g)].map((match) => match.index);
+    assert.ok(uses.length > 0 && uses.every((at) => at > bindStart && at < bindEnd), 'the OIDC request variables are read only by the binding step');
+    const binding = text.slice(bindStart, bindEnd).split('\n').filter((line) => !/^\s*#/.test(line)).join('\n');
+    assert.match(binding, /\n {10}BINDING_AUDIENCE: ssd-framework-binding\n/);
+    assert.doesNotMatch(binding, /ssd-break-glass\b(?!-)|sts\.amazonaws\.com\n|audience=ssd-break-glass/);
   });
 
   it('the HTTP transport (the only one _source-scan.yml runs in-job) never mints a token', async () => {

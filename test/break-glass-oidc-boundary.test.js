@@ -416,6 +416,318 @@ describe('Lambda break-glass: the credential boundary', () => {
   });
 });
 
+// =================================================================================
+// FRAMEWORK BINDING (Phase 3D, docs/break-glass-repositories.md). Every `run:`
+// step of a job with `id-token: write` can mint OIDC tokens, so the code this
+// job runs must be the commit GitHub vouches for (job_workflow_sha) — never a
+// ref the caller picks (toolkit_ref). Asserted structurally AND by executing
+// the real binding and placement scripts against a stub token endpoint; each
+// mutation below must be rejected by the same check.
+const BIND_STEP = "Bind to this workflow's own framework commit";
+const PLACE_STEP = 'Place the toolkit outside the workspace';
+const BOUND_REF = 'ref: ${{ steps.bind-framework-commit.outputs.sha }}';
+const SHA = 'c'.repeat(40);
+const FRAMEWORK_REF = (ref, repository = 'IamRitz/ssd-security-framework', path = '.github/workflows/_break-glass-lambda.yml') =>
+  `${repository}/${path}@${ref}`;
+
+const BINDING_WORK = join(WORK, 'binding');
+const FAKE_BIN = join(BINDING_WORK, 'bin');
+mkdirSync(FAKE_BIN, { recursive: true });
+// Stub curl: records its argv and stdin, answers with FAKE_RESPONSE.
+writeFileSync(
+  join(FAKE_BIN, 'curl'),
+  '#!/usr/bin/env bash\nprintf \'%s\\n\' "$@" > "$FAKE_CURL_ARGS"\ncat > "$FAKE_CURL_STDIN"\n[ -z "${FAKE_CURL_FAIL:-}" ] || exit 22\nprintf \'%s\' "$FAKE_RESPONSE"\n',
+  { mode: 0o755 }
+);
+
+const b64url = (value) => Buffer.from(JSON.stringify(value)).toString('base64url');
+const jwt = (claims) => `${b64url({ alg: 'RS256', kid: 'k' })}.${b64url(claims)}.c2lnbmF0dXJl`;
+
+// A step's literal `env:` constants, read from the workflow itself (so a
+// mutated constant is what runs). Expression values are the runner's to fill
+// in, and each test supplies them.
+function stepEnv(source, name) {
+  const start = source.indexOf(`- name: ${name}\n`);
+  assert.ok(start >= 0, `step "${name}" not found`);
+  const lines = source.slice(start).split('\n').slice(1);
+  const envAt = lines.findIndex((line) => /^ {8}env:\s*$/.test(line));
+  const nextStep = lines.findIndex((line) => /^ {6}- name: /.test(line));
+  if (envAt === -1 || (nextStep !== -1 && envAt > nextStep)) return {};
+  const env = {};
+  for (const line of lines.slice(envAt + 1)) {
+    const match = /^ {10}([A-Z_][A-Z0-9_]*): (.*)$/.exec(line);
+    if (!match) break;
+    if (!match[2].includes('${{')) env[match[1]] = match[2];
+  }
+  return env;
+}
+
+let runCounter = 0;
+// Runs one step's real script with bash, as the runner does.
+function runStep(source, name, env, cwd = BINDING_WORK) {
+  runCounter += 1;
+  const scriptPath = join(BINDING_WORK, `step-${runCounter}.sh`);
+  writeFileSync(scriptPath, stepScript(source, name));
+  const output = join(BINDING_WORK, `output-${runCounter}`);
+  const githubEnv = join(BINDING_WORK, `env-${runCounter}`);
+  writeFileSync(output, '');
+  writeFileSync(githubEnv, '');
+  const result = spawnSync('bash', ['--noprofile', '--norc', '-eo', 'pipefail', scriptPath], {
+    cwd,
+    encoding: 'utf8',
+    env: { PATH: `${FAKE_BIN}:${process.env.PATH}`, GITHUB_OUTPUT: output, GITHUB_ENV: githubEnv, ...stepEnv(source, name), ...env }
+  });
+  return { ...result, output: readFileSync(output, 'utf8'), githubEnv: readFileSync(githubEnv, 'utf8') };
+}
+
+const REQUEST_TOKEN = 'runner-request-credential';
+function bind(source, claims, extra = {}) {
+  const args = join(BINDING_WORK, `curl-args-${runCounter + 1}`);
+  const stdin = join(BINDING_WORK, `curl-stdin-${runCounter + 1}`);
+  const token = claims === null ? null : jwt(claims);
+  const result = runStep(source, BIND_STEP, {
+    ACTIONS_ID_TOKEN_REQUEST_URL: 'https://token.example.invalid/idtoken?api-version=2.0',
+    ACTIONS_ID_TOKEN_REQUEST_TOKEN: REQUEST_TOKEN,
+    FAKE_RESPONSE: JSON.stringify(token === null ? {} : { value: token }),
+    FAKE_CURL_ARGS: args,
+    FAKE_CURL_STDIN: stdin,
+    ...extra
+  });
+  const read = (path) => (existsSync(path) ? readFileSync(path, 'utf8') : '');
+  return { ...result, token, curlArgs: read(args), curlStdin: read(stdin) };
+}
+
+// The accept/refuse matrix the binding step must satisfy.
+const BINDING_CASES = [
+  { name: 'an exact-SHA call', claims: { job_workflow_sha: SHA, job_workflow_ref: FRAMEWORK_REF(SHA) }, bound: SHA },
+  { name: 'a tag call (the commit is authorized, not the spelling)', claims: { job_workflow_sha: SHA, job_workflow_ref: FRAMEWORK_REF('refs/tags/v1') }, bound: SHA },
+  { name: 'a branch call', claims: { job_workflow_sha: SHA, job_workflow_ref: FRAMEWORK_REF('refs/heads/feature/x') }, bound: SHA },
+  { name: 'the repository in another case', claims: { job_workflow_sha: SHA, job_workflow_ref: FRAMEWORK_REF(SHA, 'iamritz/SSD-Security-Framework') }, bound: SHA },
+  { name: 'another repository', claims: { job_workflow_sha: SHA, job_workflow_ref: FRAMEWORK_REF(SHA, 'evil/ssd-security-framework') } },
+  { name: 'a look-alike repository', claims: { job_workflow_sha: SHA, job_workflow_ref: FRAMEWORK_REF(SHA, 'IamRitz/ssd-security-framework-fork') } },
+  { name: 'the legacy _source-security.yml', claims: { job_workflow_sha: SHA, job_workflow_ref: FRAMEWORK_REF(SHA, undefined, '.github/workflows/_source-security.yml') } },
+  { name: 'the path in another case', claims: { job_workflow_sha: SHA, job_workflow_ref: FRAMEWORK_REF(SHA, undefined, '.github/workflows/_Break-glass-lambda.yml') } },
+  { name: 'a path that only starts with the workflow', claims: { job_workflow_sha: SHA, job_workflow_ref: FRAMEWORK_REF(SHA, undefined, '.github/workflows/_break-glass-lambda.yml.bak') } },
+  { name: 'a nested path', claims: { job_workflow_sha: SHA, job_workflow_ref: FRAMEWORK_REF(SHA, undefined, 'x/.github/workflows/_break-glass-lambda.yml') } },
+  { name: 'an empty ref', claims: { job_workflow_sha: SHA, job_workflow_ref: FRAMEWORK_REF('') } },
+  { name: 'an upper-case SHA', claims: { job_workflow_sha: SHA.toUpperCase(), job_workflow_ref: FRAMEWORK_REF(SHA) } },
+  { name: 'a short SHA', claims: { job_workflow_sha: SHA.slice(1), job_workflow_ref: FRAMEWORK_REF(SHA) } },
+  { name: 'a 41-character SHA', claims: { job_workflow_sha: `${SHA}0`, job_workflow_ref: FRAMEWORK_REF(SHA) } },
+  { name: 'a SHA inside a longer value', claims: { job_workflow_sha: `v1-${SHA}`, job_workflow_ref: FRAMEWORK_REF(SHA) } },
+  { name: 'a SHA with a trailing newline', claims: { job_workflow_sha: `${SHA}\n`, job_workflow_ref: FRAMEWORK_REF(SHA) } },
+  { name: 'a ref with a trailing newline', claims: { job_workflow_sha: SHA, job_workflow_ref: `${FRAMEWORK_REF(SHA)}\n` } },
+  { name: 'a non-string SHA', claims: { job_workflow_sha: 7, job_workflow_ref: FRAMEWORK_REF(SHA) } },
+  { name: 'no job_workflow_sha', claims: { job_workflow_ref: FRAMEWORK_REF(SHA) } },
+  { name: 'no job_workflow_ref', claims: { job_workflow_sha: SHA } },
+  { name: 'no token in the response', claims: null }
+];
+
+function assertBindingBehaviour(source) {
+  for (const testCase of BINDING_CASES) {
+    const result = bind(source, testCase.claims);
+    if (testCase.bound) {
+      assert.equal(result.status, 0, `${testCase.name}: must bind (${result.stderr})`);
+      assert.equal(result.output, `sha=${testCase.bound}\n`, `${testCase.name}: must output exactly the bound commit`);
+      // The token is printed only to mask it, before anything else uses it, and
+      // the runner's request credential never reaches argv.
+      const lines = result.stdout.split('\n');
+      assert.equal(lines.filter((line) => line.includes(result.token)).join('\n'), `::add-mask::${result.token}`, `${testCase.name}: the token must be masked and never printed`);
+      assert.ok(!result.curlArgs.includes(REQUEST_TOKEN), `${testCase.name}: the request credential must not be in argv`);
+      assert.equal(result.curlStdin, `Authorization: bearer ${REQUEST_TOKEN}\n`, `${testCase.name}: the request credential goes in on stdin`);
+      assert.match(result.curlArgs, /\nhttps:\/\/token\.example\.invalid\/idtoken\?api-version=2\.0&audience=ssd-framework-binding\n/, `${testCase.name}: the token must be for the inert binding audience`);
+    } else {
+      assert.notEqual(result.status, 0, `${testCase.name}: must be refused`);
+      assert.equal(result.output, '', `${testCase.name}: a refusal must output no commit`);
+    }
+  }
+  const unavailable = bind(source, { job_workflow_sha: SHA, job_workflow_ref: FRAMEWORK_REF(SHA) }, { ACTIONS_ID_TOKEN_REQUEST_TOKEN: '' });
+  assert.notEqual(unavailable.status, 0, 'no OIDC for the job must be refused');
+  const failed = bind(source, { job_workflow_sha: SHA, job_workflow_ref: FRAMEWORK_REF(SHA) }, { FAKE_CURL_FAIL: '1' });
+  assert.notEqual(failed.status, 0, 'a failed token request must be refused');
+  assert.equal(failed.output, '');
+  const plainHttp = bind(source, { job_workflow_sha: SHA, job_workflow_ref: FRAMEWORK_REF(SHA) }, { ACTIONS_ID_TOKEN_REQUEST_URL: 'http://token.example.invalid/idtoken' });
+  assert.notEqual(plainHttp.status, 0, 'a non-HTTPS token URL must be refused');
+}
+
+// A throwaway framework checkout whose HEAD is known.
+function fakeCheckout() {
+  runCounter += 1;
+  const dir = join(BINDING_WORK, `checkout-${runCounter}`);
+  const repo = join(dir, '.ssd-toolkit-checkout');
+  mkdirSync(join(repo, 'security'), { recursive: true });
+  writeFileSync(join(repo, 'VERSION'), read('VERSION'));
+  const git = (...args) => {
+    const r = spawnSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@example.invalid', '-c', 'commit.gpgsign=false', ...args], { cwd: repo, encoding: 'utf8' });
+    assert.equal(r.status, 0, r.stderr);
+    return r.stdout.trim();
+  };
+  git('init', '-q');
+  git('add', '-A');
+  git('commit', '-q', '-m', 'toolkit');
+  return { dir, head: git('rev-parse', 'HEAD') };
+}
+
+function place(source, { bound, toolkitRef }) {
+  const { dir, head } = fakeCheckout();
+  const runnerTemp = join(dir, 'runner-temp');
+  mkdirSync(runnerTemp);
+  const result = runStep(source, PLACE_STEP, {
+    BOUND_SHA: bound(head),
+    TOOLKIT_REF: toolkitRef(head),
+    RUNNER_TEMP: runnerTemp,
+    SSD_REQUIRED_TOOLKIT_MAJOR: '1'
+  }, dir);
+  return { ...result, head, placed: existsSync(join(runnerTemp, 'ssd-toolkit')) };
+}
+
+function assertPlacementBehaviour(source) {
+  const ok = place(source, { bound: (head) => head, toolkitRef: (head) => head });
+  assert.equal(ok.status, 0, ok.stderr);
+  assert.match(ok.githubEnv, /^SSD_TOOLKIT=/m, 'the toolkit is exported once HEAD is proven');
+  assert.ok(!/::notice::/.test(ok.stdout), 'a matching toolkit_ref needs no notice');
+
+  const ignored = place(source, { bound: (head) => head, toolkitRef: () => 'v1' });
+  assert.equal(ignored.status, 0, 'a different toolkit_ref must not fail the job');
+  assert.match(ignored.stdout, /::notice::toolkit_ref is ignored/, 'a different toolkit_ref yields a notice');
+  assert.ok(!ignored.stdout.includes('::notice::') || !/v1/.test(ignored.stdout.split('::notice::')[1].split('\n')[0]), 'the notice must not echo the caller\'s value');
+
+  const moved = place(source, { bound: () => 'd'.repeat(40), toolkitRef: (head) => head });
+  assert.notEqual(moved.status, 0, 'a checkout whose HEAD is not the bound commit must be refused');
+  assert.ok(!/SSD_TOOLKIT=/.test(moved.githubEnv), 'a refused checkout must never be exported');
+  assert.ok(!moved.placed, 'a refused checkout must never be placed');
+
+  const unbound = place(source, { bound: () => '', toolkitRef: (head) => head });
+  assert.notEqual(unbound.status, 0, 'no bound commit must be refused');
+  assert.ok(!/SSD_TOOLKIT=/.test(unbound.githubEnv));
+}
+
+// The structural half: ordering, and what each step may reference.
+function assertBindingStructure(source) {
+  const body = executable(source);
+  const jobSteps = [...body.matchAll(/\n {6}- name: ([^\n]+)/g)].map((m) => ({ name: m[1], at: m.index }));
+  const text = (i) => body.slice(jobSteps[i].at, jobSteps[i + 1]?.at ?? body.length);
+  const bindAt = jobSteps.findIndex((step) => step.name === BIND_STEP);
+  const checkouts = jobSteps.map((_, i) => i).filter((i) => /actions\/checkout@/.test(text(i)));
+  const placeAt = jobSteps.findIndex((step) => step.name === PLACE_STEP);
+
+  assert.equal(bindAt, 0, 'binding must be the job\'s first step: nothing may run before it');
+  const binding = text(bindAt);
+  assert.match(binding, /\n\s+id: bind-framework-commit\n/);
+  assert.ok(!/\buses:|continue-on-error|\n\s+if:/.test(binding), 'binding must be inline, unconditional and never masked');
+  assert.ok(!/\bnode\b|SSD_TOOLKIT|scripts\/|toolkit_ref/.test(binding), 'binding must run no framework script and read no caller ref');
+
+  assert.equal(checkouts.length, 1, 'exactly one checkout');
+  const checkout = text(checkouts[0]);
+  assert.ok(checkouts[0] > bindAt, 'the toolkit must be checked out only after binding');
+  assert.equal(checkout.match(/\n\s+ref: [^\n]*/g)?.map((l) => l.trim()).join('|'), BOUND_REF, 'the checkout ref must be the bound commit');
+  assert.ok(!/\n\s+if:|continue-on-error/.test(checkout), 'the checkout must depend on binding success only');
+
+  assert.equal(placeAt, checkouts[0] + 1, 'the HEAD check must follow the checkout directly');
+  const placement = text(placeAt);
+  assert.ok(!/continue-on-error|\n\s+if:/.test(placement));
+  assert.match(placement, /\n\s+BOUND_SHA: \$\{\{ steps\.bind-framework-commit\.outputs\.sha \}\}\n/);
+  const headCheck = placement.indexOf('[ "$head" = "$BOUND_SHA" ]');
+  assert.ok(headCheck > placement.indexOf('git -C .ssd-toolkit-checkout rev-parse HEAD'), 'HEAD must be compared with the bound commit');
+  assert.ok(headCheck >= 0 && headCheck < placement.indexOf('mv .ssd-toolkit-checkout') && headCheck < placement.indexOf('SSD_TOOLKIT='), 'HEAD must be proven before the toolkit is placed or exported');
+
+  // toolkit_ref reaches exactly one place: the notice comparison.
+  assert.equal((body.match(/inputs\.toolkit_ref/g) ?? []).length, 1, 'toolkit_ref may only feed the notice');
+  assert.match(placement, /\n\s+TOOLKIT_REF: \$\{\{ inputs\.toolkit_ref \}\}\n/);
+  const refLines = placement.split('\n').filter((line) => line.includes('TOOLKIT_REF') && !/TOOLKIT_REF: \$\{\{/.test(line)).map((l) => l.trim());
+  assert.deepEqual(refLines.length, 1, 'TOOLKIT_REF is used on exactly one line');
+  assert.match(refLines[0], /^if \[ "\$TOOLKIT_REF" != "\$BOUND_SHA" \]; then echo "::notice::[^"$]*\$BOUND_SHA[^"$]*"; fi$/, 'TOOLKIT_REF may only decide whether to print a notice');
+
+  // No framework code before the toolkit is proven and placed.
+  jobSteps.forEach((step, i) => {
+    if (/\$SSD_TOOLKIT|scripts\/[a-z-]+\.mjs/.test(text(i))) {
+      assert.ok(i > placeAt, `step "${step.name}" runs framework code before the toolkit is bound and placed`);
+    }
+    if (i !== placeAt) assert.ok(!/SSD_TOOLKIT=/.test(text(i)), `only the placement step may define SSD_TOOLKIT (found in "${step.name}")`);
+  });
+}
+
+function assertFrameworkBinding(source) {
+  assertBindingStructure(source);
+  assertBindingBehaviour(source);
+  assertPlacementBehaviour(source);
+}
+
+describe('Lambda break-glass: the framework binding (job_workflow_sha)', () => {
+  const bg = read('.github/workflows/_break-glass-lambda.yml');
+
+  it('binds first, checks out only the bound commit, proves HEAD, and lets toolkit_ref select nothing', () => {
+    assertBindingStructure(bg);
+  });
+
+  for (const testCase of BINDING_CASES) {
+    it(`${testCase.bound ? 'binds' : 'refuses'}: ${testCase.name}`, () => {
+      const result = bind(bg, testCase.claims);
+      if (testCase.bound) {
+        assert.equal(result.status, 0, result.stderr);
+        assert.equal(result.output, `sha=${testCase.bound}\n`);
+      } else {
+        assert.notEqual(result.status, 0);
+        assert.equal(result.output, '');
+        assert.match(result.stderr, /::error::Framework binding refused: /);
+      }
+    });
+  }
+
+  it('masks the token, keeps the request credential out of argv, and uses the inert audience', () => {
+    assertBindingBehaviour(bg);
+  });
+
+  it('places the toolkit only when HEAD is the bound commit; a different toolkit_ref is a notice', () => {
+    assertPlacementBehaviour(bg);
+  });
+
+  describe('mutations the binding check must reject', () => {
+    const swapSteps = (text, a, b) => {
+      const start = (name) => text.indexOf(`      - name: ${name}\n`);
+      const end = (name) => {
+        const n = text.indexOf('\n      - name:', start(name) + 1);
+        return n === -1 ? text.length : n + 1;
+      };
+      const [first, second] = start(a) < start(b) ? [a, b] : [b, a];
+      const A = text.slice(start(first), end(first));
+      const B = text.slice(start(second), end(second));
+      return text.slice(0, start(first)) + B + text.slice(end(first), start(second)) + A + text.slice(end(second));
+    };
+    const drop = (text, line) => text.replace(`${line}\n`, '');
+    const cases = {
+      'checkout before binding': swapSteps(bg, BIND_STEP, 'Check out the security framework toolkit'),
+      'checkout ref from toolkit_ref': bg.replace(`          ${BOUND_REF}\n`, '          ref: ${{ inputs.toolkit_ref }}\n'),
+      'checkout ref from toolkit_ref when set': bg.replace(`          ${BOUND_REF}\n`, '          ref: ${{ inputs.toolkit_ref || steps.bind-framework-commit.outputs.sha }}\n'),
+      'repository check removed': drop(bg, '          [ "${repository,,}" = "${FRAMEWORK_REPOSITORY,,}" ] || fail "job_workflow_ref names another repository"'),
+      'repository compared by suffix': bg.replace('[ "${repository,,}" = "${FRAMEWORK_REPOSITORY,,}" ]', '[[ "${repository,,}" == *"ssd-security-framework" ]]'),
+      'repository compared case-sensitively': bg.replace('[ "${repository,,}" = "${FRAMEWORK_REPOSITORY,,}" ]', '[ "$repository" = "$FRAMEWORK_REPOSITORY" ]'),
+      'path check removed': drop(bg, '          [ "$called_as" != "$rest" ] || fail "job_workflow_ref names another workflow"'),
+      'path compared case-insensitively': bg.replace('called_as="${rest#"$WORKFLOW_PATH@"}"', 'called_as="${rest,,}"; called_as="${called_as#"${WORKFLOW_PATH,,}@"}"'),
+      'empty ref accepted': drop(bg, '          [ -n "$called_as" ] || fail "job_workflow_ref carries no ref"'),
+      'SHA validation removed': drop(bg, '          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || fail "job_workflow_sha is not a 40-character lower-case commit SHA"'),
+      'SHA validation case-insensitive': bg.replace('[[ "$sha" =~ ^[0-9a-f]{40}$ ]]', '[[ "$sha" =~ ^[0-9a-fA-F]{40}$ ]]'),
+      'SHA validation unanchored': bg.replace('[[ "$sha" =~ ^[0-9a-f]{40}$ ]]', '[[ "$sha" =~ [0-9a-f]{40} ]]'),
+      'control characters allowed in claims': bg.replace(' and (.[$name] | test("[\\u0000-\\u001f\\u007f]") | not)', ''),
+      'token no longer masked': drop(bg, '          echo "::add-mask::$token"'),
+      'request credential passed in argv': bg.replace('--header @- "$url" <<<"Authorization: bearer $request_token"', '--header "Authorization: bearer $request_token" "$url"'),
+      'binding audience changed to the broker\'s': bg.replace('BINDING_AUDIENCE: ssd-framework-binding', 'BINDING_AUDIENCE: ssd-break-glass'),
+      'binding masked with continue-on-error': bg.replace('        id: bind-framework-commit\n', '        id: bind-framework-commit\n        continue-on-error: true\n'),
+      'HEAD equality check removed': drop(bg, '          [ "$head" = "$BOUND_SHA" ] || { echo "::error::The toolkit checkout is $head, not the bound framework commit $BOUND_SHA." >&2; exit 1; }'),
+      'toolkit_ref used to move the checkout': bg.replace('          rm -rf "$RUNNER_TEMP/ssd-toolkit"\n', '          git -C .ssd-toolkit-checkout checkout -q "$TOOLKIT_REF"\n          rm -rf "$RUNNER_TEMP/ssd-toolkit"\n'),
+      'framework script before binding': bg.replace(`      - name: ${BIND_STEP}\n`, '      - name: Prepare\n        run: node "$SSD_TOOLKIT/scripts/break-glass-evidence.mjs"\n\n' + `      - name: ${BIND_STEP}\n`),
+      'framework script inside binding': bg.replace('          set -euo pipefail\n          fail() {', '          set -euo pipefail\n          node "$SSD_TOOLKIT/scripts/break-glass-evidence.mjs"\n          fail() {'),
+      'framework script before placement': swapSteps(bg, PLACE_STEP, 'Validate the gate evidence and resolve the broker before any credential')
+    };
+    for (const [name, mutated] of Object.entries(cases)) {
+      it(`rejects: ${name}`, () => {
+        assert.notEqual(mutated, bg, 'the mutation must change the workflow');
+        // Rejected by a real check, not because the harness lost a step.
+        assert.throws(() => assertFrameworkBinding(mutated), (error) => !/not found|has no multi-line run script/.test(error.message));
+      });
+    }
+  });
+});
+
 describe('Lambda break-glass callers: only the break-glass job holds OIDC', () => {
   const source = read('examples/container-ecr/security.yml');
   it('exactly one job is granted id-token, and it is the break-glass job', () => {
