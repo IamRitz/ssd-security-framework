@@ -127,6 +127,17 @@ Two things contain the consequences:
    repository's default branch — an unpinned, moving dependency sitting inside a
    security control.
 
+**Exception: `_break-glass-lambda.yml` (Phase 3D).** That workflow's one job
+already holds `id-token: write`, so it reads `job_workflow_sha` from an OIDC
+token in its first step and checks the toolkit out at exactly that commit.
+Its `toolkit_ref` input is kept for v1 compatibility but selects nothing; a
+different value only produces a notice. The broker authorizes that commit, not
+the ref spelling, so pinning `uses:` to an exact SHA is recommended there as
+supply-chain hardening rather than required
+([break-glass-repositories.md](break-glass-repositories.md#which-framework-code-may-ask-job_workflow_sha)).
+The scanner workflows stay as described above: they hold no OIDC permission,
+and must not gain one just to learn their own commit.
+
 What the assertion does *not* catch is a mismatch **within** a major: `@v1.2.0`
 with `toolkit_ref: v1.0.0` loads older scripts under a newer workflow and passes
 the major check. Within a major that combination is contract-compatible by

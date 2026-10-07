@@ -67,10 +67,16 @@ delegation, so a skipped or misconfigured break-glass job cannot lose it.
 Approvers may see that alert and the interactive request for the same BLOCK;
 that duplicate is deliberate (fail-safe) until something can observe delivery.
 
-Pin the invoker role's trust policy to this workflow's `job_workflow_ref`
-(`IamRitz/ssd-security-framework/.github/workflows/_break-glass-lambda.yml@<ref>`),
-so only this reviewed job — not an arbitrary job in the consumer repository —
-can assume it.
+Before any of that, the job binds itself to its own commit: its first step
+reads `job_workflow_sha` from an OIDC token and checks the framework out at
+exactly that commit, whatever `toolkit_ref` says (Phase 3D,
+[break-glass-repositories.md](break-glass-repositories.md#1-the-workflow-runs-its-own-commit-and-nothing-else)).
+
+The invoker role's trust does **not** name this workflow: AWS role trust is
+bounded to the repository's `pull_request` runs, and the role can only invoke
+the CI broker. Which job, and which framework commit, may actually file a
+request is decided by the broker from the verified token
+([below](#who-is-asking-verified-github-identity)).
 
 ### In-job break-glass (`_source-security.yml`, and HTTP in `_source-scan.yml`)
 
@@ -116,6 +122,16 @@ It cannot carry a verified identity: in `_source-scan.yml` it runs in a job
 that has no OIDC token, and that job stays OIDC-free on purpose. So an `http`
 broker trusts the repository its caller names. It is suitable for a single
 repository only, and it is never generated.
+
+**The hardened broker (Phases 3A–3D) supports the `lambda` transport only, and
+only from `_break-glass-lambda.yml`.** The `http` transport cannot carry the
+verified identity or framework commit the broker requires, so it is not a
+production path for that broker; it remains in the workflows for existing
+consumers of a separate HTTP broker. The legacy in-job `lambda` path of
+`_source-security.yml` is refused as well: its credential-bearing job runs
+code its caller controls (the consumer checkout, `toolkit_repository`,
+`toolkit_path`), so no commit of that workflow can vouch for a request
+([break-glass-repositories.md](break-glass-repositories.md#2-only-_break-glass-lambdayml-may-ask)).
 
 ## Synthetic runs are isolated by construction
 
@@ -179,10 +195,16 @@ eligibility step exactly like a real one, before any of the above matters.
   clicking simultaneously produce one decision, not two.
 - **Secrets Manager** — the Slack bot token and signing secret.
 
-**Per repository**: a dedicated OIDC invoker role that can invoke *only* the
-broker function. Verify the negative case explicitly — assuming that role and
-calling the interaction handler, the DynamoDB table, or Secrets Manager must all
-return AccessDenied. A role you have only tested positively is not scoped.
+**Per environment**: the allowed framework commits, in their own governance
+stack (Phase 3D).
+
+**Per repository** (Phase 3D, one stack per environment): a dedicated OIDC
+invoker role that can invoke *only* the CI broker function, and the
+repository's approver parameter. Verify the negative case explicitly —
+assuming that role and calling the interaction handler, the DynamoDB table, or
+Secrets Manager must all return AccessDenied. A role you have only tested
+positively is not scoped. Provisioning and the full probe list:
+[break-glass-repositories.md](break-glass-repositories.md).
 
 ## Slack
 
@@ -218,9 +240,16 @@ verifies it before anything else (`broker/identity/github-oidc.mjs`):
 | `iss` | exactly `https://token.actions.githubusercontent.com` (an enterprise-scoped issuer is refused) |
 | `aud` | exactly `ssd-break-glass` |
 | `exp` / `iat` / `nbf` | not expired; `iat` at most 300 s old and not in the future; `nbf` (when present) not in the future (30 s skew) |
-| `job_workflow_ref` | parsed into repository, path and ref: repository `IamRitz/ssd-security-framework`, path `.github/workflows/_break-glass-lambda.yml` or `.github/workflows/_source-security.yml`, ref a 40-character commit SHA equal to `job_workflow_sha` |
+| `job_workflow_ref` | parsed as `<owner>/<repo>/<path>@<ref>`: repository `IamRitz/ssd-security-framework`, compared case-insensitively (capitalization is not part of the boundary); path exactly `.github/workflows/_break-glass-lambda.yml`; a non-empty ref. The ref (a SHA, tag or branch) is recorded but authorizes nothing |
+| `job_workflow_sha` | exactly 40 lower-case hex characters: **the framework commit**. It must be in this environment's allowed set (Phase 3D, [break-glass-repositories.md](break-glass-repositories.md#3-the-broker-admits-commits-per-environment)) |
 | `event_name` / `ref` | `pull_request` with `ref` = `refs/pull/<N>/merge`; the PR number is `<N>` |
 | `jti` | accepted **once** (an atomic conditional write in the request table) |
+
+A caller may spell the reusable-workflow ref as a SHA, a tag or a branch. What
+is authorized is the commit it resolved to: when a tag moves to a commit that
+is not admitted, `job_workflow_sha` changes and the request is refused.
+Pinning callers to an exact SHA is still recommended, as supply-chain
+hardening, but it is not the authorization mechanism.
 
 What the broker then does with it:
 
@@ -237,6 +266,14 @@ What the broker then does with it:
 - **Status is bound to the filing run.** A `status` call needs its own fresh
   token whose `repository_id`, `run_id` and `run_attempt` equal the request's.
   A request id alone authorizes nothing.
+- **The framework commit is checked on `notify`, on every `status`, and again
+  when an approver clicks** (against the stored request's commit). Removing a
+  commit from the allowed set therefore also revokes its pending requests: a
+  click gets `revoked` and claims nothing. A policy that cannot be read admits
+  nothing.
+- **Secrets are read only when needed.** The CI broker reads its Slack
+  credential when it posts, so a request refused for its identity or commit
+  reads no secret.
 - **Refusals are logged with** the rejection code, any verified ids and what
   the payload claimed, so abuse is investigable. Tokens are never logged,
   stored or echoed.
@@ -250,7 +287,9 @@ guards. TTL deletion is lazy and happens only after that.
 
 `notify` writes in this order, and nothing before step 2 writes at all:
 
-1. **Check the payload shape and verify the token.** Nothing is written.
+1. **Check the payload shape, verify the token, and check its framework
+   commit** against this environment's allowed set. Nothing is written, and no
+   secret is read.
 2. **Claim the token's `jti`** with a conditional write. This is the first write.
 3. **Bind the payload to the token.** A disagreement is refused, and the token
    is already spent. This order is **intentional**: claiming first means no
@@ -295,9 +334,11 @@ request for the same run:
    - a caller pinned to an **older framework commit** sends no token, so its
      request is refused (`identity_rejected: token_missing`). The request is not
      delivered and **the BLOCK stands**;
-   - a caller that pins the framework by **tag or branch** (`@v1`) yields a
-     `job_workflow_ref` that is not a SHA and is refused. Generated callers
-     always pin an exact SHA;
+   - a request whose **framework commit is not admitted** for the environment
+     is refused (`framework_sha_not_allowed`), however the caller spelled the
+     ref: by SHA, or by a tag or branch (`@v1`) that resolved to that commit;
+   - a request from **`_source-security.yml`**'s legacy in-job path is refused
+     (`job_workflow_path_not_allowed`);
    - a request from **`workflow_dispatch`, `push`, `schedule` or
      `pull_request_target`** is refused. That includes a manually dispatched
      synthetic demo: a non-PR synthetic route needs its own, explicitly
@@ -305,8 +346,11 @@ request for the same run:
    - **pending requests filed before the hardening** have no stored identity.
      They match no status caller and authorize no approver, so they simply
      expire. That is fail-closed by design.
-3. **Create each repository's approver parameter** (below, Phase 3D) before its
-   first request. Until then, nobody is authorized for it.
+3. **Admit the framework commit and onboard each repository** (Phase 3D,
+   [break-glass-repositories.md](break-glass-repositories.md)): the
+   environment's allowed set must list the commit its callers resolve to, and
+   the repository needs its invoker role and approver parameter before its
+   first request. Until then, nobody can file for it or approve for it.
 
 ## Authorization is per repository and fail-closed
 
@@ -346,9 +390,17 @@ with no duplicates.
 
 The interaction function needs `ssm:GetParameter` on
 `arn:aws:ssm:<region>:<account>:parameter/ssd/break-glass/<environment>/approvers/*`
-and nothing broader. Phase 3C grants exactly that on the interaction function's
-execution role. Creating, owning and verifying the parameters, one per
-repository alongside its invoker role, is Phase 3D.
+for approvers, and nothing broader. Phase 3C grants exactly that on the
+interaction function's execution role. Phase 3D adds only `ssm:GetParameter` on
+its environment's exact allowed-commit parameter (the click-time check).
+Creating, owning and verifying the approver parameters, one per repository
+alongside its invoker role, is Phase 3D
+([break-glass-repositories.md](break-glass-repositories.md#approver-parameter-ssdbreak-glassenvapproversrepository_id)).
+
+**`[]` is a valid value, not an error.** It is how a repository is offboarded:
+every ssd-onboard resource is retained, so the list is emptied before anything
+is removed. `aws verify` reports `[]` as "enabled but not operationally ready"
+(a WARN), and it always authorizes nobody.
 
 ## A repository with no Slack
 

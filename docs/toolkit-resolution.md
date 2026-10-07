@@ -89,6 +89,11 @@ So the ref is stated as an input, and the risk is contained by asserting the
 toolkit's major version after checkout. See
 [`versioning.md`](versioning.md#the-toolkit_ref-duplication-and-why-it-exists).
 
+The one exception is `_break-glass-lambda.yml`, whose job holds
+`id-token: write` anyway: it binds itself to `job_workflow_sha` before any
+framework script runs and ignores `toolkit_ref`
+([break-glass-repositories.md](break-glass-repositories.md#1-the-workflow-runs-its-own-commit-and-nothing-else)).
+
 ## Access requirements
 
 `actions/checkout` fetching a second repository uses the job's `GITHUB_TOKEN`,

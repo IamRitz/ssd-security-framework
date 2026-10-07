@@ -90,8 +90,10 @@ A replacement or removal is still classified and counted by the plan, and
 `aws apply` needs `--allow-destructive <n>` for it.
 
 Not in these stacks: the per-repository invoker roles and approver parameters
-(Phase 3D), the reviewed-SHA policy (3D), and the synthetic workflow contract
-(3E). See [Phase sequence and gates](#phase-sequence-and-gates).
+and the allowed framework commits, which Phase 3D keeps in their own stacks
+([break-glass-repositories.md](break-glass-repositories.md)), and the
+synthetic workflow contract (3E). See
+[Phase sequence and gates](#phase-sequence-and-gates).
 
 ## IAM: exactly what the broker calls
 
@@ -105,6 +107,13 @@ Not in these stacks: the per-repository invoker roles and approver parameters
 | | `lambda:InvokeFunction` | its own function ARN (the async follow-up) |
 | | `ssm:GetParameter` | `parameter/ssd/break-glass/<env>/approvers/*` (Phase 3B) |
 | | `logs:CreateLogStream`, `logs:PutLogEvents` | its own log group `:*` |
+
+**Phase 3D adds** to these stacks only what the framework-commit check needs
+([break-glass-repositories.md § Changes to the shared stacks](break-glass-repositories.md#changes-to-the-shared-stacks)):
+`ssm:GetParameter` on exactly
+`parameter/ssd/break-glass/<env>/governance/allowed-framework-shas` for **both**
+execution roles, and `BREAK_GLASS_ENVIRONMENT=<env>` on the CI function. It
+adds no wildcard.
 
 `dynamodb:PutItem` on the CI role covers both the pending request and the
 one-shot OIDC replay record (`consumeTokenId`, key `oidc-jti:<sha256>`).
@@ -290,7 +299,7 @@ items land).
 | Phase | Delivers | Merge gate |
 | --- | --- | --- |
 | **3C** (this page) | the shared production and synthetic stacks: template, plan, apply, verify | live validation of the shared infrastructure on the **synthetic** stack ([below](#phase-3c-pre-merge-gate-met-on-the-synthetic-stack)) |
-| **3D** | per-repository invoker roles; approver SSM parameters `/ssd/break-glass/<environment>/approvers/<repository_id>`; the reviewed/allowed framework-SHA policy | the per-invoker-role checks of [architecture E.7](onboarding-architecture.md#e7-verification) that apply, against the synthetic stack |
+| **3D** | per-repository invoker roles; approver SSM parameters `/ssd/break-glass/<environment>/approvers/<repository_id>`; the allowed framework commits (`job_workflow_sha`) per environment, and the workflow binding that makes them meaningful ([break-glass-repositories.md](break-glass-repositories.md)) | the checks of [break-glass-repositories.md § Live validation](break-glass-repositories.md#live-validation-synthetic-only), against the synthetic stacks only |
 | **3E** | the separate synthetic workflow contract; the ported `verify-live` suite | the negative, race and timeout suite, against the synthetic stack only |
 | **Pre-production** | production in service | [below](#pre-production-gate-after-3d-and-3e) |
 
@@ -348,6 +357,12 @@ landed:
    ([onboarding.md § 3.3](onboarding.md#33-the-slack-app-org)).
 4. **Repository approver parameters onboarded** (Phase 3D), one per repository,
    before its first request. Until then nobody is authorized for it.
+5. **The production allowed-commit set applied** (Phase 3D): every listed
+   commit is an ancestor of the framework's `main` and binds its own toolkit.
+   Until then the production broker admits no request.
+6. **Production invoker roles planned, applied and verified** (Phase 3D), one
+   per onboarded repository. Phase 3D itself validates these stacks on
+   synthetic only.
 
 ## Residual limitations
 
