@@ -13,6 +13,15 @@
 // configuration, Inspector enablement or break-glass resources. Shared scope
 // NEVER holds a per-repository ECR repository or IAM role. Registry scanning
 // has no stack kind in Phase 2B (see plan.mjs): it is reported, never planned.
+//
+// Break-glass scope (Phase 3C) is the ONE narrow exception to "shared stacks
+// hold no IAM role": the two named kinds break-glass-production and
+// break-glass-synthetic may hold exactly their two Lambda execution roles
+// (and their functions, table, secrets and log groups) — nothing else, and no
+// other shared kind gains IAM roles. A break-glass kind never holds a
+// per-repository resource (ECR repository, invoker role) or an account-level
+// one (the OIDC provider, registry scanning, Inspector).
+import { BREAK_GLASS_RESOURCE_TYPES } from '../templates/shared-break-glass.mjs';
 import { REPO_LOGICAL_IDS } from '../templates/repo-ecr-delivery.mjs';
 import { OIDC_LOGICAL_ID } from '../templates/shared-github-oidc.mjs';
 
@@ -36,7 +45,9 @@ export const STACK_KINDS = Object.freeze({
   'shared-github-oidc': Object.freeze({
     scope: 'shared',
     resources: Object.freeze({ [OIDC_LOGICAL_ID]: 'AWS::IAM::OIDCProvider' })
-  })
+  }),
+  'break-glass-production': Object.freeze({ scope: 'break-glass', environment: 'production', resources: BREAK_GLASS_RESOURCE_TYPES }),
+  'break-glass-synthetic': Object.freeze({ scope: 'break-glass', environment: 'synthetic', resources: BREAK_GLASS_RESOURCE_TYPES })
 });
 
 // Resource types that are shared by nature: never in a repo-scope stack, even
@@ -44,6 +55,11 @@ export const STACK_KINDS = Object.freeze({
 const SHARED_ONLY = /^AWS::(?:IAM::OIDCProvider|ECR::RegistryScanningConfiguration|ECR::RegistryPolicy|ECR::ReplicationConfiguration|ECR::PullThroughCacheRule|InspectorV2::.+|Inspector::.+|Lambda::.+|DynamoDB::.+|SecretsManager::.+)$/;
 // Resource types that are per repository by nature: never in a shared stack.
 const REPO_ONLY = /^AWS::(?:ECR::Repository|IAM::Role)$/;
+// The only resource types a break-glass stack may hold. IAM::Role is here and
+// ONLY here among the shared kinds. Like REPO_ONLY / SHARED_ONLY this is
+// defense in depth: today every kind's exact logicalId -> type table already
+// refuses a foreign type; these guards hold if a future edit widens a table.
+const BREAK_GLASS_ONLY = /^AWS::(?:DynamoDB::Table|SecretsManager::Secret|Logs::LogGroup|IAM::Role|Lambda::(?:Function|Url|Permission|EventInvokeConfig))$/;
 
 const TEMPLATE_KEYS = new Set(['AWSTemplateFormatVersion', 'Description', 'Resources']);
 
@@ -58,6 +74,9 @@ function kindOf(stackKind) {
 function assertType(kind, stackKind, logicalId, type, where) {
   if (kind.scope === 'repo' && SHARED_ONLY.test(type)) {
     throw new ScopeError(`${where}: ${logicalId} is ${type}, a shared resource; a repo-scope plan never contains it`);
+  }
+  if (kind.scope === 'break-glass' && !BREAK_GLASS_ONLY.test(type)) {
+    throw new ScopeError(`${where}: ${logicalId} is ${type}; a break-glass stack holds only its functions, table, secrets, log groups and execution roles`);
   }
   if (kind.scope === 'shared' && REPO_ONLY.test(type)) {
     throw new ScopeError(`${where}: ${logicalId} is ${type}, a per-repository resource; a shared-scope plan never contains it`);

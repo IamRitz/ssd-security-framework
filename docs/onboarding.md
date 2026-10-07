@@ -741,7 +741,9 @@ with no duplicates.
 
 The interaction function needs `ssm:GetParameter` on
 `arn:aws:ssm:<region>:<account>:parameter/ssd/break-glass/<environment>/approvers/*`
-and nothing broader. Creating, owning and verifying the parameters is Phase 3C.
+and nothing broader. Phase 3C grants exactly that on the interaction function's
+execution role. Creating, owning and verifying the parameters, one per
+repository alongside its invoker role, is Phase 3D.
 
 ### 3.5 A repo with no Slack
 

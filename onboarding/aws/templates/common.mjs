@@ -10,7 +10,7 @@
 import { createHash } from 'node:crypto';
 
 import { SSD_TAGS } from '../discover/stacks.mjs';
-import { DELIVERY_ENVIRONMENT, canonicalSlug } from '../stack-names.mjs';
+import { BREAK_GLASS_ENVIRONMENTS, DELIVERY_ENVIRONMENT, canonicalSlug } from '../stack-names.mjs';
 
 export const TEMPLATE_FORMAT_VERSION = '2010-09-09';
 
@@ -33,14 +33,28 @@ export function sortKeys(value) {
 export const canonicalJson = (value) => `${JSON.stringify(sortKeys(value), null, 2)}\n`;
 export const sha256 = (text) => createHash('sha256').update(text).digest('hex');
 
+// The ssd:environment a stack of this scope must carry: production for every
+// Phase 2 stack; for a break-glass stack, exactly its own environment (there
+// is no default, so a break-glass stack can never fall back to production).
+export function expectedEnvironment({ scope, environment }) {
+  if (scope !== 'break-glass') {
+    return DELIVERY_ENVIRONMENT;
+  }
+  if (!BREAK_GLASS_ENVIRONMENTS.includes(environment)) {
+    throw new Error(`a break-glass stack needs its environment (production or synthetic), got '${environment}'`);
+  }
+  return environment;
+}
+
 // The ownership tags, as CloudFormation's [{ Key, Value }], sorted by key.
 // Every managed stack and resource carries them; per-repository ones also name
-// the canonical consumer repository.
-export function ssdTags({ scope, slug }) {
+// the canonical consumer repository. Break-glass stacks are shared (no
+// consumer) and carry their own environment.
+export function ssdTags({ scope, slug, environment }) {
   const tags = [
     { Key: SSD_TAGS.framework[0], Value: SSD_TAGS.framework[1] },
     { Key: SSD_TAGS.managedBy[0], Value: SSD_TAGS.managedBy[1] },
-    { Key: SSD_TAGS.environment, Value: DELIVERY_ENVIRONMENT },
+    { Key: SSD_TAGS.environment, Value: expectedEnvironment({ scope, environment }) },
     ...(scope === 'repo' ? [{ Key: SSD_TAGS.consumer, Value: canonicalSlug(slug) }] : [])
   ];
   return tags.sort((a, b) => (a.Key < b.Key ? -1 : a.Key > b.Key ? 1 : 0));

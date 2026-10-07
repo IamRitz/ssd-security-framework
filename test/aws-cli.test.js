@@ -9,7 +9,7 @@ import { join } from 'node:path';
 import { after, describe, it } from 'node:test';
 
 import * as awsCli from '../onboarding/aws/aws-cli.mjs';
-import { AwsCliError, READ_ONLY_OPERATIONS, assertReadOnly, classifyFailure, execAws, readOnlyAws, redact } from '../onboarding/aws/aws-cli.mjs';
+import { AwsCliError, EMPTY_SUCCESS_OPERATIONS, READ_ONLY_OPERATIONS, assertReadOnly, breakGlassReadAws, classifyFailure, execAws, readOnlyAws, redact } from '../onboarding/aws/aws-cli.mjs';
 import { accessDenied, awsError, fakeAws, ok } from './support/aws-fake.mjs';
 
 // A real `aws` on PATH that reports exactly what it received.
@@ -178,18 +178,21 @@ describe('read-only allowlist', () => {
 
   it('the allowlist names no mutating operation, and there is no mutating wrapper', () => {
     const MUTATING = /^(put|create|update|delete|attach|detach|tag|untag|set|execute|send|start|stop|enable|disable|register|deregister|import|modify|run|terminate|reboot|batch-delete|upload|complete|initiate|add|remove|reset|associate|disassociate|cancel|restore|replace)-/;
-    for (const [service, operations] of Object.entries(READ_ONLY_OPERATIONS)) {
-      for (const operation of Object.keys(operations)) {
-        assert.doesNotMatch(operation, MUTATING, `${service} ${operation}`);
+    for (const table of [READ_ONLY_OPERATIONS, awsCli.BREAK_GLASS_READ_OPERATIONS]) {
+      for (const [service, operations] of Object.entries(table)) {
+        for (const operation of Object.keys(operations)) {
+          assert.doesNotMatch(operation, MUTATING, `${service} ${operation}`);
+        }
       }
     }
     // The only factories are the read-only one (doctor), the planning one
-    // (aws plan, test/aws-plan-wrapper.test.js) and the per-plan apply one
-    // (aws apply, test/aws-apply-wrapper.test.js); there is no generic
-    // mutating wrapper.
+    // (aws plan, test/aws-plan-wrapper.test.js), the per-plan apply one
+    // (aws apply, test/aws-apply-wrapper.test.js) and the two Phase 3C
+    // break-glass ones (read-only verify and planning,
+    // test/aws-break-glass-plan.test.js); there is no generic mutating wrapper.
     assert.deepEqual(Object.keys(awsCli).sort(), [
-      'AwsCliError', 'DEFAULT_DEADLINE_MS', 'DEFAULT_MAX_BUFFER', 'DEFAULT_TIMEOUT_MS', 'MAX_TEMPLATE_BODY', 'PLANNING_OPERATIONS', 'READ_ONLY_OPERATIONS',
-      'applyAws', 'applyOperations', 'assertApply', 'assertPlanning', 'assertReadOnly', 'classifyFailure', 'execAws', 'executeArgv', 'planningAws', 'readOnlyAws', 'redact'
+      'AwsCliError', 'BREAK_GLASS_PLANNING_OPERATIONS', 'BREAK_GLASS_READ_OPERATIONS', 'DEFAULT_DEADLINE_MS', 'DEFAULT_MAX_BUFFER', 'DEFAULT_TIMEOUT_MS', 'EMPTY_SUCCESS_OPERATIONS', 'MAX_TEMPLATE_BODY', 'PLANNING_OPERATIONS', 'READ_ONLY_OPERATIONS',
+      'applyAws', 'applyOperations', 'assertApply', 'assertBreakGlassPlanning', 'assertBreakGlassRead', 'assertPlanning', 'assertReadOnly', 'breakGlassPlanningAws', 'breakGlassReadAws', 'classifyFailure', 'execAws', 'executeArgv', 'planningAws', 'readOnlyAws', 'redact'
     ]);
   });
 
@@ -276,6 +279,39 @@ describe('results and errors', () => {
     const failure = classifyFailure({ stderr: 'An error occurred (AccessDenied) when calling the GetRole operation: super-secret-value-123' }, env);
     assert.ok(!failure.message.includes('super-secret-value-123'));
     assert.ok(redact('x'.repeat(2000)).length <= 501, 'bounded');
+  });
+});
+
+describe('results: an empty successful response', () => {
+  // Live AWS (Phase 3C, 2026-10-05): get-function-concurrency on a function with
+  // no reservation exits 0 and prints nothing. Only that operation may do so.
+  const concurrency = ['lambda', 'get-function-concurrency', '--function-name', 'ssd-break-glass-production-ci'];
+  const run = (response, argv) => breakGlassReadAws({ region: 'us-east-1', exec: async () => response, env: {} })(argv);
+
+  it('get-function-concurrency with empty stdout is {} (no reservation configured)', async () => {
+    assert.deepEqual(await run({ stdout: '', stderr: '', exitCode: 0 }, concurrency), {});
+    assert.deepEqual(await run({ stdout: '\n', stderr: '', exitCode: 0 }, concurrency), {});
+  });
+
+  it('an explicit reservation is returned as is', async () => {
+    assert.deepEqual(await run({ stdout: '{"ReservedConcurrentExecutions":5}', stderr: '', exitCode: 0 }, concurrency), { ReservedConcurrentExecutions: 5 });
+  });
+
+  it('non-empty, non-object output is still malformed', async () => {
+    for (const stdout of ['not json', '[]', 'null', '"x"']) {
+      await assert.rejects(run({ stdout, stderr: '', exitCode: 0 }, concurrency), (error) => error.kind === 'malformed-json', stdout);
+    }
+  });
+
+  it('every other read with empty stdout is still malformed', async () => {
+    for (const argv of [['lambda', 'get-function-configuration', '--function-name', 'ssd-break-glass-production-ci'], ['lambda', 'get-function-event-invoke-config', '--function-name', 'ssd-break-glass-production-interactions']]) {
+      await assert.rejects(run({ stdout: '', stderr: '', exitCode: 0 }, argv), (error) => error.kind === 'malformed-json', argv.join(' '));
+    }
+    assert.deepEqual([...EMPTY_SUCCESS_OPERATIONS], ['lambda get-function-concurrency']);
+  });
+
+  it('a failed call with empty stdout is never read as empty success', async () => {
+    await assert.rejects(run({ stdout: '', stderr: '\nAn error occurred (AccessDeniedException) when calling the GetFunctionConcurrency operation: denied\n', exitCode: 254 }, concurrency), (error) => error.kind === 'authorization');
   });
 });
 

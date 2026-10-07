@@ -80,14 +80,14 @@ export const exitCodeOf = (r) => OUTCOMES[r.outcome] ?? 1;
 export const SECTIONS = Object.freeze(['Identity', 'GitHub OIDC', 'Push/scan role', 'Deploy role', 'Separation of duties', 'ECR', 'SSM', 'Ownership']);
 const ROLE_SECTION = { push: 'Push/scan role', deploy: 'Deploy role' };
 
-function check(id, section, title, fields = {}) {
+export function check(id, section, title, fields = {}) {
   return { id, section, title, status: PASS, required: true, basis: 'runtime', why: '', observed: [], expected: [], findings: [], remediation: [], ...fields };
 }
 
-const worst = (findings, floor = PASS) => findings.reduce((acc, f) => (RANK[f.severity] > RANK[acc] ? f.severity : acc), floor);
+export const worst = (findings, floor = PASS) => findings.reduce((acc, f) => (RANK[f.severity] > RANK[acc] ? f.severity : acc), floor);
 
 // A doctor check, placed in verify's report.
-const adopt = (c, fields) => ({ why: '', ...c, ...fields });
+export const adopt = (c, fields) => ({ why: '', ...c, ...fields });
 
 const SIMULATOR_REMEDIATION =
   'Give the operator iam:SimulatePrincipalPolicy on the push/scan, deploy and instance roles (docs/onboarding-cli.md § AWS verification, Prerequisites); without it effective access cannot be proven.';
@@ -471,10 +471,12 @@ export function outcomeOf(checks) {
   return 'VERIFIED';
 }
 
-function report({ target, checks, calls, skipped = null }) {
+// sections: the report's section order (the delivery SECTIONS by default;
+// a break-glass verification names its own).
+export function report({ target, checks, calls, skipped = null, sections = null }) {
   const counts = { [PASS]: 0, [WARN]: 0, [FAIL]: 0, [NOT_VERIFIED]: 0 };
   checks.forEach((c) => (counts[c.status] += 1));
-  return { schemaVersion: SCHEMA_VERSION, command: 'aws verify', target, outcome: outcomeOf(checks), counts, checks, skipped, awsCalls: calls };
+  return { schemaVersion: SCHEMA_VERSION, command: 'aws verify', target, outcome: outcomeOf(checks), counts, checks, skipped, awsCalls: calls, ...(sections ? { sections } : {}) };
 }
 
 const IDENTITY_WHY = {
@@ -482,7 +484,7 @@ const IDENTITY_WHY = {
   'identity.principal': 'the account root user is never an acceptable operator identity',
   'identity.region': 'stacks, the repository, scanning and the instance are regional; only the configured region is examined'
 };
-const identityCheck = (c) => adopt(c, { why: IDENTITY_WHY[c.id] });
+export const identityCheck = (c) => adopt(c, { why: IDENTITY_WHY[c.id] });
 
 const ROLE_WHY = {
   push: {

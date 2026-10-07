@@ -76,7 +76,7 @@ export const REGISTRY_SCANNING_UNSUPPORTED =
 
 // --- repo unit ---------------------------------------------------------------------------
 
-async function evaluateResource(ctx, { label, logicalId, mode, discovered, physicalId, type, tags, stackName, scope, inStack }) {
+export async function evaluateResource(ctx, { label, logicalId, mode, discovered, physicalId, type, tags, stackName, scope, inStack }) {
   const out = { label, logicalId, type, mode, physicalId, state: discovered.state, ownership: null, findings: [], owned: false };
   if (discovered.state === 'unverified') {
     out.findings.push(finding(mode === 'managed' ? FAIL : NOT_VERIFIED, 'discovery-unverified', `${label}: ${describeError(discovered)}`));
@@ -90,7 +90,7 @@ async function evaluateResource(ctx, { label, logicalId, mode, discovered, physi
     }
     return out;
   }
-  const evaluation = evaluateOwnership({ discovered: await discoverStack(ctx.aws, physicalId), resourceTags: tags, expectedType: type, slug: ctx.slug, scope, expectedStackName: stackName, region: ctx.region });
+  const evaluation = evaluateOwnership({ discovered: await discoverStack(ctx.aws, physicalId), resourceTags: tags, expectedType: type, slug: ctx.slug, scope, expectedStackName: stackName, region: ctx.region, environment: ctx.environment ?? null });
   out.ownership = evaluation.ownership;
   if (evaluation.ownership === 'unverified') {
     out.findings.push(finding(mode === 'managed' ? FAIL : NOT_VERIFIED, 'ownership-unverified', `${label}: ownership could not be determined (${evaluation.reasons.join('; ')})`));
@@ -123,9 +123,9 @@ async function evaluateResource(ctx, { label, logicalId, mode, discovered, physi
 const unexpectedStackResources = (stackKind, stackResources) =>
   stackResources.filter((r) => !Object.hasOwn(STACK_KINDS[stackKind].resources, r.logicalId) || STACK_KINDS[stackKind].resources[r.logicalId] !== r.type);
 
-async function stackState(ctx, unit, { stackName, scope }) {
+export async function stackState(ctx, unit, { stackName, scope }) {
   const stack = await discoverStackByName(ctx.aws, stackName);
-  const sp = planStack({ stack, expectedStackName: stackName, scope, slug: ctx.slug });
+  const sp = planStack({ stack, expectedStackName: stackName, scope, slug: ctx.slug, environment: ctx.environment ?? null });
   unit.changeSetType = sp.type;
   unit.baseStack = sp.baseStack;
   sp.problems.forEach((p) => unit.findings.push(finding(FAIL, 'stack-not-plannable', p)));
@@ -153,19 +153,19 @@ async function stackState(ctx, unit, { stackName, scope }) {
 // set — so planning for that role is REFUSED (never warned about), and nothing
 // is detached or modified. A policy list that cannot be read completely proves
 // nothing and is refused the same way.
-async function iamRecord(ctx, { key, arn, logicalId, generated, resource, stackName }) {
+export async function iamRecord(ctx, { key, arn, logicalId, generated, resource, stackName, policyName = ROLE_POLICY_NAMES[key] }) {
   const record = { logicalId, role: key, arn, trust: null, permissions: null, unmanaged: [], findings: [] };
   let beforeTrust = null;
   let beforePermissions = null;
   if (resource.owned) {
     beforeTrust = parseDocument(resource.discovered.value.trust ?? '{}');
     const policies = await discoverRolePolicies(ctx.aws, resource.physicalId);
-    const ours = policies.policies.find((p) => p.kind === 'inline' && p.name === `inline:${ROLE_POLICY_NAMES[key]}`);
+    const ours = policies.policies.find((p) => p.kind === 'inline' && p.name === `inline:${policyName}`);
     beforePermissions = ours ? parseDocument(ours.document) : null;
     const unmanaged = policies.policies.filter((p) => p !== ours);
     record.unmanaged = unmanaged.map((p) => (p.kind === 'attached' ? `managed policy ${p.arn}` : `inline policy ${p.name.slice('inline:'.length)}`));
     for (const policy of unmanaged) {
-      const what = policy.kind === 'attached' ? `managed policy ${policy.arn} (${policy.name.slice('attached:'.length)}) is attached directly to it` : `inline policy '${policy.name.slice('inline:'.length)}' is not the stack's ${ROLE_POLICY_NAMES[key]}`;
+      const what = policy.kind === 'attached' ? `managed policy ${policy.arn} (${policy.name.slice('attached:'.length)}) is attached directly to it` : `inline policy '${policy.name.slice('inline:'.length)}' is not the stack's ${policyName}`;
       record.findings.push(
         finding(
           FAIL,
@@ -348,7 +348,7 @@ async function prepareScanningUnit(ctx) {
 
 // --- orchestration -----------------------------------------------------------------------
 
-function report(base, { outcome, units = [], findings = [], skipped = null }) {
+export function report(base, { outcome, units = [], findings = [], skipped = null }) {
   return {
     schemaVersion: SCHEMA_VERSION,
     command: 'aws plan',
@@ -390,7 +390,7 @@ function publicUnit(unit) {
   };
 }
 
-const capabilitiesFor = (template) => (Object.values(template.Resources).some((r) => r.Type.startsWith('AWS::IAM::Role')) ? ['CAPABILITY_NAMED_IAM'] : []);
+export const capabilitiesFor = (template) => (Object.values(template.Resources).some((r) => r.Type.startsWith('AWS::IAM::Role')) ? ['CAPABILITY_NAMED_IAM'] : []);
 
 // awsPlan(options) -> report. Throws for a run-ending failure (AwsCliError,
 // IdentityError, PlanError, ChangeSetError, ScopeError, PlanRecordError,
@@ -438,9 +438,18 @@ export async function awsPlan({ config, scope = 'repo', region: explicitRegion =
     return report(base, { outcome: 'BLOCKED', units, skipped: 'a precondition failed: no change set was created' });
   }
 
+  return recordPlans({ units, base, scope, tags: ssdTags({ scope, slug }), aws, account, region: resolved.region, caller, root, env, sleep, repository: canonicalSlug(slug), configDigest: configDigestOf(config) });
+}
+
+// Steps 5–7 for any set of prepared units (repo, shared, break-glass): render,
+// assert the scope boundary, derive plan ids, prove every slot free — before
+// ANY AWS object is created — then create, describe and record each change
+// set. One path for every scope, so every plan gets the same checks.
+//   repository    the canonical consumer repository, or null (break-glass)
+//   configDigest  digest of the configuration the plan was made from
+export async function recordPlans({ units, base, scope, tags, aws, account, region, caller, root, env, sleep, repository, configDigest }) {
   // Render, assert scope, derive plan ids, prove every slot free — before ANY
   // AWS object is created.
-  const tags = ssdTags({ scope, slug });
   const planned = units.filter((u) => u.template);
   for (const unit of planned) {
     assertTemplateScope(unit.stackKind, unit.template);
@@ -451,7 +460,7 @@ export async function awsPlan({ config, scope = 'repo', region: explicitRegion =
     assertPersistable({ 'template.json': unit.body, 'parameters.json': unit.parametersText, 'policies.json': unit.policiesText }, env);
     unit.planIdInput = planIdInput({
       account,
-      region: resolved.region,
+      region,
       scope,
       stackKind: unit.stackKind,
       stackName: unit.stackName,
@@ -462,16 +471,15 @@ export async function awsPlan({ config, scope = 'repo', region: explicitRegion =
       tagsSha256: sha256(canonicalJson(tags)),
       capabilities: unit.capabilities,
       framework: base.framework,
-      repository: canonicalSlug(slug)
+      repository
     });
     unit.planId = planIdOf(unit.planIdInput);
     unit.changeSetName = changeSetNameOf(unit.planId);
     await assertPlanSlotFree(root, unit.planId);
   }
-  const configDigest = configDigestOf(config);
 
   for (const unit of planned) {
-    const result = await planChangeSet(aws, { stackKind: unit.stackKind, stackName: unit.stackName, changeSetName: unit.changeSetName, type: unit.changeSetType, body: unit.body, tags, account, region: resolved.region, sleep });
+    const result = await planChangeSet(aws, { stackKind: unit.stackKind, stackName: unit.stackName, changeSetName: unit.changeSetName, type: unit.changeSetType, body: unit.body, tags, account, region, sleep });
     if (JSON.stringify(result.capabilities) !== JSON.stringify(unit.capabilities)) {
       throw new PlanError('capabilities-mismatch', `validate-template requires [${result.capabilities.join(', ')}], but the plan id binds [${unit.capabilities.join(', ')}]`);
     }
@@ -484,9 +492,9 @@ export async function awsPlan({ config, scope = 'repo', region: explicitRegion =
       outcome: result.outcome,
       scope,
       stackKind: unit.stackKind,
-      repository: canonicalSlug(slug),
+      repository,
       account,
-      region: resolved.region,
+      region,
       callerArn: caller.arn,
       stackName: unit.stackName,
       changeSetType: unit.changeSetType,

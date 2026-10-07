@@ -12,6 +12,7 @@ import { describe, it } from 'node:test';
 
 import { main } from '../onboarding/cli.mjs';
 import { awsApply } from '../onboarding/aws/apply.mjs';
+import { checkStack } from '../onboarding/aws/apply/live.mjs';
 import { awsPlan } from '../onboarding/aws/plan.mjs';
 import { verifyAws } from '../onboarding/aws/verify.mjs';
 import { PlanRecordError, planDirOf, writeApplyRecord } from '../onboarding/aws/plan/record.mjs';
@@ -129,6 +130,23 @@ describe('aws apply: plan integrity (refused before AWS)', () => {
       const r = await apply(p, { allowDestructive: 1 });
       refusedWithoutMutation(r, 'plan-inconsistent');
       assert.equal(r.fake.calls.length, 0);
+    });
+  }
+
+  // The reviewed change set's tags are bound EXACTLY, before any AWS call:
+  // change-set.json must carry precisely plan.json's SSD tags (no extra, none
+  // missing), and plan.json's tags are themselves bound by the plan id.
+  for (const [what, file, edit, kind] of [
+    ['an extra tag on the recorded change set', 'change-set.json', (cs) => ({ ...cs, Tags: [...cs.Tags, { Key: 'owner', Value: 'someone-else' }] }), 'plan-inconsistent'],
+    ['a required SSD tag missing from the recorded change set', 'change-set.json', (cs) => ({ ...cs, Tags: cs.Tags.filter((tag) => tag.Key !== 'ssd:managed-by') }), 'plan-inconsistent'],
+    ['plan.json tags that are not the SSD tags the plan id binds', 'plan.json', (plan) => ({ ...plan, tags: plan.tags.map((tag) => (tag.Key === 'ssd:managed-by' ? { ...tag, Value: 'terraform' } : tag)) }), 'plan-not-applicable']
+  ]) {
+    it(`a resealed CREATE record with ${what} is refused before AWS`, async (t) => {
+      const p = await planned(t);
+      reseal(p, file, edit);
+      const r = await apply(p);
+      refusedWithoutMutation(r, kind);
+      assert.equal(r.fake.calls.length, 0, 'no AWS call at all');
     });
   }
 
@@ -304,18 +322,133 @@ describe('aws apply: stack time-of-check / time-of-use', () => {
     }
   });
 
-  it('the recorded CREATE placeholder is applied; anything else at that name is refused', async (t) => {
+  // AWS contract observed live (Phase 3C synthetic apply, 2026-10-05): a first
+  // CREATE change set is CREATE_COMPLETE/AVAILABLE and carries the SSD tags;
+  // its REVIEW_IN_PROGRESS placeholder has the change set's StackId and Tags: [].
+  // The tags reach the stack only when the change set executes.
+  it('a first CREATE applies against the untagged REVIEW_IN_PROGRESS placeholder AWS creates', async (t) => {
     const p = await planned(t);
+    const recorded = readPlanJson(p.root, p.planId, 'change-set.json');
+    assert.deepEqual(recorded.Tags, readPlanJson(p.root, p.planId).tags, 'the reviewed change set carries the SSD tags');
+    const r = await apply(p, { world: { stack: (s) => ({ ...s, StackId: recorded.StackId, StackStatus: 'REVIEW_IN_PROGRESS', Tags: [] }) } });
+    assert.equal(r.report.outcome, 'APPLIED');
+    assert.ok(r.report.verification.some((v) => v.id === 'stack' && v.status === 'PASS'));
+    assert.equal(r.report.execution.finalStackStatus, 'CREATE_COMPLETE');
+  });
+
+  it('a CREATE placeholder that carries exactly the SSD ownership tags is also accepted', async (t) => {
+    const p = await planned(t);
+    const tags = readPlanJson(p.root, p.planId).tags;
+    assert.equal((await apply(p, { world: { stack: (s) => ({ ...s, Tags: tags }) } })).report.outcome, 'APPLIED');
+  });
+
+  it('anything but the recorded CREATE placeholder at that name is refused', async (t) => {
+    const p = await planned(t);
+    const tags = readPlanJson(p.root, p.planId).tags;
     for (const [rewrite, kind] of [
       [(s) => ({ ...s, StackId: OTHER_STACK_ID(s.StackName) }), 'stack-replaced'],
+      [(s) => ({ ...s, StackName: `${s.StackName}-other` }), 'stack-replaced'],
       [(s) => ({ ...s, StackStatus: 'CREATE_COMPLETE' }), 'stack-changed'],
-      [(s) => ({ ...s, Tags: s.Tags.map((tag) => (tag.Key === 'ssd:consumer-repository' ? { ...tag, Value: 'evil/app' } : tag)) }), 'stack-not-owned'],
-      [(s) => ({ ...s, Tags: [] }), 'stack-not-owned'],
+      [(s) => ({ ...s, StackStatus: 'CREATE_IN_PROGRESS' }), 'stack-changed'],
+      [(s) => ({ ...s, StackStatus: 'ROLLBACK_COMPLETE' }), 'stack-changed'],
+      [(s) => ({ ...s, Tags: tags.map((tag) => (tag.Key === 'ssd:consumer-repository' ? { ...tag, Value: 'evil/app' } : tag)) }), 'stack-not-owned'],
+      [(s) => ({ ...s, Tags: [{ Key: 'owner', Value: 'someone-else' }] }), 'stack-not-owned'],
       [() => null, 'stack-missing']
     ]) {
       refusedWithoutMutation(await apply(p, { world: { stack: rewrite } }), kind);
     }
-    assert.equal((await apply(p)).report.outcome, 'APPLIED');
+  });
+
+  it('a CREATE whose live change set no longer carries the reviewed SSD tags is refused', async (t) => {
+    const p = await planned(t);
+    for (const rewrite of [(d) => ({ ...d, Tags: [] }), (d) => ({ ...d, Tags: d.Tags.map((tag) => (tag.Key === 'ssd:managed-by' ? { ...tag, Value: 'someone-else' } : tag)) })]) {
+      refusedWithoutMutation(await apply(p, { world: { changeSet: rewrite } }), 'change-set-changed');
+    }
+  });
+
+  it('an UPDATE stack must still carry the SSD ownership tags (unchanged by the CREATE rule)', async (t) => {
+    const p = await planned(t, { kind: 'UPDATE' });
+    for (const rewrite of [(s) => ({ ...s, Tags: [] }), (s) => ({ ...s, Tags: s.Tags.map((tag) => (tag.Key === 'ssd:consumer-repository' ? { ...tag, Value: 'evil/app' } : tag)) })]) {
+      refusedWithoutMutation(await apply(p, { world: { stack: rewrite } }), 'stack-not-owned');
+    }
+  });
+});
+
+// checkStack directly, over the exact shapes AWS returned for the Phase 3C
+// synthetic CREATE (2026-10-05).
+describe('aws apply: checkStack over the observed CREATE contract', () => {
+  const STACK_ID = 'arn:aws:cloudformation:us-east-1:157328692276:stack/ssd-break-glass-synthetic/4dcc71e0-c08a-11f1-8ffc-0ef7e0e36b7f';
+  const NAME = 'ssd-break-glass-synthetic';
+  const CHANGE_SET_TAGS = [
+    { Key: 'ssd:framework', Value: 'ssd-security-framework' },
+    { Key: 'ssd:environment', Value: 'synthetic' },
+    { Key: 'ssd:managed-by', Value: 'ssd-onboard' }
+  ];
+  const record = ({ operation = 'CREATE', base = { state: 'absent' }, tags = CHANGE_SET_TAGS } = {}) => ({
+    plan: { scope: 'break-glass', stackKind: 'break-glass-synthetic', baseStack: base },
+    operation,
+    binding: { stackName: NAME, stackId: STACK_ID },
+    changeSet: { StackId: STACK_ID, Status: 'CREATE_COMPLETE', ExecutionStatus: 'AVAILABLE', Tags: tags }
+  });
+  const placeholder = (overrides = {}) => ({ state: 'present', value: { name: NAME, stackId: STACK_ID, status: 'REVIEW_IN_PROGRESS', tags: [], lastUpdatedTime: null, ...overrides } });
+  const kinds = (findings) => findings.map((f) => f.kind);
+  const asTags = (list) => list.map((t) => ({ key: t.Key, value: t.Value }));
+
+  it('PASS: tagged change set + REVIEW_IN_PROGRESS placeholder with Tags [] + matching StackId', () => {
+    assert.deepEqual(checkStack({ record: record(), stack: placeholder(), slug: null }), []);
+  });
+
+  it('PASS: a placeholder carrying exactly the SSD tags', () => {
+    assert.deepEqual(checkStack({ record: record(), stack: placeholder({ tags: asTags(CHANGE_SET_TAGS) }), slug: null }), []);
+  });
+
+  for (const [what, tags] of [
+    ['no tags', []],
+    ['the production environment tag', CHANGE_SET_TAGS.map((t) => (t.Key === 'ssd:environment' ? { ...t, Value: 'production' } : t))],
+    ['another manager', CHANGE_SET_TAGS.map((t) => (t.Key === 'ssd:managed-by' ? { ...t, Value: 'terraform' } : t))],
+    ['a consumer repository on a shared break-glass stack', [...CHANGE_SET_TAGS, { Key: 'ssd:consumer-repository', Value: 'acme/app' }]]
+  ]) {
+    it(`REFUSED: the reviewed change set with ${what}`, () => {
+      assert.ok(kinds(checkStack({ record: record({ tags }), stack: placeholder(), slug: null })).includes('change-set-not-owned'));
+    });
+  }
+
+  it('REFUSED: a reviewed change set with no Tags field at all', () => {
+    const untagged = record();
+    delete untagged.changeSet.Tags;
+    assert.ok(kinds(checkStack({ record: untagged, stack: placeholder(), slug: null })).includes('change-set-not-owned'));
+  });
+
+  for (const [what, overrides, kind] of [
+    ['a different StackId', { stackId: STACK_ID.replace('4dcc71e0', '00000000') }, 'stack-replaced'],
+    ['a different stack name', { name: 'ssd-break-glass-production' }, 'stack-replaced'],
+    ['status CREATE_COMPLETE', { status: 'CREATE_COMPLETE' }, 'stack-changed'],
+    ['status ROLLBACK_COMPLETE', { status: 'ROLLBACK_COMPLETE' }, 'stack-changed'],
+    ['foreign tags on the placeholder', { tags: [{ key: 'owner', value: 'someone-else' }] }, 'stack-not-owned'],
+    ['the other environment\'s SSD tags on the placeholder', { tags: asTags(CHANGE_SET_TAGS.map((t) => (t.Key === 'ssd:environment' ? { ...t, Value: 'production' } : t))) }, 'stack-not-owned']
+  ]) {
+    it(`REFUSED: ${what}`, () => {
+      assert.ok(kinds(checkStack({ record: record(), stack: placeholder(overrides), slug: null })).includes(kind));
+    });
+  }
+
+  it('REFUSED: the placeholder is gone', () => {
+    assert.deepEqual(kinds(checkStack({ record: record(), stack: { state: 'absent' }, slug: null })), ['stack-missing']);
+  });
+
+  it('a plan made against an existing placeholder keeps its revision protection', () => {
+    const base = { state: 'present', stackId: STACK_ID, stackStatus: 'REVIEW_IN_PROGRESS', lastUpdatedTime: '2026-10-05T06:59:00.000Z' };
+    assert.deepEqual(checkStack({ record: record({ base }), stack: placeholder({ lastUpdatedTime: '2026-10-05T06:59:00.000Z' }), slug: null }), []);
+    for (const lastUpdatedTime of ['2026-10-05T07:30:00.000Z', null]) {
+      assert.ok(kinds(checkStack({ record: record({ base }), stack: placeholder({ lastUpdatedTime }), slug: null })).includes('stack-changed'));
+    }
+  });
+
+  it('UPDATE is unchanged: the live stack itself must carry the SSD tags', () => {
+    const base = { state: 'present', stackId: STACK_ID, stackStatus: 'CREATE_COMPLETE', lastUpdatedTime: '2026-10-05T07:00:00.000Z' };
+    const settled = (tags) => ({ state: 'present', value: { name: NAME, stackId: STACK_ID, status: 'CREATE_COMPLETE', tags, lastUpdatedTime: '2026-10-05T07:00:00.000Z' } });
+    assert.deepEqual(checkStack({ record: record({ operation: 'UPDATE', base }), stack: settled(asTags(CHANGE_SET_TAGS)), slug: null }), []);
+    assert.ok(kinds(checkStack({ record: record({ operation: 'UPDATE', base }), stack: settled([]), slug: null })).includes('stack-not-owned'));
   });
 });
 

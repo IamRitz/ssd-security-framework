@@ -33,7 +33,7 @@ function detailRows(c) {
 export function awsVerifyBlocks(report) {
   const t = report.target;
   const problems = report.checks.filter((c) => c.status !== PASS);
-  const bySection = SECTIONS.map((name) => [name, report.checks.filter((c) => c.section === name)]).filter(([, checks]) => checks.length > 0);
+  const bySection = (report.sections ?? SECTIONS).map((name) => [name, report.checks.filter((c) => c.section === name)]).filter(([, checks]) => checks.length > 0);
   const nv = report.checks.filter((c) => c.status === NOT_VERIFIED);
   const requiredNv = nv.filter((c) => c.required !== false).length;
   return [
@@ -41,9 +41,9 @@ export function awsVerifyBlocks(report) {
     section(
       'Target',
       rows([
-        row('Repository', t.repository, { strong: true }),
+        t.environment ? row('Break-glass', t.environment, { strong: true }) : row('Repository', t.repository, { strong: true }),
         row('Account', t.account),
-        row('Region', `${t.region} (${t.regionSource === 'flag' ? '--region' : 'delivery.aws.region'})`),
+        row('Region', `${t.region} (${t.regionSource === 'flag' ? '--region' : t.environment ? 'aws.region' : 'delivery.aws.region'})`),
         row('Caller', t.caller ? t.caller.arn : '(not contacted)'),
         row('AWS profile', t.awsProfile ?? '(default credential chain)')
       ])

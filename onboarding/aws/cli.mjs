@@ -27,7 +27,11 @@ import { PLAN_ID } from './plan/record.mjs';
 import { awsVerify, exitCodeOf as verifyExitCodeOf } from './verify.mjs';
 import { awsVerifyBlocks, awsVerifyErrorBlocks, awsVerifyErrorReport } from './verify-report.mjs';
 import { detectFramework } from '../lib/framework.mjs';
+import { loadOperatorConfig } from '../lib/operator-file.mjs';
 import { terminalPrompter } from '../lib/prompt.mjs';
+import { awsPlanBreakGlass } from './break-glass/plan.mjs';
+import { awsVerifyBreakGlass } from './break-glass/verify.mjs';
+import { BREAK_GLASS_ENVIRONMENTS } from './stack-names.mjs';
 
 export const AWS_USAGE = `ssd-onboard aws — AWS readiness for the configured delivery (Phase 2)
 
@@ -42,17 +46,23 @@ instance/role credentials…). ssd-onboard never reads, accepts or prints a key.
                           permissions, SSM instance, ownership. Makes no AWS change.
                           Exit 0 ready (warnings allowed), 1 blocked or not verifiable
   plan [--scope repo|shared] [--region <r>] [--json]
+  plan --scope break-glass --environment production|synthetic --operator-config <file>
+       [--region <r>] [--json]
                           Creates an UNEXECUTED CloudFormation change set per stack and
                           records it in .ssd/aws-plans/<plan-id>/. Never executes it.
                           repo (default): the per-repository delivery stack (ECR repository,
                           push+scan and deploy roles — only those configured managed).
                           shared: the GitHub OIDC provider stack (when managed); registry
                           scanning and Inspector are reported, never planned.
+                          break-glass (Phase 3C): ONE shared break-glass stack
+                          (ssd-break-glass-<environment>) from the operator config — never
+                          .ssd/onboarding.yml. The Lambda artifact must already be published
+                          (an immutable S3 object version); plan uploads nothing.
                           A CREATE change set leaves a REVIEW_IN_PROGRESS placeholder stack.
                           Requires a clean framework checkout at framework.ref.
                           Exit 0 planned / no changes / nothing to plan, 1 blocked or error
   apply --plan-id <id> --account <12 digits> --region <r>
-        [--allow-destructive <n>] [--yes] [--json]
+        [--operator-config <file>] [--allow-destructive <n>] [--yes] [--json]
                           Executes EXACTLY the change set recorded in .ssd/aws-plans/<id>/,
                           once, after re-verifying the plan hashes, caller, account, region,
                           configuration, framework binding, the live change set and template,
@@ -62,21 +72,33 @@ instance/role credentials…). ssd-onboard never reads, accepts or prints a key.
                           changes (DELETE/REPLACE) need --allow-destructive <their exact count>.
                           Never edits .ssd/onboarding.yml or any repository file; writes only
                           apply-started.json / apply.json into the plan directory.
+                          A break-glass plan is applied with --operator-config <its file>
+                          instead of .ssd/onboarding.yml; secret values are never applied.
                           Exit 0 applied, 1 refused / error / apply failed
   verify [--region <r>] [--json]
+  verify --scope break-glass --environment production|synthetic --operator-config <file>
+         [--region <r>] [--json]
                           READ-ONLY: re-reads the deployed state and proves the boundary holds:
                           caller, account and region; ownership; OIDC provider; each role's trust,
                           required access (simulated ALLOW) and forbidden access (simulated
                           DENY); push/deploy separation; ECR repository, registry scanning and
                           Inspector coverage; SSM instance Online and its ECR pull access.
                           Never repairs anything. Needs iam:SimulatePrincipalPolicy.
+                          break-glass: the deployed stack of one environment — ownership,
+                          separation from the other environment, TTL on ttl, PutItem
+                          (simulated) on its own table only, function exposure, CodeSha256
+                          of the configured artifact. Never reads a secret value.
                           Exit 0 verified (warnings allowed), 1 failed or not verifiable
 
 Options:
   --repo <dir>            consumer repository root (default: current directory)
   --region <r>            must equal delivery.aws.region when given; the AWS CLI's default
                           region is never used
-  --scope repo|shared     plan only (default repo)
+  --scope repo|shared|break-glass
+                          plan (default repo); verify accepts only break-glass
+  --environment <env>     break-glass only: production or synthetic
+  --operator-config <f>   break-glass only: the Phase 3 operator configuration (identifiers
+                          only; never .ssd/onboarding.yml, never read by Phase 1)
   --plan-id <id>          apply only: the 64-hex plan id printed by aws plan
   --account <id>          apply only: must equal the plan, delivery.aws.accountId and the caller
   --allow-destructive <n> apply only: the exact number of DELETE + REPLACE changes
@@ -92,6 +114,8 @@ const OPTIONS = {
   'plan-id': { type: 'string' },
   account: { type: 'string' },
   'allow-destructive': { type: 'string' },
+  environment: { type: 'string' },
+  'operator-config': { type: 'string' },
   yes: { type: 'boolean' },
   json: { type: 'boolean' },
   help: { type: 'boolean', short: 'h' }
@@ -136,6 +160,26 @@ export async function awsMain(args, context) {
         throw new AwsUsageError(`Unknown option '--${stray}'`);
       }
     }
+    // --environment and --operator-config belong to break-glass only: refused
+    // (never ignored) anywhere else.
+    const breakGlass = values.scope === 'break-glass';
+    if (sub !== 'apply' && !breakGlass) {
+      const stray = ['environment', 'operator-config'].find((name) => values[name] !== undefined);
+      if (stray) {
+        throw new AwsUsageError(`Unknown option '--${stray}' (only with --scope break-glass)`);
+      }
+    }
+    if (sub === 'apply' && values.environment !== undefined) {
+      throw new AwsUsageError("Unknown option '--environment' (a plan already names its environment)");
+    }
+    if (breakGlass && (sub === 'plan' || sub === 'verify')) {
+      if (!BREAK_GLASS_ENVIRONMENTS.includes(values.environment)) {
+        throw new AwsUsageError(`--scope break-glass requires --environment production|synthetic${values.environment === undefined ? '' : ` (got '${values.environment}')`}`);
+      }
+      if (!values['operator-config']) {
+        throw new AwsUsageError('--scope break-glass requires --operator-config <file> (the break-glass stacks are never planned from .ssd/onboarding.yml)');
+      }
+    }
     switch (sub) {
       case 'doctor':
         if (values.scope !== undefined) {
@@ -144,6 +188,9 @@ export async function awsMain(args, context) {
         }
         return await cmdAwsDoctor(resolve(values.repo ?? process.cwd()), values, context);
       case 'plan':
+        if (breakGlass) {
+          return await cmdAwsPlanBreakGlass(resolve(values.repo ?? process.cwd()), values, context);
+        }
         return await cmdAwsPlan(resolve(values.repo ?? process.cwd()), values, context);
       case 'apply':
         if (values.scope !== undefined) {
@@ -151,8 +198,11 @@ export async function awsMain(args, context) {
         }
         return await cmdAwsApply(resolve(values.repo ?? process.cwd()), values, context);
       case 'verify':
-        if (values.scope !== undefined) {
-          throw new AwsUsageError("Unknown option '--scope'");
+        if (values.scope !== undefined && !breakGlass) {
+          throw new AwsUsageError(`verify accepts only --scope break-glass (got '${values.scope}')`);
+        }
+        if (breakGlass) {
+          return await cmdAwsVerifyBreakGlass(values, context);
         }
         return await cmdAwsVerify(resolve(values.repo ?? process.cwd()), values, context);
       default:
@@ -238,6 +288,45 @@ async function cmdAwsDoctor(root, options, context) {
 // Run-ending failures of `aws plan`: typed errors, reported as ERROR (exit 1).
 const PLAN_ERRORS = new Set(['AwsCliError', 'IdentityError', 'PlanError', 'ChangeSetError', 'ScopeError', 'PlanRecordError', 'PathConfinementError', 'TrustBuildError']);
 
+// Phase 3C: one shared break-glass stack from the operator config.
+async function cmdAwsPlanBreakGlass(root, options, context) {
+  if (options.region !== undefined && !REGION.test(options.region)) {
+    throw new AwsUsageError(`--region '${options.region}' is not an AWS region name`);
+  }
+  const fail = (error, target = null) => {
+    const errorReport = awsPlanErrorReport(error, target);
+    if (options.json) {
+      context.json(errorReport);
+    } else {
+      context.printErr(awsPlanErrorBlocks(errorReport));
+    }
+    return 1;
+  };
+  let operator;
+  try {
+    operator = await loadOperatorConfig(resolve(options['operator-config']));
+  } catch (error) {
+    return fail(error);
+  }
+  const target = { repository: null, environment: options.environment, account: operator.aws.accountId, region: options.region ?? operator.aws.region, scope: 'break-glass' };
+  const framework = context.framework !== undefined ? context.framework : await detectFramework();
+  let report;
+  try {
+    report = await awsPlanBreakGlass({ operator, environment: options.environment, region: options.region ?? null, exec: context.awsExec ?? execAws, env: context.env ?? process.env, framework, root, sleep: context.awsSleep });
+  } catch (error) {
+    if (PLAN_ERRORS.has(error?.name)) {
+      return fail(error, target);
+    }
+    throw error;
+  }
+  if (options.json) {
+    context.json(report);
+  } else {
+    context.print(awsPlanBlocks(report));
+  }
+  return planExitCodeOf(report);
+}
+
 async function cmdAwsPlan(root, options, context) {
   if (options.region !== undefined && !REGION.test(options.region)) {
     throw new AwsUsageError(`--region '${options.region}' is not an AWS region name`);
@@ -314,13 +403,21 @@ async function cmdAwsApply(root, options, context) {
     }
     return 1;
   };
-  let config;
+  // A break-glass plan is applied against its operator config, never against
+  // .ssd/onboarding.yml (and a delivery plan never against an operator config:
+  // checkIntent refuses the mismatch either way).
+  let config = null;
+  let operator = null;
   try {
-    config = await loadDelivery(root, 'aws apply');
+    if (options['operator-config'] !== undefined) {
+      operator = await loadOperatorConfig(resolve(options['operator-config']));
+    } else {
+      config = await loadDelivery(root, 'aws apply');
+    }
   } catch (error) {
     return fail(error);
   }
-  target.repository = config.repository.slug;
+  target.repository = config?.repository.slug ?? null;
   const framework = context.framework !== undefined ? context.framework : await detectFramework();
 
   // Typed confirmation: an injected prompter (tests) or a terminal. Without
@@ -344,6 +441,7 @@ async function cmdAwsApply(root, options, context) {
   try {
     report = await awsApply({
       config,
+      operator,
       planId,
       account: options.account,
       region: options.region,
@@ -407,6 +505,44 @@ async function cmdAwsVerify(root, options, context) {
   let report;
   try {
     report = await awsVerify({ config, region: options.region ?? null, exec: context.awsExec ?? execAws, env: context.env ?? process.env });
+  } catch (error) {
+    if (error instanceof AwsCliError || error instanceof IdentityError) {
+      return fail(error, target);
+    }
+    throw error;
+  }
+  if (options.json) {
+    context.json(report);
+  } else {
+    context.print(awsVerifyBlocks(report));
+  }
+  return verifyExitCodeOf(report);
+}
+
+// Phase 3C: read-only verification of one deployed break-glass stack.
+async function cmdAwsVerifyBreakGlass(options, context) {
+  if (options.region !== undefined && !REGION.test(options.region)) {
+    throw new AwsUsageError(`--region '${options.region}' is not an AWS region name`);
+  }
+  const fail = (error, target = null) => {
+    const errorReport = awsVerifyErrorReport(error, target);
+    if (options.json) {
+      context.json(errorReport);
+    } else {
+      context.printErr(awsVerifyErrorBlocks(errorReport));
+    }
+    return 1;
+  };
+  let operator;
+  try {
+    operator = await loadOperatorConfig(resolve(options['operator-config']));
+  } catch (error) {
+    return fail(error);
+  }
+  const target = { scope: 'break-glass', environment: options.environment, repository: null, account: operator.aws.accountId, region: options.region ?? operator.aws.region };
+  let report;
+  try {
+    report = await awsVerifyBreakGlass({ operator, environment: options.environment, region: options.region ?? null, exec: context.awsExec ?? execAws, env: context.env ?? process.env });
   } catch (error) {
     if (error instanceof AwsCliError || error instanceof IdentityError) {
       return fail(error, target);

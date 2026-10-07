@@ -12,7 +12,8 @@ import { assertDescribedMatches, classifyChanges, countChanges } from '../plan/c
 import { assertChangeScope, assertTemplateScope } from '../plan/scope.mjs';
 import { changeSetNameOf, configDigestOf } from '../plan/record.mjs';
 import { LIVE } from '../discover/stacks.mjs';
-import { SHARED_STACKS, canonicalSlug, repoStackName } from '../stack-names.mjs';
+import { BREAK_GLASS_STACKS, SHARED_STACKS, breakGlassEnvironmentOf, canonicalSlug, repoStackName } from '../stack-names.mjs';
+import { operatorDigestOf } from '../break-glass/operator-config.mjs';
 import { canonicalJson, ssdTags } from '../templates/common.mjs';
 import { frameworkProblems } from '../../lib/framework.mjs';
 
@@ -27,8 +28,15 @@ const finding = (kind, message) => ({ kind, message });
 export function expectedStackName(stackKind, slug) {
   if (stackKind === 'repo') return repoStackName(slug);
   if (stackKind === 'shared-github-oidc') return SHARED_STACKS.githubOidc;
+  const environment = breakGlassEnvironmentOf(stackKind);
+  if (environment) return BREAK_GLASS_STACKS[environment];
   return null;
 }
+
+// A break-glass plan's scope, stack kind, stack name and repository must agree
+// with each other: the environment comes from the stack kind, and the stack
+// name and tags must be that environment's. -> environment | null
+export const planEnvironment = (input) => (input.scope === 'break-glass' ? breakGlassEnvironmentOf(input.stackKind) : null);
 
 function parse(text) {
   try {
@@ -66,8 +74,22 @@ export function checkPlanRecord({ plan, texts }) {
   if (input.changeSetType === 'CREATE' && !(base?.state === 'absent' || (base?.state === 'present' && base.stackStatus === 'REVIEW_IN_PROGRESS'))) {
     findings.push(finding('plan-inconsistent', 'a CREATE plan must be bound to an absent stack or a REVIEW_IN_PROGRESS placeholder'));
   }
-  if (!same(plan.tags, ssdTags({ scope: input.scope, slug: input.repository }))) {
-    findings.push(finding('plan-inconsistent', 'plan.json tags are not the SSD ownership tags of this scope and repository'));
+  const environment = planEnvironment(input);
+  if (input.scope === 'break-glass') {
+    if (!environment || input.stackName !== expectedStackName(input.stackKind, null) || input.repository !== null) {
+      findings.push(finding('plan-inconsistent', 'a break-glass plan must name a break-glass stack kind, that environment\'s stack, and no consumer repository'));
+    }
+  } else if (breakGlassEnvironmentOf(input.stackKind)) {
+    findings.push(finding('plan-inconsistent', `stack kind ${input.stackKind} belongs to the break-glass scope, not ${input.scope}`));
+  }
+  let expectedTags = null;
+  try {
+    expectedTags = ssdTags({ scope: input.scope, slug: input.repository, environment });
+  } catch {
+    expectedTags = null;
+  }
+  if (!expectedTags || !same(plan.tags, expectedTags)) {
+    findings.push(finding('plan-inconsistent', `plan.json tags are not the SSD ownership tags of this scope and ${input.scope === 'break-glass' ? 'environment' : 'repository'}`));
   }
 
   const template = parse(texts['template.json']);
@@ -150,7 +172,20 @@ export function checkPlanRecord({ plan, texts }) {
 //     ones the current configuration derives;
 //   configuration: unchanged since the plan (createdFromConfigDigest);
 //   framework: the `aws plan` binding rule, and the plan was made at this ref.
-export function checkIntent({ plan, config, framework, account, region }) {
+//
+// A break-glass plan is checked against the OPERATOR configuration instead
+// (operator: break-glass/operator-config.mjs): aws.accountId / aws.region,
+// the environment's stack, the operator config digest and its framework.ref.
+// Each kind of plan needs its own kind of configuration: a break-glass plan
+// is never applied against .ssd/onboarding.yml, nor a delivery plan against
+// an operator config.
+export function checkIntent({ plan, config = null, operator = null, framework, account, region }) {
+  if (plan.scope === 'break-glass' || operator) {
+    return checkOperatorIntent({ plan, operator, framework, account, region });
+  }
+  if (!config) {
+    return [finding('config-kind-mismatch', `a ${plan.scope} plan is applied against .ssd/onboarding.yml, which was not loaded`)];
+  }
   const findings = [];
   const d = config.delivery;
   if (account !== plan.account || account !== d.aws.accountId) {
@@ -173,6 +208,36 @@ export function checkIntent({ plan, config, framework, account, region }) {
   }
   if (!same(plan.framework, { repository: config.framework.repository, ref: config.framework.ref })) {
     findings.push(finding('framework-binding', `the plan was created by ${plan.framework?.repository}@${plan.framework?.ref}, not framework.ref ${config.framework.repository}@${config.framework.ref}`));
+  }
+  return findings;
+}
+
+function checkOperatorIntent({ plan, operator, framework, account, region }) {
+  if (plan.scope !== 'break-glass') {
+    return [finding('config-kind-mismatch', `this is a ${plan.scope} plan; --operator-config applies only to break-glass plans (apply it from the consumer repository, without --operator-config)`)];
+  }
+  if (!operator) {
+    return [finding('config-kind-mismatch', 'this is a break-glass plan: apply it with --operator-config <the file it was planned from>')];
+  }
+  const findings = [];
+  if (account !== plan.account || account !== operator.aws.accountId) {
+    findings.push(finding('account-mismatch', `--account ${account}, plan account ${plan.account} and aws.accountId ${operator.aws.accountId} must all be equal`));
+  }
+  if (region !== plan.region || region !== operator.aws.region) {
+    findings.push(finding('region-mismatch', `--region ${region}, plan region ${plan.region} and aws.region ${operator.aws.region} must all be equal`));
+  }
+  const environment = breakGlassEnvironmentOf(plan.stackKind);
+  if (!environment || plan.stackName !== BREAK_GLASS_STACKS[environment]) {
+    findings.push(finding('stack-mismatch', `the plan names stack ${plan.stackName}, not the ${plan.stackKind} stack`));
+  }
+  if (plan.createdFromConfigDigest !== operatorDigestOf(operator)) {
+    findings.push(finding('config-changed', 'the operator configuration changed since this plan was created: re-plan against the current file'));
+  }
+  for (const problem of frameworkProblems(framework, operator)) {
+    findings.push(finding('framework-binding', problem));
+  }
+  if (!same(plan.framework, { repository: operator.framework.repository, ref: operator.framework.ref })) {
+    findings.push(finding('framework-binding', `the plan was created by ${plan.framework?.repository}@${plan.framework?.ref}, not framework.ref ${operator.framework.repository}@${operator.framework.ref}`));
   }
   return findings;
 }

@@ -289,7 +289,9 @@ request for the same run:
    send the token. The pre-hardening broker ignores the extra field, so this
    step changes nothing on its own.
 2. **Broker second.** Once the hardened broker is deployed (Phase 3C provisions
-   it), it refuses every request that does not prove its identity:
+   its stacks; production use waits for Phases 3D and 3E, see
+   [break-glass-provisioning.md § Phase sequence](break-glass-provisioning.md#phase-sequence-and-gates)),
+   it refuses every request that does not prove its identity:
    - a caller pinned to an **older framework commit** sends no token, so its
      request is refused (`identity_rejected: token_missing`). The request is not
      delivered and **the BLOCK stands**;
@@ -303,8 +305,8 @@ request for the same run:
    - **pending requests filed before the hardening** have no stored identity.
      They match no status caller and authorize no approver, so they simply
      expire. That is fail-closed by design.
-3. **Create each repository's approver parameter** (below) before its first
-   request. Until then, nobody is authorized for it.
+3. **Create each repository's approver parameter** (below, Phase 3D) before its
+   first request. Until then, nobody is authorized for it.
 
 ## Authorization is per repository and fail-closed
 
@@ -344,7 +346,9 @@ with no duplicates.
 
 The interaction function needs `ssm:GetParameter` on
 `arn:aws:ssm:<region>:<account>:parameter/ssd/break-glass/<environment>/approvers/*`
-and nothing broader. Creating, owning and verifying the parameters is Phase 3C.
+and nothing broader. Phase 3C grants exactly that on the interaction function's
+execution role. Creating, owning and verifying the parameters, one per
+repository alongside its invoker role, is Phase 3D.
 
 ## A repository with no Slack
 

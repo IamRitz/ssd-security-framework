@@ -17,14 +17,18 @@
 //                                placeholder this change set created — same
 //                                stack id (and, when the plan was made against
 //                                an existing placeholder, the same revision);
-//                      and in both cases it still carries the SSD ownership tags.
+//                      ownership: an UPDATE's stack still carries the SSD
+//                      ownership tags; a CREATE's reviewed change set carries
+//                      them (its placeholder has none yet — see checkStack).
 //   stackProgress      after execute-change-set: waiting, succeeded or failed.
 //                      Success is ONLY the operation's own *_COMPLETE on the
 //                      same stack id (for UPDATE, with a LastUpdatedTime newer
 //                      than the base revision's); a rollback, a delete, a
 //                      different stack or an unknown state is failure.
+import { tagList } from '../discover/oidc-provider.mjs';
 import { LIVE, stackTagProblems } from '../discover/stacks.mjs';
 import { canonicalJson } from '../templates/common.mjs';
+import { breakGlassEnvironmentOf } from '../stack-names.mjs';
 
 const finding = (kind, message) => ({ kind, message });
 
@@ -78,11 +82,27 @@ export function checkStack({ record, stack, slug }) {
   if (st.name !== binding.stackName) {
     findings.push(finding('stack-replaced', `describe-stacks returned stack '${st.name}', not '${binding.stackName}'`));
   }
-  const tags = stackTagProblems(st.tags, { scope: plan.scope, slug });
-  if (tags.length > 0) {
-    findings.push(finding('stack-not-owned', `stack ${binding.stackName} no longer carries the SSD ownership tags: ${tags.join('; ')}`));
-  }
+  const owner = { scope: plan.scope, slug, environment: breakGlassEnvironmentOf(plan.stackKind) };
   if (operation === 'CREATE') {
+    // Observed AWS behaviour (Phase 3C live validation, 2026-10-05): the
+    // REVIEW_IN_PROGRESS placeholder of a CREATE change set has NO tags.
+    // CloudFormation keeps the tags on the change set and copies them onto the
+    // stack only when that change set executes. Before execution, ownership is
+    // therefore proven by the reviewed change set itself (here, and byte-for-
+    // byte by compareChangeSet), and the placeholder by identity: same stack id
+    // and name, REVIEW_IN_PROGRESS, unchanged revision.
+    const changeSetTags = stackTagProblems(tagList(record.changeSet?.Tags), owner);
+    if (changeSetTags.length > 0) {
+      findings.push(finding('change-set-not-owned', `the reviewed CREATE change set does not carry the SSD ownership tags: ${changeSetTags.join('; ')}`));
+    }
+    // An untagged placeholder is the normal case. A tagged one must carry
+    // exactly the SSD ownership tags: foreign tags mean it is not ours.
+    if (st.tags.length > 0) {
+      const placeholderTags = stackTagProblems(st.tags, owner);
+      if (placeholderTags.length > 0) {
+        findings.push(finding('stack-not-owned', `the CREATE placeholder ${binding.stackName} carries tags that are not the SSD ownership tags: ${placeholderTags.join('; ')}`));
+      }
+    }
     if (st.status !== 'REVIEW_IN_PROGRESS') {
       findings.push(finding('stack-changed', `the CREATE placeholder ${binding.stackName} is ${st.status}, not REVIEW_IN_PROGRESS: re-plan`));
     }
@@ -90,6 +110,10 @@ export function checkStack({ record, stack, slug }) {
       findings.push(finding('stack-changed', `the placeholder ${binding.stackName} changed since the plan (LastUpdatedTime ${st.lastUpdatedTime ?? 'none'}, recorded ${base.lastUpdatedTime ?? 'none'}): re-plan`));
     }
   } else {
+    const tags = stackTagProblems(st.tags, owner);
+    if (tags.length > 0) {
+      findings.push(finding('stack-not-owned', `stack ${binding.stackName} no longer carries the SSD ownership tags: ${tags.join('; ')}`));
+    }
     if (st.status !== base.stackStatus || st.lastUpdatedTime !== (base.lastUpdatedTime ?? null)) {
       findings.push(
         finding(

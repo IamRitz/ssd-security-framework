@@ -7,7 +7,10 @@
 //     it (a test may rewrite the live description);
 //   - its template (get-template --template-stage Original);
 //   - the stack: the base revision (UPDATE) or the REVIEW_IN_PROGRESS
-//     placeholder (CREATE), looked up by name or id;
+//     placeholder (CREATE), looked up by name or id. A CREATE placeholder has
+//     NO tags (observed live, Phase 3C, 2026-10-05: the change set carries the
+//     tags; CloudFormation copies them onto the stack only when it executes),
+//     so the default placeholder here is untagged and gains the tags on execute;
 //   - execute-change-set: counted, prints nothing (as the CLI does), marks the
 //     change set EXECUTE_IN_PROGRESS and starts the stack along `sequence` —
 //     one status per describe-stacks poll by stack id, the last one sticking.
@@ -63,7 +66,7 @@ function modelOf({ root, planId, sequence = null, stack = (doc) => doc, changeSe
       StackName: plan.stackName,
       StackId: stackId,
       StackStatus: operation === 'CREATE' ? 'REVIEW_IN_PROGRESS' : base.stackStatus,
-      Tags: plan.tags,
+      Tags: operation === 'CREATE' ? [] : plan.tags,
       CreationTime: '2026-08-01T10:00:00.000Z',
       ...(operation === 'UPDATE' && base.lastUpdatedTime ? { LastUpdatedTime: base.lastUpdatedTime } : {}),
       ...(operation === 'CREATE' && base.state === 'present' && base.lastUpdatedTime ? { LastUpdatedTime: base.lastUpdatedTime } : {})
@@ -95,7 +98,7 @@ function modelOf({ root, planId, sequence = null, stack = (doc) => doc, changeSe
         }
       }
       const status = state.sequence[Math.min(state.polls - 1, state.sequence.length - 1)];
-      state.stack = { ...state.stack, StackStatus: status, LastUpdatedTime: UPDATED_AT, ...(status.endsWith('_COMPLETE') ? { Outputs: outputs } : {}) };
+      state.stack = { ...state.stack, StackStatus: status, LastUpdatedTime: UPDATED_AT, ...(operation === 'CREATE' ? { Tags: plan.tags } : {}), ...(status.endsWith('_COMPLETE') ? { Outputs: outputs } : {}) };
       return ok({ Stacks: [state.stack] });
     },
     [`cloudformation describe-stack-resources --stack-name ${stackId}`]: () =>

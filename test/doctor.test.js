@@ -7,9 +7,9 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, lstatSync, mkdtempSync, readFileSync, readdirSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, lstatSync, mkdtempSync, readFileSync, readdirSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, relative } from 'node:path';
+import { dirname, join, relative } from 'node:path';
 import { after, describe, it } from 'node:test';
 
 import { main } from '../onboarding/cli.mjs';
@@ -21,7 +21,7 @@ import { FAIL, NOT_VERIFIED, PASS, WARN, describeSourceBoundary, diagnose, githu
 import { withMarker } from '../onboarding/lib/files.mjs';
 import { inspectRepository, parseGithubSlug, parseRemoteHost } from '../onboarding/lib/inspect.mjs';
 import { renderAll } from '../onboarding/lib/render.mjs';
-import { FRAMEWORK, SAMPLE_BASELINE, capture, commitAll, config, deepMerge, makeRepo, read, write } from './support/onboarding-fixtures.mjs';
+import { FRAMEWORK, SAMPLE_BASELINE, capture, commitAll, config, deepMerge, makeRepo, read, tempDir, write } from './support/onboarding-fixtures.mjs';
 
 // PATH shims that record any aws / gh invocation. Tests assert they stay empty.
 const SHIM_DIR = mkdtempSync(join(tmpdir(), 'ssd-doctor-shims-'));
@@ -55,6 +55,39 @@ async function cli(root, args, io = {}) {
 async function doctorJson(root, io) {
   const result = await cli(root, ['doctor', '--json'], io);
   return { ...result, report: result.out ? JSON.parse(result.out) : null };
+}
+
+// Git looks for a repository in every parent directory, so a directory with no
+// .git can still resolve to a repository above it. GIT_CEILING_DIRECTORIES stops
+// that search at `ceiling` (never searched, nor anything above it), which keeps
+// the identity tests from depending on whatever lies above the temp directory.
+// It is set for this one in-process call only: tests in a file run one at a
+// time, and every file runs in its own process. On failure, `gitView` says what
+// git resolved under the same ceiling.
+async function doctorJsonBelowCeiling(root, ceiling) {
+  const previous = process.env.GIT_CEILING_DIRECTORIES;
+  process.env.GIT_CEILING_DIRECTORIES = ceiling;
+  try {
+    const result = await doctorJson(root);
+    const revParse = (flag) => {
+      try {
+        return execFileSync('git', ['-C', root, 'rev-parse', flag], { stdio: ['ignore', 'pipe', 'pipe'] }).toString().trim();
+      } catch (error) {
+        return `exit ${error.status}: ${error.stderr.toString().trim()}`;
+      }
+    };
+    const gitView = `git under ceiling ${ceiling}: --show-toplevel → ${revParse('--show-toplevel')}; --absolute-git-dir → ${revParse('--absolute-git-dir')}`;
+    return { ...result, gitView };
+  } finally {
+    if (previous === undefined) delete process.env.GIT_CEILING_DIRECTORIES;
+    else process.env.GIT_CEILING_DIRECTORIES = previous;
+  }
+}
+
+// A copy of a checkout's working tree, without its .git, into `dest`.
+function copyWorkingTree(source, dest) {
+  cpSync(source, dest, { recursive: true, filter: (src) => src !== join(source, '.git') });
+  return dest;
 }
 
 const statusOf = (report, id) => report.checks.find((c) => c.id === id)?.status;
@@ -319,12 +352,30 @@ describe('doctor: readiness per repository state', () => {
     }
   });
 
-  it('a non-git directory: identity not established (WARN)', async (t) => {
+  it('a directory that never held .git: identity not established (WARN)', async (t) => {
+    const root = copyWorkingTree(await consumer(t), tempDir(t));
+    const { report, gitView } = await doctorJsonBelowCeiling(root, dirname(root));
+    assert.equal(statusOf(report, 'identity'), WARN, gitView);
+    assert.match(checkOf(report, 'identity').observed.join('\n'), /not a git repository/, gitView);
+  });
+
+  it('a checkout whose own .git was removed: identity not established (WARN)', async (t) => {
     const root = await consumer(t);
     rmSync(join(root, '.git'), { recursive: true, force: true });
-    const { report } = await doctorJson(root);
-    assert.equal(statusOf(report, 'identity'), WARN);
-    assert.match(checkOf(report, 'identity').observed.join('\n'), /not a git repository/);
+    const { report, gitView } = await doctorJsonBelowCeiling(root, dirname(root));
+    assert.equal(statusOf(report, 'identity'), WARN, gitView);
+    assert.match(checkOf(report, 'identity').observed.join('\n'), /not a git repository/, gitView);
+  });
+
+  it('a consumer in a subdirectory of a real repository: git finds the parent, identity PASS', async (t) => {
+    const outer = makeRepo(t);
+    const root = copyWorkingTree(await consumer(t), join(outer, 'service'));
+    commitAll(outer, 'nested consumer');
+    // The ceiling sits above the outer repository, so it must not hide it.
+    const { report, gitView } = await doctorJsonBelowCeiling(root, dirname(outer));
+    assert.equal(existsSync(join(root, '.git')), false, 'the consumer directory holds no .git of its own');
+    assert.equal(statusOf(report, 'identity'), PASS, gitView);
+    assert.match(checkOf(report, 'identity').observed.join('\n'), /git: origin acme\/app, origin\/HEAD main/, gitView);
   });
 
   it('no CODEOWNERS: WARN naming every protected path', async (t) => {
