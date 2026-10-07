@@ -57,7 +57,7 @@ import { REPO_LOGICAL_IDS } from './templates/repo-ecr-delivery.mjs';
 import { canonicalJson } from './templates/common.mjs';
 import { roleName } from './discover/iam-role.mjs';
 import { breakGlassNames } from './break-glass/names.mjs';
-import { breakGlassEnvironmentOf } from './stack-names.mjs';
+import { BREAK_GLASS_GOVERNANCE_STACKS, breakGlassKindOf } from './stack-names.mjs';
 
 export const SCHEMA_VERSION = 1;
 export const APPLY_RECORD_SCHEMA_VERSION = 1;
@@ -259,8 +259,14 @@ function nextSteps(config, record, resources) {
 // After a break-glass stack is applied: the out-of-band steps the plan
 // deliberately does not perform (no secret value ever passes through ssd-onboard).
 function breakGlassNextSteps(record) {
-  const environment = breakGlassEnvironmentOf(record.plan.stackKind);
+  const { family, environment } = breakGlassKindOf(record.plan.stackKind);
   const n = breakGlassNames(environment);
+  if (family === 'governance') {
+    return [
+      `Run \`ssd-onboard aws verify --scope break-glass-governance --environment ${environment} --operator-config <file> --policy-config <file>\` to prove ${BREAK_GLASS_GOVERNANCE_STACKS[environment]} (ownership, byte-exact value, admission, readers and writers).`,
+      `The broker reads ${n.frameworkPolicyParameter} on every notify, status and click: a commit removed from it is refused on the next call.`
+    ];
+  }
   return [
     `Put each secret value out of band, from a file descriptor, never argv — e.g. \`aws secretsmanager put-secret-value --secret-id ${n.secrets.slackBotToken} --secret-string file:///dev/stdin\`, and the same for ${n.secrets.slackSigningSecret} and ${n.secrets.githubToken}. Until then the broker cannot start (fail closed).`,
     `Set the Slack Request URL of the ${environment} Slack app to the Function URL of ${n.functions.interactions} (aws lambda get-function-url-config). Only after the secrets are in place: Slack verifies the URL when it is saved.`,
@@ -311,6 +317,7 @@ function applyRecord(report, record, { appliedAt, waited }) {
 export async function awsApply({
   config = null,
   operator = null,
+  policy = null,
   planId,
   account,
   region,
@@ -351,7 +358,7 @@ export async function awsApply({
   report.changes = { counts: record.counts, destructive: record.destructive, items: record.changes };
 
   // 3. Intent, configuration and framework binding.
-  if (!step(report, 'intent', 'Account, region, repository, stack, configuration and framework match', checkIntent({ plan, config, operator, framework, account, region }))) {
+  if (!step(report, 'intent', 'Account, region, repository, stack, configuration and framework match', checkIntent({ plan, config, operator, policy, framework, account, region }))) {
     return refuse(report);
   }
 

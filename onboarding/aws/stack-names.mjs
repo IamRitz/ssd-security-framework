@@ -40,13 +40,30 @@ export const BREAK_GLASS_STACKS = Object.freeze({
   production: 'ssd-break-glass-production',
   synthetic: 'ssd-break-glass-synthetic'
 });
+// Phase 3D: one governance stack per environment, holding exactly that
+// environment's allowed-framework-commit parameter.
+export const BREAK_GLASS_GOVERNANCE_STACKS = Object.freeze({
+  production: 'ssd-break-glass-production-governance',
+  synthetic: 'ssd-break-glass-synthetic-governance'
+});
 // The plan stack kind of each environment's stack (plan/scope.mjs).
 export const breakGlassStackKind = (environment) => `break-glass-${environment}`;
+export const breakGlassGovernanceStackKind = (environment) => `break-glass-governance-${environment}`;
+
+// Every break-glass stack kind, by family. A family is never inferred from a
+// prefix: only these exact kinds exist.
+const BREAK_GLASS_KINDS = Object.freeze(
+  Object.fromEntries(
+    BREAK_GLASS_ENVIRONMENTS.flatMap((environment) => [
+      [breakGlassStackKind(environment), Object.freeze({ family: 'shared', environment })],
+      [breakGlassGovernanceStackKind(environment), Object.freeze({ family: 'governance', environment })]
+    ])
+  )
+);
+// stack kind -> { family: 'shared' | 'governance', environment }, or null.
+export const breakGlassKindOf = (stackKind) => (typeof stackKind === 'string' && Object.hasOwn(BREAK_GLASS_KINDS, stackKind) ? BREAK_GLASS_KINDS[stackKind] : null);
 // stack kind -> environment, or null for a kind that is not a break-glass stack.
-export function breakGlassEnvironmentOf(stackKind) {
-  const environment = typeof stackKind === 'string' && stackKind.startsWith('break-glass-') ? stackKind.slice('break-glass-'.length) : null;
-  return BREAK_GLASS_ENVIRONMENTS.includes(environment) ? environment : null;
-}
+export const breakGlassEnvironmentOf = (stackKind) => breakGlassKindOf(stackKind)?.environment ?? null;
 
 const PREFIX = 'ssd-delivery-';
 const MAX_STACK_NAME = 128;

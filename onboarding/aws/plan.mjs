@@ -512,6 +512,10 @@ export async function recordPlans({ units, base, scope, tags, aws, account, regi
       counts: result.counts,
       destructive: result.destructive,
       planIdInput: unit.planIdInput,
+      // Evidence a scope records beside the plan (governance: the admission
+      // result and the origin/main commit it was checked against). Not bound
+      // by the plan id; plan.json itself is hash-checked by apply.
+      ...(unit.record ?? {}),
       files: Object.fromEntries(Object.entries(files).map(([name, text]) => [name, sha256(text)]))
     };
     unit.directory = await writePlanDirectory(root, unit.planId, { ...files, 'plan.json': canonicalJson(plan) }, env);

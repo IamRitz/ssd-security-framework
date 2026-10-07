@@ -80,3 +80,44 @@ export function frameworkProblems(framework, config) {
   }
   return problems;
 }
+
+// Phase 3D admission (onboarding/aws/break-glass/admission.mjs): local git
+// questions about OTHER commits of the framework checkout. Read-only, no
+// network, nothing fetched.
+const COMMIT = /^[0-9a-f]{40}$/;
+// git over the framework checkout at `root`. Every method answers from local
+// objects only and never throws: an unanswerable question is null.
+export function frameworkGit(root) {
+  const git = async (args) => {
+    try {
+      return { ok: true, stdout: (await run('git', ['-C', root, ...args], { maxBuffer: 4 * 1024 * 1024 })).stdout };
+    } catch (error) {
+      return { ok: false, code: typeof error?.code === 'number' ? error.code : null };
+    }
+  };
+  return {
+    // -> true | false | null (git could not answer)
+    async isCommit(sha) {
+      const r = await git(['cat-file', '-t', sha]);
+      if (r.ok) return r.stdout.trim() === 'commit';
+      return r.code === 128 ? false : null;
+    },
+    // -> 40-hex | null
+    async resolve(ref) {
+      const r = await git(['rev-parse', '--verify', '--quiet', `${ref}^{commit}`]);
+      const sha = r.ok ? r.stdout.trim() : '';
+      return COMMIT.test(sha) ? sha : null;
+    },
+    // -> true | false | null. merge-base --is-ancestor exits 0 (yes) or 1 (no).
+    async isAncestor(sha, ref) {
+      const r = await git(['merge-base', '--is-ancestor', sha, ref]);
+      if (r.ok) return true;
+      return r.code === 1 ? false : null;
+    },
+    // -> file text at that commit | null
+    async show(sha, path) {
+      const r = await git(['show', `${sha}:${path}`]);
+      return r.ok ? r.stdout : null;
+    }
+  };
+}

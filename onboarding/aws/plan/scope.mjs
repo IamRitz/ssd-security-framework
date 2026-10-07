@@ -21,6 +21,12 @@
 // other shared kind gains IAM roles. A break-glass kind never holds a
 // per-repository resource (ECR repository, invoker role) or an account-level
 // one (the OIDC provider, registry scanning, Inspector).
+//
+// Break-glass governance (Phase 3D): the two kinds break-glass-governance-
+// production and break-glass-governance-synthetic hold exactly ONE
+// AWS::SSM::Parameter (the environment's allowed framework commits) and
+// nothing else — no role, no function, no other parameter.
+import { GOVERNANCE_RESOURCE_TYPES } from '../templates/break-glass-governance.mjs';
 import { BREAK_GLASS_RESOURCE_TYPES } from '../templates/shared-break-glass.mjs';
 import { REPO_LOGICAL_IDS } from '../templates/repo-ecr-delivery.mjs';
 import { OIDC_LOGICAL_ID } from '../templates/shared-github-oidc.mjs';
@@ -47,7 +53,9 @@ export const STACK_KINDS = Object.freeze({
     resources: Object.freeze({ [OIDC_LOGICAL_ID]: 'AWS::IAM::OIDCProvider' })
   }),
   'break-glass-production': Object.freeze({ scope: 'break-glass', environment: 'production', resources: BREAK_GLASS_RESOURCE_TYPES }),
-  'break-glass-synthetic': Object.freeze({ scope: 'break-glass', environment: 'synthetic', resources: BREAK_GLASS_RESOURCE_TYPES })
+  'break-glass-synthetic': Object.freeze({ scope: 'break-glass', environment: 'synthetic', resources: BREAK_GLASS_RESOURCE_TYPES }),
+  'break-glass-governance-production': Object.freeze({ scope: 'break-glass', family: 'governance', environment: 'production', resources: GOVERNANCE_RESOURCE_TYPES }),
+  'break-glass-governance-synthetic': Object.freeze({ scope: 'break-glass', family: 'governance', environment: 'synthetic', resources: GOVERNANCE_RESOURCE_TYPES })
 });
 
 // Resource types that are shared by nature: never in a repo-scope stack, even
@@ -60,6 +68,8 @@ const REPO_ONLY = /^AWS::(?:ECR::Repository|IAM::Role)$/;
 // defense in depth: today every kind's exact logicalId -> type table already
 // refuses a foreign type; these guards hold if a future edit widens a table.
 const BREAK_GLASS_ONLY = /^AWS::(?:DynamoDB::Table|SecretsManager::Secret|Logs::LogGroup|IAM::Role|Lambda::(?:Function|Url|Permission|EventInvokeConfig))$/;
+// The only resource type a governance stack may hold.
+const GOVERNANCE_ONLY = /^AWS::SSM::Parameter$/;
 
 const TEMPLATE_KEYS = new Set(['AWSTemplateFormatVersion', 'Description', 'Resources']);
 
@@ -75,7 +85,10 @@ function assertType(kind, stackKind, logicalId, type, where) {
   if (kind.scope === 'repo' && SHARED_ONLY.test(type)) {
     throw new ScopeError(`${where}: ${logicalId} is ${type}, a shared resource; a repo-scope plan never contains it`);
   }
-  if (kind.scope === 'break-glass' && !BREAK_GLASS_ONLY.test(type)) {
+  if (kind.family === 'governance' && !GOVERNANCE_ONLY.test(type)) {
+    throw new ScopeError(`${where}: ${logicalId} is ${type}; a break-glass governance stack holds only its allowed-commit parameter`);
+  }
+  if (kind.scope === 'break-glass' && !kind.family && !BREAK_GLASS_ONLY.test(type)) {
     throw new ScopeError(`${where}: ${logicalId} is ${type}; a break-glass stack holds only its functions, table, secrets, log groups and execution roles`);
   }
   if (kind.scope === 'shared' && REPO_ONLY.test(type)) {

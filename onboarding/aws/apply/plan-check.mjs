@@ -12,8 +12,9 @@ import { assertDescribedMatches, classifyChanges, countChanges } from '../plan/c
 import { assertChangeScope, assertTemplateScope } from '../plan/scope.mjs';
 import { changeSetNameOf, configDigestOf } from '../plan/record.mjs';
 import { LIVE } from '../discover/stacks.mjs';
-import { BREAK_GLASS_STACKS, SHARED_STACKS, breakGlassEnvironmentOf, canonicalSlug, repoStackName } from '../stack-names.mjs';
+import { BREAK_GLASS_GOVERNANCE_STACKS, BREAK_GLASS_STACKS, SHARED_STACKS, breakGlassEnvironmentOf, breakGlassKindOf, canonicalSlug, repoStackName } from '../stack-names.mjs';
 import { operatorDigestOf } from '../break-glass/operator-config.mjs';
+import { governanceDigestOf } from '../break-glass/governance-plan.mjs';
 import { canonicalJson, ssdTags } from '../templates/common.mjs';
 import { frameworkProblems } from '../../lib/framework.mjs';
 
@@ -28,8 +29,9 @@ const finding = (kind, message) => ({ kind, message });
 export function expectedStackName(stackKind, slug) {
   if (stackKind === 'repo') return repoStackName(slug);
   if (stackKind === 'shared-github-oidc') return SHARED_STACKS.githubOidc;
-  const environment = breakGlassEnvironmentOf(stackKind);
-  if (environment) return BREAK_GLASS_STACKS[environment];
+  const kind = breakGlassKindOf(stackKind);
+  if (kind?.family === 'shared') return BREAK_GLASS_STACKS[kind.environment];
+  if (kind?.family === 'governance') return BREAK_GLASS_GOVERNANCE_STACKS[kind.environment];
   return null;
 }
 
@@ -179,9 +181,9 @@ export function checkPlanRecord({ plan, texts }) {
 // Each kind of plan needs its own kind of configuration: a break-glass plan
 // is never applied against .ssd/onboarding.yml, nor a delivery plan against
 // an operator config.
-export function checkIntent({ plan, config = null, operator = null, framework, account, region }) {
-  if (plan.scope === 'break-glass' || operator) {
-    return checkOperatorIntent({ plan, operator, framework, account, region });
+export function checkIntent({ plan, config = null, operator = null, policy = null, framework, account, region }) {
+  if (plan.scope === 'break-glass' || operator || policy) {
+    return checkOperatorIntent({ plan, operator, policy, framework, account, region });
   }
   if (!config) {
     return [finding('config-kind-mismatch', `a ${plan.scope} plan is applied against .ssd/onboarding.yml, which was not loaded`)];
@@ -212,12 +214,22 @@ export function checkIntent({ plan, config = null, operator = null, framework, a
   return findings;
 }
 
-function checkOperatorIntent({ plan, operator, framework, account, region }) {
+// The configuration a break-glass plan of each family is bound to, and which
+// extra file it needs: shared = the operator config alone; governance = the
+// operator config + --policy-config. A file of the wrong kind refuses.
+function checkOperatorIntent({ plan, operator, policy, framework, account, region }) {
   if (plan.scope !== 'break-glass') {
     return [finding('config-kind-mismatch', `this is a ${plan.scope} plan; --operator-config applies only to break-glass plans (apply it from the consumer repository, without --operator-config)`)];
   }
   if (!operator) {
     return [finding('config-kind-mismatch', 'this is a break-glass plan: apply it with --operator-config <the file it was planned from>')];
+  }
+  const kind = breakGlassKindOf(plan.stackKind);
+  if (kind?.family === 'governance' && !policy) {
+    return [finding('config-kind-mismatch', 'this is a break-glass governance plan: apply it with --operator-config and --policy-config <the files it was planned from>')];
+  }
+  if (kind?.family !== 'governance' && policy) {
+    return [finding('config-kind-mismatch', `--policy-config applies only to break-glass governance plans, not ${plan.stackKind}`)];
   }
   const findings = [];
   if (account !== plan.account || account !== operator.aws.accountId) {
@@ -227,10 +239,17 @@ function checkOperatorIntent({ plan, operator, framework, account, region }) {
     findings.push(finding('region-mismatch', `--region ${region}, plan region ${plan.region} and aws.region ${operator.aws.region} must all be equal`));
   }
   const environment = breakGlassEnvironmentOf(plan.stackKind);
-  if (!environment || plan.stackName !== BREAK_GLASS_STACKS[environment]) {
+  if (!environment || plan.stackName !== expectedStackName(plan.stackKind, null)) {
     findings.push(finding('stack-mismatch', `the plan names stack ${plan.stackName}, not the ${plan.stackKind} stack`));
   }
-  if (plan.createdFromConfigDigest !== operatorDigestOf(operator)) {
+  if (kind?.family === 'governance') {
+    if (policy.environment !== environment) {
+      findings.push(finding('environment-mismatch', `--policy-config is for '${policy.environment}', but the plan is for '${environment}'`));
+    }
+    if (plan.createdFromConfigDigest !== governanceDigestOf(operator, policy)) {
+      findings.push(finding('config-changed', 'the operator configuration or the framework policy changed since this plan was created: re-plan against the current files'));
+    }
+  } else if (plan.createdFromConfigDigest !== operatorDigestOf(operator)) {
     findings.push(finding('config-changed', 'the operator configuration changed since this plan was created: re-plan against the current file'));
   }
   for (const problem of frameworkProblems(framework, operator)) {

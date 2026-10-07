@@ -53,6 +53,12 @@ const BREAK_GLASS_SECRET_ID = /^(?:arn:(?:aws|aws-cn|aws-us-gov):secretsmanager:
 const BREAK_GLASS_FUNCTION = /^ssd-break-glass-(?:production|synthetic)-(?:ci|interactions)$/;
 const BREAK_GLASS_TABLE = /^ssd-break-glass-(?:production|synthetic)-requests$/;
 const BREAK_GLASS_LOG_PREFIX = /^\/aws\/lambda\/ssd-break-glass-(?:production|synthetic)-(?:ci|interactions)$/;
+// Phase 3D governance: its two stacks and the one parameter each holds.
+const GOVERNANCE_STACK_NAMES = /^ssd-break-glass-(?:production|synthetic)-governance$/;
+const FRAMEWORK_POLICY_PARAMETER = /^\/ssd\/break-glass\/(?:production|synthetic)\/governance\/allowed-framework-shas$/;
+// The four break-glass execution roles: the only principals governance verify
+// simulates (who may read, and who must never write, the parameter).
+const BREAK_GLASS_EXECUTION_ROLE_ARN = /^arn:(?:aws|aws-cn|aws-us-gov):iam::\d{12}:role\/ssd-break-glass-(?:production|synthetic)-(?:ci|interactions)-execution$/;
 const is = (re) => (value) => re.test(value);
 
 // service -> operation -> the flags it may be called with. A flag listed with
@@ -242,6 +248,65 @@ export const BREAK_GLASS_PLANNING_OPERATIONS = union(READ_ONLY_OPERATIONS, union
   }
 }));
 
+// --- the governance allowlists (Phase 3D) ------------------------------------------
+
+// describe-parameters with exactly one Name=Equals filter on one governance
+// parameter: never a path, prefix or wildcard listing.
+function governanceParameterFilter(value) {
+  try {
+    const parsed = JSON.parse(value);
+    return (
+      Array.isArray(parsed) &&
+      parsed.length === 1 &&
+      Object.keys(parsed[0] ?? {}).sort().join() === 'Key,Option,Values' &&
+      parsed[0].Key === 'Name' &&
+      parsed[0].Option === 'Equals' &&
+      Array.isArray(parsed[0].Values) &&
+      parsed[0].Values.length === 1 &&
+      FRAMEWORK_POLICY_PARAMETER.test(parsed[0].Values[0])
+    );
+  } catch {
+    return false;
+  }
+}
+
+// NOT a union with READ_ONLY_OPERATIONS: governance reads exactly what it
+// needs. get-parameter has no --with-decryption (the value is a String).
+const GOVERNANCE_READS = {
+  sts: { 'get-caller-identity': {} },
+  cloudformation: {
+    'describe-stacks': { '--stack-name': true },
+    'describe-stack-resources': { '--physical-resource-id': matches(FRAMEWORK_POLICY_PARAMETER), '--stack-name': matches(GOVERNANCE_STACK_NAMES) }
+  },
+  ssm: {
+    'get-parameter': { '--name': matches(FRAMEWORK_POLICY_PARAMETER) }
+  }
+};
+
+// `aws plan --scope break-glass-governance`: governance reads plus the
+// planning calls confined to the two governance stacks. No --capabilities
+// (the stack holds no IAM resource), so CAPABILITY_NAMED_IAM is refused.
+export const GOVERNANCE_PLANNING_OPERATIONS = union(GOVERNANCE_READS, {
+  cloudformation: {
+    'validate-template': { '--template-body': templateBody },
+    'create-change-set': {
+      '--stack-name': matches(GOVERNANCE_STACK_NAMES),
+      '--change-set-name': matches(CHANGE_SET_NAME),
+      '--change-set-type': matches(/^(?:CREATE|UPDATE)$/),
+      '--template-body': templateBody,
+      '--tags': ssdTags
+    },
+    'describe-change-set': { '--stack-name': matches(GOVERNANCE_STACK_NAMES), '--change-set-name': matches(CHANGE_SET_NAME) }
+  }
+});
+
+// `aws verify --scope break-glass-governance`: governance reads, the tier
+// (describe-parameters, one exact name), and simulation of the execution roles.
+export const GOVERNANCE_READ_OPERATIONS = union(GOVERNANCE_READS, {
+  ssm: { 'describe-parameters': { '--parameter-filters': governanceParameterFilter } },
+  iam: { 'simulate-principal-policy': { '--policy-source-arn': matches(BREAK_GLASS_EXECUTION_ROLE_ARN), '--action-names': true, '--resource-arns': true } }
+});
+
 // --- the apply allowlist (Phase 2C) ------------------------------------------------
 
 // Every value is the recorded plan's own: compared for equality, never matched
@@ -254,7 +319,7 @@ const CHANGE_SET_ARN = /^arn:(?:aws|aws-cn|aws-us-gov):cloudformation:[a-z0-9-]+
 function assertBinding(binding) {
   const { stackName, stackId, changeSetArn } = binding ?? {};
   const strings = [stackName, stackId, changeSetArn].every((v) => typeof v === 'string');
-  if (!strings || !(STACK_NAMES.test(stackName) || BREAK_GLASS_STACK_NAMES.test(stackName)) || STACK_ID.exec(stackId)?.[1] !== stackName || !CHANGE_SET_ARN.test(changeSetArn)) {
+  if (!strings || !(STACK_NAMES.test(stackName) || BREAK_GLASS_STACK_NAMES.test(stackName) || GOVERNANCE_STACK_NAMES.test(stackName)) || STACK_ID.exec(stackId)?.[1] !== stackName || !CHANGE_SET_ARN.test(changeSetArn)) {
     throw new AwsCliError('refused', "refusing to create an apply wrapper without the recorded plan's exact stack name, stack id (of that stack) and ssd-plan change-set ARN");
   }
 }
@@ -353,7 +418,9 @@ const NOT_FOUND_CODES = new Set([
   'LifecyclePolicyNotFoundException',
   'RepositoryPolicyNotFoundException',
   'InvalidInstanceID.NotFound',
-  'ResourceNotFoundException'
+  'ResourceNotFoundException',
+  // ssm get-parameter (Phase 3D); absence still counts only where a read names it.
+  'ParameterNotFound'
 ]);
 // Local CLI messages printed before any request is made.
 const NO_CREDENTIALS = [/Unable to locate credentials/i, /Error when retrieving credentials/i, /could not be found in the credentials/i, /The config profile .* could not be found/i];
@@ -525,6 +592,26 @@ export function assertBreakGlassPlanning(argv) {
   assertAllowed(argv, BREAK_GLASS_PLANNING_OPERATIONS, BREAK_GLASS_PLANNING_WORDS);
 }
 
+const GOVERNANCE_READ_WORDS = { list: 'the break-glass governance read-only allowlist (aws verify --scope break-glass-governance makes no AWS changes)', kind: 'read' };
+const GOVERNANCE_PLANNING_WORDS = { list: 'the break-glass governance planning allowlist (aws plan --scope break-glass-governance never executes a change set)', kind: 'planning' };
+
+// Flags that must be PRESENT, not merely allowed: describe-parameters without
+// its one-name filter would list every parameter of the account.
+const GOVERNANCE_REQUIRED_FLAGS = Object.freeze({ 'ssm describe-parameters': ['--parameter-filters'], 'ssm get-parameter': ['--name'] });
+
+export function assertGovernanceRead(argv) {
+  assertAllowed(argv, GOVERNANCE_READ_OPERATIONS, GOVERNANCE_READ_WORDS);
+  for (const flag of GOVERNANCE_REQUIRED_FLAGS[`${argv[0]} ${argv[1]}`] ?? []) {
+    if (!argv.includes(flag)) {
+      throw new AwsCliError('refused', `refusing 'aws ${argv[0]} ${argv[1]}' without ${flag}: ${GOVERNANCE_READ_WORDS.list}`, { operation: `${argv[0]} ${argv[1]}` });
+    }
+  }
+}
+
+export function assertGovernancePlanning(argv) {
+  assertAllowed(argv, GOVERNANCE_PLANNING_OPERATIONS, GOVERNANCE_PLANNING_WORDS);
+}
+
 // --- execution ----------------------------------------------------------------------
 
 // The real executor: execFile, argv array, no shell. Resolves with
@@ -582,6 +669,15 @@ export function breakGlassReadAws(options = {}) {
 
 export function breakGlassPlanningAws(options = {}) {
   return wrapper(assertBreakGlassPlanning, options);
+}
+
+// Phase 3D: the governance wrappers.
+export function governanceReadAws(options = {}) {
+  return wrapper(assertGovernanceRead, options);
+}
+
+export function governancePlanningAws(options = {}) {
+  return wrapper(assertGovernancePlanning, options);
 }
 
 // applyAws({ region, binding, ...readOnlyAws options }) — the same contract
