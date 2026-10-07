@@ -91,7 +91,7 @@ A replacement or removal is still classified and counted by the plan, and
 
 Not in these stacks: the per-repository invoker roles and approver parameters
 (Phase 3D), the reviewed-SHA policy (3D), and the synthetic workflow contract
-(3E).
+(3E). See [Phase sequence and gates](#phase-sequence-and-gates).
 
 ## IAM: exactly what the broker calls
 
@@ -279,35 +279,75 @@ The run is read-only. Each fact is its own check:
 Effective access comes from `iam simulate-principal-policy`, as in Phase 2D. It
 does not evaluate resource, session or VPC endpoint policies.
 
-## Not production-ready until live validation passes
+## Phase sequence and gates
 
-Phase 3C is reviewed and tested against recorded AWS behaviour only. Nothing
-has been deployed, so **these stacks are not production-ready** until every
-check below passes against real deployed stacks. These are pre-merge and
-pre-production requirements, not follow-ups:
+Each phase merges once the checks it can satisfy on its own have passed.
+Production use waits for all of them
+([architecture E.2](onboarding-architecture.md#e2-concrete-defect-to-fix-first-caller-asserted-repository):
+the hardened broker is not put into production use until the carried-forward
+items land).
 
-1. **`aws verify --scope break-glass`** against the deployed **production and
-   synthetic** stacks. This is the live proof of the CI role's
-   `dynamodb:PutItem` on its own table (and its denial on the other
-   environment's), TTL `ENABLED` on `ttl`, and separation.
+| Phase | Delivers | Merge gate |
+| --- | --- | --- |
+| **3C** (this page) | the shared production and synthetic stacks: template, plan, apply, verify | live validation of the shared infrastructure on the **synthetic** stack ([below](#phase-3c-pre-merge-gate-met-on-the-synthetic-stack)) |
+| **3D** | per-repository invoker roles; approver SSM parameters `/ssd/break-glass/<environment>/approvers/<repository_id>`; the reviewed/allowed framework-SHA policy | the per-invoker-role checks of [architecture E.7](onboarding-architecture.md#e7-verification) that apply, against the synthetic stack |
+| **3E** | the separate synthetic workflow contract; the ported `verify-live` suite | the negative, race and timeout suite, against the synthetic stack only |
+| **Pre-production** | production in service | [below](#pre-production-gate-after-3d-and-3e) |
+
+The 3E suite is not a 3C merge gate. Its approver, race and timeout cases need
+a request filed with a verified repository identity through a per-repository
+invoker role, and an approver parameter to authorize against. Both are 3D, so
+gating 3C on 3E would block 3C on its own successors.
+
+### Phase 3C pre-merge gate: met on the synthetic stack
+
+Observed live against `ssd-break-glass-synthetic`, deployed from the reviewed,
+published artifact and verified at framework commit `1feaad3`:
+
+1. **`aws verify --scope break-glass`: 25 PASS, 2 WARN, 0 NOT VERIFIED,
+   0 FAIL.** This is the live proof of the CI role's `dynamodb:PutItem` on its
+   own table (and its denial on the other environment's), TTL `ENABLED` on
+   `ttl`, both roles' required and negative access, and production separation.
+   Both warnings are expected:
+   - `bg.ci-concurrency`: the CI broker has no reservation (advisory, above);
+   - `bg.secrets`: all three secret containers are empty, as created.
 2. **Live `CodeSha256` comparison.** `bg.ci-code` and `bg.interactions-code`
-   must pass against the deployed functions. That proves
-   `base64(hex-decode(sha256))` is the value Lambda reports for the configured
+   pass: both functions report `base64(hex-decode(sha256))` of the configured
    artifact.
-3. **Empty secrets as created.** Immediately after the first apply, and before
-   any value is put, `describe-secret` must show each CloudFormation-created
-   secret with no `AWSCURRENT` version (verify: `bg.secrets` WARN "has no
-   value yet"). The CloudFormation reference documents this; it has not been
-   observed.
-4. **The live Function URL resource-policy shape.** Observe `lambda get-policy`
-   on the interaction function, and confirm that `bg.interactions-exposure`
-   recognises exactly the two statements CloudFormation created (in particular
-   how the `InvokedViaFunctionUrl` condition is rendered). Verify fails closed
-   if the shape differs; adjust the expected shape only from that observation.
-5. **The synthetic negative suite (Phase 3E)** against the synthetic stack, and
-   only that stack, before any production use: unsigned, tampered, stale and
-   wrong-secret requests; unauthorized and other-repository approvers; the
-   concurrent-claim race; timeout.
+3. **Empty secrets as created.** After the first apply, and before any value
+   was put, `describe-secret` showed each CloudFormation-created secret with no
+   versions and no `AWSCURRENT`.
+4. **The live Function URL resource-policy shape.** `lambda get-policy` on the
+   interaction function returned exactly the two statements CloudFormation
+   created, `lambda:InvokeFunctionUrl` (FunctionUrlAuthType `NONE`) and
+   `lambda:InvokeFunction` (InvokedViaFunctionUrl `true`), and
+   `bg.interactions-exposure` recognises them.
+
+Phase 3C does **not** deploy the production stack. Its template is reviewed and
+tested against recorded AWS behaviour only, and its live proof is the
+pre-production gate.
+
+### Pre-production gate (after 3D and 3E)
+
+**The production stack is not production-ready** until, after 3D and 3E have
+landed:
+
+1. **Production deployed and verified on the final reviewed artifact.** Deploy
+   `ssd-break-glass-production` from the artifact that carries every
+   merged broker change, and pass `aws verify --scope break-glass` against the
+   production and synthetic stacks. That includes the live `CodeSha256`
+   comparison, empty secrets as created, and the Function URL resource-policy
+   shape, now on production. Verify fails closed if the policy shape differs;
+   adjust the expected shape only from an observation.
+2. **Production secrets populated** out of band (`put-secret-value
+   --secret-string file:///dev/stdin`), never in config, templates, change
+   sets, plans, argv or logs.
+3. **The production Slack Request URL configured**: the production Slack app's
+   Interactivity Request URL set to the production interaction function's
+   Function URL. It must be live when saved
+   ([onboarding.md § 3.3](onboarding.md#33-the-slack-app-org)).
+4. **Repository approver parameters onboarded** (Phase 3D), one per repository,
+   before its first request. Until then nobody is authorized for it.
 
 ## Residual limitations
 

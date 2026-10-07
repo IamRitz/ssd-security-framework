@@ -1320,7 +1320,19 @@ What exists, and where it refines D.8:
 
 ## Part E — Phase 3: break-glass provisioning
 
-Not implemented. Design:
+**Status.** Partly implemented, in sub-phases:
+
+| Phase | Scope | State |
+| --- | --- | --- |
+| 3A | broker verifies the caller's GitHub OIDC identity (E.2) | merged (PR #16) |
+| 3B | broker reads approvers from per-repository SSM parameters (E.3) | merged (PR #17) |
+| 3C | shared production and synthetic stacks (E.4), plus synthetic infrastructure live validation | implemented; live-validated on the synthetic stack only; production stack not deployed |
+| 3D | per-repository invoker roles, approver parameters, reviewed/allowed framework-SHA policy, and the live role checks that apply (E.7) | not implemented |
+| 3E | synthetic workflow contract; synthetic negative, race and timeout suite (E.7) | not implemented |
+| pre-production | production deployed and verified on the final reviewed artifact; production secrets; production Slack Request URL; repository approver parameters | after 3D and 3E |
+
+Gates per phase: [break-glass-provisioning.md § Phase sequence and gates](break-glass-provisioning.md#phase-sequence-and-gates).
+Design:
 
 ### E.1 Architecture kept
 
@@ -1352,7 +1364,7 @@ and derives `repository`, `repository_id`, `ref`, `run_id` **from the token**,
 rejecting any payload context that disagrees. The approver map is then keyed by
 the immutable `repository_id`.
 
-**Status: implemented in Phase 3A (broker code; deployment is Phase 3C).** The
+**Status: implemented in Phase 3A (broker code; its stacks are Phase 3C).** The
 broker now lives in this repository (`broker/`, imported unchanged from
 `IamRitz/secure-software-delivery@6c37d7d` and then hardened). It differs from
 the sketch above in three places, each one stricter:
@@ -1380,16 +1392,17 @@ the sketch above in three places, each one stricter:
 Contract and rollout: [break-glass-setup.md § Who is asking](break-glass-setup.md#who-is-asking-verified-github-identity).
 
 **Carried forward. These are not part of 3A, and the hardened broker is not
-deployed until they land:**
+put into production use until they land.** Phase 3C deploys it to the
+synthetic stack only, for live validation:
 
 1. **3B (done in broker code):** the approver map moved from the interaction
-   function's environment to one SSM parameter per repository (E.3). 3C still
-   has to create the parameters and grant the `ssm:GetParameter` scope.
-2. **3C:** CloudFormation/IAM deployment of the production and synthetic
-   stacks. The CI broker execution role's `dynamodb:PutItem` on the table
-   (used by the replay record) and TTL on `ttl` are, today, verified only
-   against the imported provisioning source. 3C must declare them, and live
-   verification must prove them (E.7).
+   function's environment to one SSM parameter per repository (E.3). 3C grants
+   the interaction role's `ssm:GetParameter` scope; 3D creates the parameters.
+2. **3C:** CloudFormation/IAM for the production and synthetic stacks. It
+   declares the CI broker execution role's `dynamodb:PutItem` on the table
+   (used by the replay record) and TTL on `ttl`, and `aws verify` has proven
+   both live on the synthetic stack (E.7). Production's live proof is the
+   pre-production gate.
 3. **3D:** an exact SHA is necessary but **not sufficient**. Today the broker
    accepts any 40-hex SHA of the framework repository, including a commit on an
    unmerged branch. That does not reopen cross-repository forgery, because
@@ -1415,10 +1428,12 @@ Approver mappings move out of the interaction function's environment (changing i
 is a shared-resource mutation per repo) into per-repository SSM parameters,
 `/ssd/break-glass/<environment>/approvers/<repository_id>` (a JSON list of Slack
 user IDs), read with `ssm:GetParameter` on that path prefix only. Onboarding a
-repository = one per-repo stack: its invoker role + its parameter. The interaction
-function's missing/malformed parameter semantics stay fail-closed (nobody authorized).
+repository = one per-repo stack: its invoker role + its parameter (Phase 3D).
+The interaction function's missing/malformed parameter semantics stay
+fail-closed (nobody authorized).
 
-**Status: implemented in Phase 3B (broker code; parameters and IAM are 3C).**
+**Status: implemented in Phase 3B (broker code; the interaction role's
+`ssm:GetParameter` scope is 3C; the per-repository parameters are 3D).**
 `broker/authorize/approvers.mjs` reads
 `/ssd/break-glass/<BREAK_GLASS_ENVIRONMENT>/approvers/<verified repository_id>`
 at click time, with no cache and a 2 s timeout. A missing, empty or malformed
@@ -1460,6 +1475,10 @@ Recommendation: move to a GitHub App with `pull_requests: write` only, private k
 in Secrets Manager, in a dedicated broker change. Not silently redesigned here.
 
 ### E.7 Verification
+
+The shared stacks' own checks are Phase 3C (`aws verify --scope break-glass`).
+The per-invoker-role checks below are Phase 3D, and the `verify-live.mjs`
+suite is Phase 3E.
 
 `aws verify --break-glass` must include, per repository invoker role, negative
 checks via `iam simulate-principal-policy` (read-only) **and** a GitHub-run probe
