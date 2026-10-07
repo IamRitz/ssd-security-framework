@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// Mutation check for the break-glass broker identity invariants (Phase 3A).
+// Mutation check for the break-glass broker identity invariants (Phase 3A),
+// approvers (3B), and the framework commit policy and lazy secrets (3D).
 //
 // Each mutation breaks exactly one property that stops one repository, run or
 // workflow from acting as another; the broker and client tests must FAIL for
@@ -14,6 +15,7 @@ import { runMutationCheck } from './mutation-check-onboarding.mjs';
 
 export const TESTS = [
   'test/broker-oidc-identity.test.js',
+  'test/broker-framework-policy.test.js',
   'test/broker-approvers-ssm.test.js',
   'test/broker-lambda.test.js',
   'test/broker-authorize.test.js',
@@ -27,6 +29,17 @@ const REQUEST = 'broker/request.mjs';
 const BROKER = 'broker/lambda/broker.mjs';
 const STORE = 'broker/lambda/dynamodb-store.mjs';
 const APPROVERS = 'broker/authorize/approvers.mjs';
+const POLICY = 'broker/identity/framework-policy.mjs';
+const RUNTIME = 'broker/lambda/runtime.mjs';
+
+// authenticate(): the framework check before the replay claim (as shipped), and
+// moved after it.
+const AUTH_SPAN = "    // Before the token is spent: a refused commit writes nothing.\n    const framework = await decideFramework(frameworkPolicy, verified.jobWorkflow?.sha);\n    if (framework.state !== 'allowed') {\n      log({ event: 'framework_rejected', action, state: framework.state, reason: framework.reason, frameworkSha: verified.jobWorkflow?.sha ?? null, ...who(verified) });\n      return { rejected: frameworkRejection(framework) };\n    }\n    const fresh = await store.consumeTokenId({\n      jtiHash: createHash('sha256').update(verified.jti).digest('hex'),\n      exp: verified.exp,\n      repositoryId: verified.repositoryId,\n      runId: verified.runId,\n      runAttempt: verified.runAttempt,\n      action\n    });\n    if (!fresh) {\n      log({ event: 'identity_rejected', action, code: 'token_replayed', ...who(verified) });\n      return { rejected: { ok: false, statusCode: 401, error: 'identity_rejected: token_replayed' } };\n    }\n";
+const AUTH_MOVED = "    const fresh = await store.consumeTokenId({\n      jtiHash: createHash('sha256').update(verified.jti).digest('hex'),\n      exp: verified.exp,\n      repositoryId: verified.repositoryId,\n      runId: verified.runId,\n      runAttempt: verified.runAttempt,\n      action\n    });\n    if (!fresh) {\n      log({ event: 'identity_rejected', action, code: 'token_replayed', ...who(verified) });\n      return { rejected: { ok: false, statusCode: 401, error: 'identity_rejected: token_replayed' } };\n    }\n    // Before the token is spent: a refused commit writes nothing.\n    const framework = await decideFramework(frameworkPolicy, verified.jobWorkflow?.sha);\n    if (framework.state !== 'allowed') {\n      log({ event: 'framework_rejected', action, state: framework.state, reason: framework.reason, frameworkSha: verified.jobWorkflow?.sha ?? null, ...who(verified) });\n      return { rejected: frameworkRejection(framework) };\n    }\n";
+
+// The click path, revoke check first (as shipped) and moved after the claim.
+const CLICK_SPAN = "    // Decided only for an authorized approver, and BEFORE any claim: a request\n    // whose commit is no longer allowed is not decided and changes no state.\n    if (framework.state !== 'allowed') {\n      log({\n        event: 'framework_revoked',\n        requestId: decision.requestId,\n        repositoryId,\n        userId: auth.userId,\n        state: framework.state,\n        reason: framework.reason,\n        frameworkSha: stored?.identity?.jobWorkflowSha ?? null\n      });\n      return reply('revoked', 'This request was filed by a framework commit that is no longer allowed. It cannot be decided.', {\n        requestId: decision.requestId\n      });\n    }\n\n    const nowDate = now();\n    const claim = claimDecision({\n      requestId: decision.requestId,\n      action: decision.action,\n      userId: auth.userId,\n      username: auth.username,\n      requests: { [decision.requestId]: stored },\n      now: nowDate\n    });\n    if (claim.outcome === 'expired') {\n      await store.expire(stored, nowDate.toISOString());\n      return reply('expired', 'This approval request has expired.', { requestId: decision.requestId });\n    }\n    if (claim.outcome === 'duplicate') {\n      return reply('duplicate', `This request is already ${claim.status}.`, { requestId: decision.requestId });\n    }\n    if (claim.outcome !== 'claimed') {\n      return reply('rejected', 'Unknown or invalid approval request.', { requestId: decision.requestId });\n    }\n\n    try {\n      await store.claim(claim.request, nowDate.toISOString());\n    } catch (error) {\n      if (!(error instanceof ConditionFailed)) throw error;\n      // Someone else committed first (or it expired between read and write).\n      const fresh = await store.get(decision.requestId);\n      log({ event: 'claim_lost', requestId: decision.requestId, userId: auth.userId, status: fresh?.status });\n      return reply('duplicate', `This request is already ${fresh?.status ?? 'decided'}.`, {\n        requestId: decision.requestId\n      });\n    }\n";
+const CLICK_MOVED = "    const nowDate = now();\n    const claim = claimDecision({\n      requestId: decision.requestId,\n      action: decision.action,\n      userId: auth.userId,\n      username: auth.username,\n      requests: { [decision.requestId]: stored },\n      now: nowDate\n    });\n    if (claim.outcome === 'expired') {\n      await store.expire(stored, nowDate.toISOString());\n      return reply('expired', 'This approval request has expired.', { requestId: decision.requestId });\n    }\n    if (claim.outcome === 'duplicate') {\n      return reply('duplicate', `This request is already ${claim.status}.`, { requestId: decision.requestId });\n    }\n    if (claim.outcome !== 'claimed') {\n      return reply('rejected', 'Unknown or invalid approval request.', { requestId: decision.requestId });\n    }\n\n    try {\n      await store.claim(claim.request, nowDate.toISOString());\n    } catch (error) {\n      if (!(error instanceof ConditionFailed)) throw error;\n      // Someone else committed first (or it expired between read and write).\n      const fresh = await store.get(decision.requestId);\n      log({ event: 'claim_lost', requestId: decision.requestId, userId: auth.userId, status: fresh?.status });\n      return reply('duplicate', `This request is already ${fresh?.status ?? 'decided'}.`, {\n        requestId: decision.requestId\n      });\n    }\n\n    // Decided only for an authorized approver, and BEFORE any claim: a request\n    // whose commit is no longer allowed is not decided and changes no state.\n    if (framework.state !== 'allowed') {\n      log({\n        event: 'framework_revoked',\n        requestId: decision.requestId,\n        repositoryId,\n        userId: auth.userId,\n        state: framework.state,\n        reason: framework.reason,\n        frameworkSha: stored?.identity?.jobWorkflowSha ?? null\n      });\n      return reply('revoked', 'This request was filed by a framework commit that is no longer allowed. It cannot be decided.', {\n        requestId: decision.requestId\n      });\n    }\n";
 
 // [invariant, file, search, replace]
 export const MUTATIONS = [
@@ -41,11 +54,43 @@ export const MUTATIONS = [
   ['a not-yet-valid token is refused', OIDC, "    if (nbf > nowSeconds + skewSeconds) reject('token_not_yet_valid');\n", ''],
   ['a token issued in the future is refused', OIDC, "  if (iat > nowSeconds + skewSeconds) reject('token_issued_in_future');\n", ''],
   ['repository_id is required', OIDC, "    repositoryId: requireString(claims, 'repository_id', DECIMAL_ID),", '    repositoryId: claims.repository_id,'],
-  // --- the token came from an allowlisted framework workflow at an exact SHA ---
+  // --- the token came from the framework's _break-glass-lambda.yml ------------
   ['job_workflow_ref repository is checked', OIDC, "  if (repository.toLowerCase() !== FRAMEWORK_REPOSITORY.toLowerCase()) reject('job_workflow_repository_not_allowed');\n", ''],
-  ['job_workflow_ref path is checked', OIDC, "  if (!ALLOWED_JOB_WORKFLOW_PATHS.includes(path)) reject('job_workflow_path_not_allowed');\n", ''],
-  ['job_workflow_ref must be an exact SHA', OIDC, "  if (!COMMIT_SHA.test(ref)) reject('job_workflow_ref_not_sha');\n", ''],
-  ['job_workflow_sha must equal the ref', OIDC, "  if (jobWorkflowSha !== jobWorkflow.sha) reject('job_workflow_sha_mismatch');\n", ''],
+  ['the repository is compared case-insensitively', OIDC, '  if (repository.toLowerCase() !== FRAMEWORK_REPOSITORY.toLowerCase())', '  if (repository !== FRAMEWORK_REPOSITORY)'],
+  ['job_workflow_ref path is checked', OIDC, "  if (!path) reject('job_workflow_path_not_allowed');\n", "  if (!path) return { repository, path: rest, ref: '' };\n"],
+  ['the path is matched exactly', OIDC, '(allowed) => rest.startsWith(`${allowed}@`)', '(allowed) => rest.toLowerCase().startsWith(`${allowed.toLowerCase()}@`)'],
+  ['_source-security.yml is not an accepted workflow', OIDC, "export const ALLOWED_JOB_WORKFLOW_PATHS = Object.freeze(['.github/workflows/_break-glass-lambda.yml']);", "export const ALLOWED_JOB_WORKFLOW_PATHS = Object.freeze(['.github/workflows/_break-glass-lambda.yml', '.github/workflows/_source-security.yml']);"],
+  ['the ref part is bounded and printable', OIDC, "  if (!WORKFLOW_REF_NAME.test(ref)) reject('job_workflow_ref_malformed');\n", ''],
+  ['job_workflow_sha must be 40 lower-case hex', OIDC, "sha: requireString(claims, 'job_workflow_sha', COMMIT_SHA) };", "sha: requireString(claims, 'job_workflow_sha') };"],
+  // --- the framework commit policy (3D) ------------------------------------------
+  ['notify checks the framework commit', BROKER, '    const framework = await decideFramework(frameworkPolicy, verified.jobWorkflow?.sha);', "    const framework = action === 'notify' ? { state: 'allowed' } : await decideFramework(frameworkPolicy, verified.jobWorkflow?.sha);"],
+  ['every status call checks the framework commit', BROKER, '    const framework = await decideFramework(frameworkPolicy, verified.jobWorkflow?.sha);', "    const framework = action === 'status' ? { state: 'allowed' } : await decideFramework(frameworkPolicy, verified.jobWorkflow?.sha);"],
+  ['the commit is checked BEFORE the token is spent', BROKER, AUTH_SPAN, AUTH_MOVED],
+  ['a not-allowed commit is 403, not silently allowed', BROKER, "    if (framework.state !== 'allowed') {\n      log({ event: 'framework_rejected'", "    if (framework.state !== 'allowed' && framework.state !== 'not_allowed') {\n      log({ event: 'framework_rejected'"],
+  ['only an exact allowed passes', POLICY, "  if (decision?.state === 'allowed') return result('allowed', null);", "  if (decision?.state === 'allowed' || decision?.state === 'absent') return result('allowed', null);"],
+  ['an absent policy is never allowed', POLICY, "        if (error?.name === 'ParameterNotFound') return result('absent', 'no framework policy parameter');", "        if (error?.name === 'ParameterNotFound') return result('allowed', null);"],
+  ['an unreadable policy is never allowed', POLICY, "        return result('unverified', `framework policy lookup failed (${error?.name || 'error'})`);", "        return result('allowed', null);"],
+  ['a thrown check is never allowed', POLICY, "    return result('unverified', `framework policy check failed (${error?.name || 'error'})`);", "    return result('allowed', null);"],
+  ['no configured policy allows nothing', POLICY, "  if (!frameworkPolicy || typeof frameworkPolicy.check !== 'function') return result('misconfigured', 'no framework policy configured');", "  if (!frameworkPolicy || typeof frameworkPolicy.check !== 'function') return result('allowed', null);"],
+  ['the environment echo is validated', POLICY, "  if (parsed.environment !== environment) return result('malformed', `the value is for '${parsed.environment}', not '${environment}'`);\n", ''],
+  ['commits must be strictly ascending', POLICY, "    if (!(shas[i - 1] < shas[i])) return result('malformed', 'commits are not strictly ascending (unsorted or duplicated)');\n", ''],
+  ['duplicate commits are malformed', POLICY, '    if (!(shas[i - 1] < shas[i]))', '    if (!(shas[i - 1] <= shas[i]))'],
+  ['entries must be lower-case 40-hex SHAs', POLICY, "  if (!shas.every((sha) => typeof sha === 'string' && COMMIT_SHA.test(sha))) {", "  if (!shas.every((sha) => typeof sha === 'string')) {"],
+  ['the key set and order are exact', POLICY, '  if (keys.length !== KEYS.length || keys.some((key, i) => key !== KEYS[i])) {', '  if (!KEYS.every((key) => keys.includes(key))) {'],
+  ['the policy set is bounded', POLICY, "  if (shas.length > MAX_ALLOWED_FRAMEWORK_SHAS) return result('malformed', `more than ${MAX_ALLOWED_FRAMEWORK_SHAS} commits`);\n", ''],
+  ['the policy parameter must be a plain String', POLICY, "  if (!parameter || parameter.Type !== 'String') return result('malformed', 'parameter is not of type String');", "  if (!parameter) return result('malformed', 'parameter is not of type String');"],
+  ['the policy environment is validated', POLICY, '  if (!BREAK_GLASS_ENVIRONMENTS.includes(environment)) return null;\n  return `/ssd/break-glass/${environment}/governance/allowed-framework-shas`;', '  return `/ssd/break-glass/${environment}/governance/allowed-framework-shas`;'],
+  ['the commit is validated before any lookup', POLICY, "      if (typeof sha !== 'string' || !COMMIT_SHA.test(sha)) return result('misconfigured', 'no valid framework commit to check');\n", ''],
+  ['the click re-checks the stored commit', BROKER, '      decideFramework(frameworkPolicy, stored?.identity?.jobWorkflowSha)', "      Promise.resolve({ state: 'allowed' })"],
+  ['a revoked commit is refused at click time', BROKER, "    if (framework.state !== 'allowed') {\n      log({\n        event: 'framework_revoked',", "    if (false) {\n      log({\n        event: 'framework_revoked',"],
+  ['the click re-check comes BEFORE the claim', BROKER, CLICK_SPAN, CLICK_MOVED],
+  ['the stored request records its commit', REQUEST, '      jobWorkflowSha: verified.jobWorkflow.sha,\n', ''],
+  // --- CI secrets are read lazily (3D) -------------------------------------------
+  ['the CI broker reads no secret before policy acceptance', RUNTIME, '    getBotToken = lazySecret(read(env.SLACK_BOT_TOKEN_SECRET_ARN));', '    const eager = await read(env.SLACK_BOT_TOKEN_SECRET_ARN)().catch(() => undefined);\n    getBotToken = async () => eager;'],
+  ['the CI role selects lazy secrets', RUNTIME, "  if (role === 'ci') {", "  if (role === 'lazy') {"],
+  ['a failed secret read is not cached', RUNTIME, '    })().finally(() => {\n      pending = undefined;\n    });', '    })();'],
+  ['a secret with no value is a failure', RUNTIME, "      if (typeof secret !== 'string' || secret === '') throw new Error('secret has no value');\n", ''],
+  ['the interaction function keeps reading secrets at start-up', RUNTIME, "  if (role === 'ci') {", "  if (role !== 'interactions-eager') {"],
   // --- JWKS is bounded and fails closed --------------------------------------
   ['an unknown kid cannot amplify JWKS fetches', OIDC, "        if (now() - lastAttemptAt < minRefreshIntervalMs) reject('unknown_kid');\n", ''],
   ['the JWKS cache expires', OIDC, '      if (!keys || now() - fetchedAt >= ttlMs) {', '      if (!keys) {'],

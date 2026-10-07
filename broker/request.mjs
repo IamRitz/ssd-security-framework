@@ -79,7 +79,10 @@ export function bindRequestIdentity(payload, verified) {
       eventName: verified.eventName,
       runId: verified.runId,
       runAttempt: verified.runAttempt,
-      jobWorkflowRef: `${verified.jobWorkflow.repository}/${verified.jobWorkflow.path}@${verified.jobWorkflow.sha}`,
+      // As GitHub reported it (the ref part may be a tag or branch), and the
+      // commit it resolved to: the one the framework policy authorizes.
+      jobWorkflowRef: `${verified.jobWorkflow.repository}/${verified.jobWorkflow.path}@${verified.jobWorkflow.ref}`,
+      jobWorkflowSha: verified.jobWorkflow.sha,
       jti: verified.jti
     },
     context: { ...expected, ciSystem }

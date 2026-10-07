@@ -4,8 +4,10 @@
 import { createCiHandler, createInteractionsHandler } from './handlers.mjs';
 import { enqueueSelf, getBroker } from './runtime.mjs';
 
-export const ciHandler = createCiHandler({ getBroker: () => getBroker() });
+// The CI broker reads its secrets lazily (only when it posts); the interaction
+// function reads them at start-up (runtime.mjs).
+export const ciHandler = createCiHandler({ getBroker: () => getBroker(process.env, { role: 'ci' }) });
 export const interactionsHandler = createInteractionsHandler({
-  getBroker: () => getBroker(),
+  getBroker: () => getBroker(process.env, { role: 'interactions' }),
   enqueue: (job) => enqueueSelf(job)
 });
