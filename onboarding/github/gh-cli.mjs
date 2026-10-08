@@ -232,16 +232,43 @@ const sameArgv = (a, b) => Array.isArray(a) && a.length === b.length && a.every(
 // endpoints. Checked before the executor is reached.
 export function assertRead(slug, branch) {
   assertTarget(slug, branch);
-  const patterns = readPatterns(slug, branch);
+  return getAllowlist(readPatterns(slug, branch), 'not a GET of an endpoint in the read-only allowlist (github plan makes no GitHub change)');
+}
+
+// argv must be exactly readArgv(<an endpoint one of `patterns` accepts>).
+function getAllowlist(patterns, refusal) {
   return (argv) => {
     if (!Array.isArray(argv) || !argv.every((a) => typeof a === 'string')) {
       throw new GhCliError('refused', 'refusing a gh call that is not an argv array of strings');
     }
     const endpoint = argv[argv.length - 1];
     if (!sameArgv(argv, readArgv(endpoint)) || !patterns.some((p) => p.test(endpoint))) {
-      throw new GhCliError('refused', `refusing 'gh ${argv.slice(0, 3).join(' ')}…': not a GET of an endpoint in the read-only allowlist (github plan makes no GitHub change)`);
+      throw new GhCliError('refused', `refusing 'gh ${argv.slice(0, 3).join(' ')}…': ${refusal}`);
     }
   };
+}
+
+// --- repository identity (Phase 3D) -------------------------------------------------
+
+// `aws plan|verify --scope break-glass-repo` key a break-glass invoker role and
+// approver parameter on the IMMUTABLE repository_id, so that id (and the OIDC
+// subject format) is read from GitHub, never taken on trust. Two GETs of one
+// repository; no branch, no paging, nothing else.
+export function identityEndpoints(slug) {
+  assertTarget(slug);
+  const repo = `repos/${slug}`;
+  return Object.freeze({ repository: () => repo, oidcSubject: () => `${repo}/actions/oidc/customization/sub` });
+}
+
+export function assertIdentityRead(slug) {
+  assertTarget(slug);
+  const r = `repos/${escapeRe(slug)}`;
+  const patterns = [new RegExp(`^${r}$`), new RegExp(`^${r}/actions/oidc/customization/sub$`)];
+  return getAllowlist(patterns, 'not a GET of the repository or its OIDC subject customization');
+}
+
+export function identityGh({ slug, ...options } = {}) {
+  return checkedReader(identityEndpoints(slug), assertIdentityRead(slug), runner(options));
 }
 
 // --- execution --------------------------------------------------------------------
@@ -344,9 +371,11 @@ function runner({ exec = execGh, env = process.env, timeoutMs = DEFAULT_TIMEOUT_
 // readGh({ slug, branch, ...options }) -> { get(name, ...args), endpoints }.
 // get() resolves to the parsed JSON (object or array) or throws GhCliError.
 export function readGh({ slug, branch, ...options } = {}) {
-  const endpoints = readEndpoints(slug, branch);
-  const check = assertRead(slug, branch);
-  const run = runner(options);
+  return checkedReader(readEndpoints(slug, branch), assertRead(slug, branch), runner(options));
+}
+
+// GETs by endpoint NAME only, each argv re-checked against `check`.
+function checkedReader(endpoints, check, run) {
   return Object.freeze({
     endpoints,
     async get(name, ...args) {

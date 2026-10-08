@@ -885,12 +885,17 @@ export async function main(argv, io = {}) {
   const { out, err } = context;
   try {
     const [command, ...args] = argv;
+    // GitHub code is reached through this ONE dynamic import. The aws side gets
+    // only a read-only repository identity lookup (Phase 3D break-glass-repo),
+    // as a function, loaded when first called: onboarding/aws never imports it.
+    const github = () => import('./github/cli.mjs');
     if (command === 'aws') {
       const { awsMain } = await import('./aws/cli.mjs');
-      return await awsMain(args, context);
+      const repositoryIdentity = context.repositoryIdentity ?? (async (slug) => (await github()).repositoryIdentity(slug, context));
+      return await awsMain(args, { ...context, repositoryIdentity });
     }
     if (command === 'github') {
-      const { githubMain } = await import('./github/cli.mjs');
+      const { githubMain } = await github();
       return await githubMain(args, context);
     }
     const { values, positionals } = parseArgs({ args, options: OPTIONS, allowPositionals: true, strict: true });

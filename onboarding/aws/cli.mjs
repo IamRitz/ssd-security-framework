@@ -27,12 +27,14 @@ import { PLAN_ID } from './plan/record.mjs';
 import { awsVerify, exitCodeOf as verifyExitCodeOf } from './verify.mjs';
 import { awsVerifyBlocks, awsVerifyErrorBlocks, awsVerifyErrorReport } from './verify-report.mjs';
 import { detectFramework } from '../lib/framework.mjs';
-import { loadFrameworkPolicyConfig, loadOperatorConfig } from '../lib/operator-file.mjs';
+import { loadFrameworkPolicyConfig, loadOperatorConfig, loadRepositoryConfig } from '../lib/operator-file.mjs';
 import { terminalPrompter } from '../lib/prompt.mjs';
 import { awsPlanBreakGlass } from './break-glass/plan.mjs';
 import { awsVerifyBreakGlass } from './break-glass/verify.mjs';
 import { awsPlanBreakGlassGovernance } from './break-glass/governance-plan.mjs';
 import { awsVerifyBreakGlassGovernance } from './break-glass/governance-verify.mjs';
+import { awsPlanBreakGlassRepository } from './break-glass/repository-plan.mjs';
+import { awsVerifyBreakGlassRepository } from './break-glass/repository-verify.mjs';
 import { BREAK_GLASS_ENVIRONMENTS } from './stack-names.mjs';
 
 export const AWS_USAGE = `ssd-onboard aws — AWS readiness for the configured delivery (Phase 2)
@@ -69,6 +71,12 @@ instance/role credentials…). ssd-onboard never reads, accepts or prints a key.
                           holding the environment's allowed framework commits. Every listed
                           commit must exist in this checkout and bind its own workflow;
                           production commits must be merged to origin/main. Checked before AWS.
+  plan --scope break-glass-repo --environment production|synthetic
+       --operator-config <file> --repository-config <file> [--region <r>] [--json]
+                          Phase 3D: ONE repository stack (ssd-break-glass-<environment>-repo-<id>):
+                          its invoker role (GitHub OIDC, pull_request of that repository only;
+                          invokes the CI broker only) and approver parameter. The repository_id
+                          and the default OIDC subject are proven with gh before AWS.
   apply --plan-id <id> --account <12 digits> --region <r>
         [--operator-config <file>] [--allow-destructive <n>] [--yes] [--json]
                           Executes EXACTLY the change set recorded in .ssd/aws-plans/<id>/,
@@ -82,7 +90,8 @@ instance/role credentials…). ssd-onboard never reads, accepts or prints a key.
                           apply-started.json / apply.json into the plan directory.
                           A break-glass plan is applied with --operator-config <its file>
                           instead of .ssd/onboarding.yml; secret values are never applied.
-                          A governance plan also needs --policy-config <its file>, unchanged.
+                          A governance plan also needs --policy-config <its file>, unchanged;
+                          a repository plan --repository-config <its file>, unchanged.
                           Exit 0 applied, 1 refused / error / apply failed
   verify [--region <r>] [--json]
   verify --scope break-glass --environment production|synthetic --operator-config <file>
@@ -102,19 +111,26 @@ instance/role credentials…). ssd-onboard never reads, accepts or prints a key.
                           Phase 3D: ownership, the parameter's exact shape and byte-equal value,
                           the broker parser, admission of every live commit, and who may read
                           (this environment's execution roles) or write (none of them) it.
+  verify --scope break-glass-repo --environment production|synthetic
+         --operator-config <file> --repository-config <file> [--region <r>] [--json]
+                          Phase 3D: GitHub identity, ownership, the invoker role's trust and
+                          permissions byte-exact, simulated invoke ALLOWED and every other
+                          access DENIED, and the approver parameter (an empty list is a WARN).
                           Exit 0 verified (warnings allowed), 1 failed or not verifiable
 
 Options:
   --repo <dir>            consumer repository root (default: current directory)
   --region <r>            must equal delivery.aws.region when given; the AWS CLI's default
                           region is never used
-  --scope repo|shared|break-glass|break-glass-governance
+  --scope repo|shared|break-glass|break-glass-governance|break-glass-repo
                           plan (default repo); verify accepts only the break-glass scopes
   --environment <env>     break-glass only: production or synthetic
   --operator-config <f>   break-glass only: the Phase 3 operator configuration (identifiers
                           only; never .ssd/onboarding.yml, never read by Phase 1)
   --policy-config <f>     break-glass-governance (and its apply) only: the environment's
                           framework policy (operator-owned; never a consumer file)
+  --repository-config <f> break-glass-repo (and its apply) only: one repository's id, slug and
+                          per-environment approvers (operator-owned; never a consumer file)
   --plan-id <id>          apply only: the 64-hex plan id printed by aws plan
   --account <id>          apply only: must equal the plan, delivery.aws.accountId and the caller
   --allow-destructive <n> apply only: the exact number of DELETE + REPLACE changes
@@ -133,6 +149,7 @@ const OPTIONS = {
   environment: { type: 'string' },
   'operator-config': { type: 'string' },
   'policy-config': { type: 'string' },
+  'repository-config': { type: 'string' },
   yes: { type: 'boolean' },
   json: { type: 'boolean' },
   help: { type: 'boolean', short: 'h' }
@@ -180,18 +197,25 @@ export async function awsMain(args, context) {
     // --environment and --operator-config belong to break-glass only: refused
     // (never ignored) anywhere else.
     const governance = values.scope === 'break-glass-governance';
-    const breakGlass = values.scope === 'break-glass' || governance;
+    const repositoryScope = values.scope === 'break-glass-repo';
+    const breakGlass = values.scope === 'break-glass' || governance || repositoryScope;
     if (sub !== 'apply' && !breakGlass) {
-      const stray = ['environment', 'operator-config', 'policy-config'].find((name) => values[name] !== undefined);
+      const stray = ['environment', 'operator-config', 'policy-config', 'repository-config'].find((name) => values[name] !== undefined);
       if (stray) {
-        throw new AwsUsageError(`Unknown option '--${stray}' (only with --scope break-glass or break-glass-governance)`);
+        throw new AwsUsageError(`Unknown option '--${stray}' (only with a break-glass --scope)`);
       }
     }
     if (sub !== 'apply' && breakGlass && !governance && values['policy-config'] !== undefined) {
       throw new AwsUsageError("Unknown option '--policy-config' (only with --scope break-glass-governance)");
     }
-    if (sub === 'apply' && values['policy-config'] !== undefined && values['operator-config'] === undefined) {
-      throw new AwsUsageError('--policy-config is applied together with --operator-config');
+    if (sub !== 'apply' && breakGlass && !repositoryScope && values['repository-config'] !== undefined) {
+      throw new AwsUsageError("Unknown option '--repository-config' (only with --scope break-glass-repo)");
+    }
+    if (sub === 'apply' && (values['policy-config'] !== undefined || values['repository-config'] !== undefined) && values['operator-config'] === undefined) {
+      throw new AwsUsageError('--policy-config / --repository-config are applied together with --operator-config');
+    }
+    if (values['policy-config'] !== undefined && values['repository-config'] !== undefined) {
+      throw new AwsUsageError('--policy-config and --repository-config belong to different plans; give one');
     }
     if (sub === 'apply' && values.environment !== undefined) {
       throw new AwsUsageError("Unknown option '--environment' (a plan already names its environment)");
@@ -206,6 +230,9 @@ export async function awsMain(args, context) {
       if (governance && !values['policy-config']) {
         throw new AwsUsageError('--scope break-glass-governance requires --policy-config <file> (the environment\'s framework policy)');
       }
+      if (repositoryScope && !values['repository-config']) {
+        throw new AwsUsageError('--scope break-glass-repo requires --repository-config <file> (the repository\'s id and approvers)');
+      }
     }
     switch (sub) {
       case 'doctor':
@@ -218,6 +245,9 @@ export async function awsMain(args, context) {
         if (governance) {
           return await cmdAwsPlanGovernance(resolve(values.repo ?? process.cwd()), values, context);
         }
+        if (repositoryScope) {
+          return await cmdAwsPlanRepository(resolve(values.repo ?? process.cwd()), values, context);
+        }
         if (breakGlass) {
           return await cmdAwsPlanBreakGlass(resolve(values.repo ?? process.cwd()), values, context);
         }
@@ -229,10 +259,13 @@ export async function awsMain(args, context) {
         return await cmdAwsApply(resolve(values.repo ?? process.cwd()), values, context);
       case 'verify':
         if (values.scope !== undefined && !breakGlass) {
-          throw new AwsUsageError(`verify accepts only --scope break-glass or break-glass-governance (got '${values.scope}')`);
+          throw new AwsUsageError(`verify accepts only --scope break-glass, break-glass-governance or break-glass-repo (got '${values.scope}')`);
         }
         if (governance) {
           return await cmdAwsVerifyGovernance(values, context);
+        }
+        if (repositoryScope) {
+          return await cmdAwsVerifyRepository(values, context);
         }
         if (breakGlass) {
           return await cmdAwsVerifyBreakGlass(values, context);
@@ -401,6 +434,47 @@ async function cmdAwsPlanGovernance(root, options, context) {
   return planExitCodeOf(report);
 }
 
+// Phase 3D: one repository stack from the operator config + repository config.
+async function cmdAwsPlanRepository(root, options, context) {
+  if (options.region !== undefined && !REGION.test(options.region)) {
+    throw new AwsUsageError(`--region '${options.region}' is not an AWS region name`);
+  }
+  const fail = (error, target = null) => {
+    const errorReport = awsPlanErrorReport(error, target);
+    if (options.json) {
+      context.json(errorReport);
+    } else {
+      context.printErr(awsPlanErrorBlocks(errorReport));
+    }
+    return 1;
+  };
+  let operator;
+  let repository;
+  try {
+    operator = await loadOperatorConfig(resolve(options['operator-config']));
+    repository = await loadRepositoryConfig(resolve(options['repository-config']));
+  } catch (error) {
+    return fail(error);
+  }
+  const target = { repository: repository.repository.slug, environment: options.environment, account: operator.aws.accountId, region: options.region ?? operator.aws.region, scope: 'break-glass-repo' };
+  const framework = context.framework !== undefined ? context.framework : await detectFramework();
+  let report;
+  try {
+    report = await awsPlanBreakGlassRepository({ operator, repository, environment: options.environment, github: context.repositoryIdentity ?? null, region: options.region ?? null, exec: context.awsExec ?? execAws, env: context.env ?? process.env, framework, root, sleep: context.awsSleep });
+  } catch (error) {
+    if (PLAN_ERRORS.has(error?.name)) {
+      return fail(error, target);
+    }
+    throw error;
+  }
+  if (options.json) {
+    context.json(report);
+  } else {
+    context.print(awsPlanBlocks(report));
+  }
+  return planExitCodeOf(report);
+}
+
 async function cmdAwsPlan(root, options, context) {
   if (options.region !== undefined && !REGION.test(options.region)) {
     throw new AwsUsageError(`--region '${options.region}' is not an AWS region name`);
@@ -483,11 +557,15 @@ async function cmdAwsApply(root, options, context) {
   let config = null;
   let operator = null;
   let policy = null;
+  let repository = null;
   try {
     if (options['operator-config'] !== undefined) {
       operator = await loadOperatorConfig(resolve(options['operator-config']));
       if (options['policy-config'] !== undefined) {
         policy = await loadFrameworkPolicyConfig(resolve(options['policy-config']));
+      }
+      if (options['repository-config'] !== undefined) {
+        repository = await loadRepositoryConfig(resolve(options['repository-config']));
       }
     } else {
       config = await loadDelivery(root, 'aws apply');
@@ -521,6 +599,7 @@ async function cmdAwsApply(root, options, context) {
       config,
       operator,
       policy,
+      repository,
       planId,
       account: options.account,
       region: options.region,
@@ -665,6 +744,46 @@ async function cmdAwsVerifyGovernance(options, context) {
     report = await awsVerifyBreakGlassGovernance({ operator, policy, environment: options.environment, region: options.region ?? null, exec: context.awsExec ?? execAws, env: context.env ?? process.env, framework, git: context.frameworkGit ?? null });
   } catch (error) {
     if (error instanceof AwsCliError || error instanceof IdentityError) {
+      return fail(error, target);
+    }
+    throw error;
+  }
+  if (options.json) {
+    context.json(report);
+  } else {
+    context.print(awsVerifyBlocks(report));
+  }
+  return verifyExitCodeOf(report);
+}
+
+// Phase 3D: read-only verification of one repository stack.
+async function cmdAwsVerifyRepository(options, context) {
+  if (options.region !== undefined && !REGION.test(options.region)) {
+    throw new AwsUsageError(`--region '${options.region}' is not an AWS region name`);
+  }
+  const fail = (error, target = null) => {
+    const errorReport = awsVerifyErrorReport(error, target);
+    if (options.json) {
+      context.json(errorReport);
+    } else {
+      context.printErr(awsVerifyErrorBlocks(errorReport));
+    }
+    return 1;
+  };
+  let operator;
+  let repository;
+  try {
+    operator = await loadOperatorConfig(resolve(options['operator-config']));
+    repository = await loadRepositoryConfig(resolve(options['repository-config']));
+  } catch (error) {
+    return fail(error);
+  }
+  const target = { scope: 'break-glass-repo', environment: options.environment, repository: repository.repository.slug, account: operator.aws.accountId, region: options.region ?? operator.aws.region };
+  let report;
+  try {
+    report = await awsVerifyBreakGlassRepository({ operator, repository, environment: options.environment, github: context.repositoryIdentity ?? null, region: options.region ?? null, exec: context.awsExec ?? execAws, env: context.env ?? process.env });
+  } catch (error) {
+    if (error instanceof AwsCliError || error instanceof IdentityError || error?.kind === 'configuration') {
       return fail(error, target);
     }
     throw error;

@@ -6,6 +6,7 @@ import { readFile } from 'node:fs/promises';
 
 import { FrameworkPolicyConfigError, parseFrameworkPolicyConfig } from '../aws/break-glass/framework-policy-config.mjs';
 import { OperatorConfigError, parseOperatorConfig } from '../aws/break-glass/operator-config.mjs';
+import { RepositoryConfigError, parseRepositoryConfig } from '../aws/break-glass/repository-config.mjs';
 
 export async function loadOperatorConfig(path) {
   let source;
@@ -28,4 +29,16 @@ export async function loadFrameworkPolicyConfig(path, { environment } = {}) {
     throw new FrameworkPolicyConfigError([`cannot read ${path}: ${error.code ?? error.message}`]);
   }
   return parseFrameworkPolicyConfig(source, { environment });
+}
+
+// Phase 3D: the repository file named by --repository-config
+// (onboarding/aws/break-glass/repository-config.mjs).
+export async function loadRepositoryConfig(path) {
+  let source;
+  try {
+    source = await readFile(path, 'utf8');
+  } catch (error) {
+    throw new RepositoryConfigError([`cannot read ${path}: ${error.code ?? error.message}`]);
+  }
+  return parseRepositoryConfig(source);
 }

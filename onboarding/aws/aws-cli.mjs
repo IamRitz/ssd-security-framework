@@ -56,6 +56,12 @@ const BREAK_GLASS_LOG_PREFIX = /^\/aws\/lambda\/ssd-break-glass-(?:production|sy
 // Phase 3D governance: its two stacks and the one parameter each holds.
 const GOVERNANCE_STACK_NAMES = /^ssd-break-glass-(?:production|synthetic)-governance$/;
 const FRAMEWORK_POLICY_PARAMETER = /^\/ssd\/break-glass\/(?:production|synthetic)\/governance\/allowed-framework-shas$/;
+// Phase 3D repository stacks: one per repository_id and environment.
+const REPO_STACK_NAMES = /^ssd-break-glass-(?:production|synthetic)-repo-[1-9][0-9]{0,19}$/;
+const INVOKER_ROLE_NAME = /^ssd-break-glass-(?:production|synthetic)-invoker-[1-9][0-9]{0,19}$/;
+const INVOKER_ROLE_ARN = /^arn:(?:aws|aws-cn|aws-us-gov):iam::\d{12}:role\/ssd-break-glass-(?:production|synthetic)-invoker-[1-9][0-9]{0,19}$/;
+const APPROVER_PARAMETER = /^\/ssd\/break-glass\/(?:production|synthetic)\/approvers\/[1-9][0-9]{0,19}$/;
+const GITHUB_OIDC_PROVIDER_ARN = /^arn:(?:aws|aws-cn|aws-us-gov):iam::\d{12}:oidc-provider\/token\.actions\.githubusercontent\.com$/;
 // The four break-glass execution roles: the only principals governance verify
 // simulates (who may read, and who must never write, the parameter).
 const BREAK_GLASS_EXECUTION_ROLE_ARN = /^arn:(?:aws|aws-cn|aws-us-gov):iam::\d{12}:role\/ssd-break-glass-(?:production|synthetic)-(?:ci|interactions)-execution$/;
@@ -250,24 +256,26 @@ export const BREAK_GLASS_PLANNING_OPERATIONS = union(READ_ONLY_OPERATIONS, union
 
 // --- the governance allowlists (Phase 3D) ------------------------------------------
 
-// describe-parameters with exactly one Name=Equals filter on one governance
-// parameter: never a path, prefix or wildcard listing.
-function governanceParameterFilter(value) {
-  try {
-    const parsed = JSON.parse(value);
-    return (
-      Array.isArray(parsed) &&
-      parsed.length === 1 &&
-      Object.keys(parsed[0] ?? {}).sort().join() === 'Key,Option,Values' &&
-      parsed[0].Key === 'Name' &&
-      parsed[0].Option === 'Equals' &&
-      Array.isArray(parsed[0].Values) &&
-      parsed[0].Values.length === 1 &&
-      FRAMEWORK_POLICY_PARAMETER.test(parsed[0].Values[0])
-    );
-  } catch {
-    return false;
-  }
+// describe-parameters with exactly one Name=Equals filter naming one parameter
+// that `pattern` accepts: never a path, prefix or wildcard listing.
+function oneParameterFilter(pattern) {
+  return (value) => {
+    try {
+      const parsed = JSON.parse(value);
+      return (
+        Array.isArray(parsed) &&
+        parsed.length === 1 &&
+        Object.keys(parsed[0] ?? {}).sort().join() === 'Key,Option,Values' &&
+        parsed[0].Key === 'Name' &&
+        parsed[0].Option === 'Equals' &&
+        Array.isArray(parsed[0].Values) &&
+        parsed[0].Values.length === 1 &&
+        pattern.test(parsed[0].Values[0])
+      );
+    } catch {
+      return false;
+    }
+  };
 }
 
 // NOT a union with READ_ONLY_OPERATIONS: governance reads exactly what it
@@ -303,8 +311,61 @@ export const GOVERNANCE_PLANNING_OPERATIONS = union(GOVERNANCE_READS, {
 // `aws verify --scope break-glass-governance`: governance reads, the tier
 // (describe-parameters, one exact name), and simulation of the execution roles.
 export const GOVERNANCE_READ_OPERATIONS = union(GOVERNANCE_READS, {
-  ssm: { 'describe-parameters': { '--parameter-filters': governanceParameterFilter } },
+  ssm: { 'describe-parameters': { '--parameter-filters': oneParameterFilter(FRAMEWORK_POLICY_PARAMETER) } },
   iam: { 'simulate-principal-policy': { '--policy-source-arn': matches(BREAK_GLASS_EXECUTION_ROLE_ARN), '--action-names': true, '--resource-arns': true } }
+});
+
+// --- the repository allowlists (Phase 3D) ------------------------------------------
+
+const invokerRole = matches(INVOKER_ROLE_NAME);
+
+// Reads of one repository stack's own resources, the GitHub OIDC provider, and
+// nothing else (no other role, secret, function or parameter).
+const REPOSITORY_READS = {
+  sts: { 'get-caller-identity': {} },
+  cloudformation: {
+    'describe-stacks': { '--stack-name': true },
+    'describe-stack-resources': { '--physical-resource-id': (v) => INVOKER_ROLE_NAME.test(v) || APPROVER_PARAMETER.test(v), '--stack-name': matches(REPO_STACK_NAMES) }
+  },
+  iam: {
+    'list-open-id-connect-providers': {},
+    'get-open-id-connect-provider': { '--open-id-connect-provider-arn': matches(GITHUB_OIDC_PROVIDER_ARN) },
+    'get-role': { '--role-name': invokerRole },
+    'list-role-policies': { '--role-name': invokerRole },
+    'get-role-policy': { '--role-name': invokerRole, '--policy-name': true },
+    'list-attached-role-policies': { '--role-name': invokerRole },
+    // An attached managed policy is read so that it can be REFUSED (plan/verify).
+    'get-policy': { '--policy-arn': true },
+    'get-policy-version': { '--policy-arn': true, '--version-id': true }
+  },
+  ssm: {
+    'get-parameter': { '--name': matches(APPROVER_PARAMETER) }
+  }
+};
+
+// `aws plan --scope break-glass-repo`: the reads above, the shared stack's
+// description (describe-stacks by name), and change sets on repository stacks
+// only — with CAPABILITY_NAMED_IAM, since the stack holds the invoker role.
+export const REPOSITORY_PLANNING_OPERATIONS = union(REPOSITORY_READS, {
+  cloudformation: {
+    'validate-template': { '--template-body': templateBody },
+    'create-change-set': {
+      '--stack-name': matches(REPO_STACK_NAMES),
+      '--change-set-name': matches(CHANGE_SET_NAME),
+      '--change-set-type': matches(/^(?:CREATE|UPDATE)$/),
+      '--template-body': templateBody,
+      '--tags': ssdTags,
+      '--capabilities': matches(/^CAPABILITY_NAMED_IAM$/)
+    },
+    'describe-change-set': { '--stack-name': matches(REPO_STACK_NAMES), '--change-set-name': matches(CHANGE_SET_NAME) }
+  }
+});
+
+// `aws verify --scope break-glass-repo`: the reads, the approver tier, and
+// simulation of invoker and execution roles only.
+export const REPOSITORY_READ_OPERATIONS = union(REPOSITORY_READS, {
+  ssm: { 'describe-parameters': { '--parameter-filters': oneParameterFilter(APPROVER_PARAMETER) } },
+  iam: { 'simulate-principal-policy': { '--policy-source-arn': (v) => INVOKER_ROLE_ARN.test(v) || BREAK_GLASS_EXECUTION_ROLE_ARN.test(v), '--action-names': true, '--resource-arns': true } }
 });
 
 // --- the apply allowlist (Phase 2C) ------------------------------------------------
@@ -319,7 +380,7 @@ const CHANGE_SET_ARN = /^arn:(?:aws|aws-cn|aws-us-gov):cloudformation:[a-z0-9-]+
 function assertBinding(binding) {
   const { stackName, stackId, changeSetArn } = binding ?? {};
   const strings = [stackName, stackId, changeSetArn].every((v) => typeof v === 'string');
-  if (!strings || !(STACK_NAMES.test(stackName) || BREAK_GLASS_STACK_NAMES.test(stackName) || GOVERNANCE_STACK_NAMES.test(stackName)) || STACK_ID.exec(stackId)?.[1] !== stackName || !CHANGE_SET_ARN.test(changeSetArn)) {
+  if (!strings || !(STACK_NAMES.test(stackName) || BREAK_GLASS_STACK_NAMES.test(stackName) || GOVERNANCE_STACK_NAMES.test(stackName) || REPO_STACK_NAMES.test(stackName)) || STACK_ID.exec(stackId)?.[1] !== stackName || !CHANGE_SET_ARN.test(changeSetArn)) {
     throw new AwsCliError('refused', "refusing to create an apply wrapper without the recorded plan's exact stack name, stack id (of that stack) and ssd-plan change-set ARN");
   }
 }
@@ -595,21 +656,39 @@ export function assertBreakGlassPlanning(argv) {
 const GOVERNANCE_READ_WORDS = { list: 'the break-glass governance read-only allowlist (aws verify --scope break-glass-governance makes no AWS changes)', kind: 'read' };
 const GOVERNANCE_PLANNING_WORDS = { list: 'the break-glass governance planning allowlist (aws plan --scope break-glass-governance never executes a change set)', kind: 'planning' };
 
-// Flags that must be PRESENT, not merely allowed: describe-parameters without
-// its one-name filter would list every parameter of the account.
-const GOVERNANCE_REQUIRED_FLAGS = Object.freeze({ 'ssm describe-parameters': ['--parameter-filters'], 'ssm get-parameter': ['--name'] });
+// Flags that must be PRESENT, not merely allowed (Phase 3D governance and
+// repository tables): describe-parameters without its one-name filter would
+// list every parameter of the account.
+const PARAMETER_REQUIRED_FLAGS = Object.freeze({ 'ssm describe-parameters': ['--parameter-filters'], 'ssm get-parameter': ['--name'] });
 
-export function assertGovernanceRead(argv) {
-  assertAllowed(argv, GOVERNANCE_READ_OPERATIONS, GOVERNANCE_READ_WORDS);
-  for (const flag of GOVERNANCE_REQUIRED_FLAGS[`${argv[0]} ${argv[1]}`] ?? []) {
+function assertRequiredFlags(argv, words) {
+  for (const flag of PARAMETER_REQUIRED_FLAGS[`${argv[0]} ${argv[1]}`] ?? []) {
     if (!argv.includes(flag)) {
-      throw new AwsCliError('refused', `refusing 'aws ${argv[0]} ${argv[1]}' without ${flag}: ${GOVERNANCE_READ_WORDS.list}`, { operation: `${argv[0]} ${argv[1]}` });
+      throw new AwsCliError('refused', `refusing 'aws ${argv[0]} ${argv[1]}' without ${flag}: ${words.list}`, { operation: `${argv[0]} ${argv[1]}` });
     }
   }
 }
 
+export function assertGovernanceRead(argv) {
+  assertAllowed(argv, GOVERNANCE_READ_OPERATIONS, GOVERNANCE_READ_WORDS);
+  assertRequiredFlags(argv, GOVERNANCE_READ_WORDS);
+}
+
 export function assertGovernancePlanning(argv) {
   assertAllowed(argv, GOVERNANCE_PLANNING_OPERATIONS, GOVERNANCE_PLANNING_WORDS);
+  assertRequiredFlags(argv, GOVERNANCE_PLANNING_WORDS);
+}
+
+const REPOSITORY_READ_WORDS = { list: 'the break-glass repository read-only allowlist (aws verify --scope break-glass-repo makes no AWS changes)', kind: 'read' };
+const REPOSITORY_PLANNING_WORDS = { list: 'the break-glass repository planning allowlist (aws plan --scope break-glass-repo never executes a change set)', kind: 'planning' };
+export function assertRepositoryRead(argv) {
+  assertAllowed(argv, REPOSITORY_READ_OPERATIONS, REPOSITORY_READ_WORDS);
+  assertRequiredFlags(argv, REPOSITORY_READ_WORDS);
+}
+
+export function assertRepositoryPlanning(argv) {
+  assertAllowed(argv, REPOSITORY_PLANNING_OPERATIONS, REPOSITORY_PLANNING_WORDS);
+  assertRequiredFlags(argv, REPOSITORY_PLANNING_WORDS);
 }
 
 // --- execution ----------------------------------------------------------------------
@@ -678,6 +757,15 @@ export function governanceReadAws(options = {}) {
 
 export function governancePlanningAws(options = {}) {
   return wrapper(assertGovernancePlanning, options);
+}
+
+// Phase 3D: the repository wrappers.
+export function repositoryReadAws(options = {}) {
+  return wrapper(assertRepositoryRead, options);
+}
+
+export function repositoryPlanningAws(options = {}) {
+  return wrapper(assertRepositoryPlanning, options);
 }
 
 // applyAws({ region, binding, ...readOnlyAws options }) — the same contract

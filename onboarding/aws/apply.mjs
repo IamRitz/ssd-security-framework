@@ -261,6 +261,12 @@ function nextSteps(config, record, resources) {
 function breakGlassNextSteps(record) {
   const { family, environment } = breakGlassKindOf(record.plan.stackKind);
   const n = breakGlassNames(environment);
+  if (family === 'repo') {
+    return [
+      `Run \`ssd-onboard aws verify --scope break-glass-repo --environment ${environment} --operator-config <file> --repository-config <file>\` to prove the invoker role (trust, its one permission, every denial) and the approver parameter.`,
+      'Approvers take effect at the next click. To offboard, plan `approvers: []` and apply before removing anything (Retain).'
+    ];
+  }
   if (family === 'governance') {
     return [
       `Run \`ssd-onboard aws verify --scope break-glass-governance --environment ${environment} --operator-config <file> --policy-config <file>\` to prove ${BREAK_GLASS_GOVERNANCE_STACKS[environment]} (ownership, byte-exact value, admission, readers and writers).`,
@@ -318,6 +324,7 @@ export async function awsApply({
   config = null,
   operator = null,
   policy = null,
+  repository = null,
   planId,
   account,
   region,
@@ -358,7 +365,7 @@ export async function awsApply({
   report.changes = { counts: record.counts, destructive: record.destructive, items: record.changes };
 
   // 3. Intent, configuration and framework binding.
-  if (!step(report, 'intent', 'Account, region, repository, stack, configuration and framework match', checkIntent({ plan, config, operator, policy, framework, account, region }))) {
+  if (!step(report, 'intent', 'Account, region, repository, stack, configuration and framework match', checkIntent({ plan, config, operator, policy, repository, framework, account, region }))) {
     return refuse(report);
   }
 

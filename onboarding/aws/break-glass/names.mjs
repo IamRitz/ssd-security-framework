@@ -15,7 +15,7 @@
 //                                 (both) and
 //                                 /ssd/break-glass/<environment>/approvers/<repository_id>
 //                                 (interactions; Phase 3B, PR #17)
-import { BREAK_GLASS_ENVIRONMENTS, BREAK_GLASS_STACKS } from '../stack-names.mjs';
+import { BREAK_GLASS_ENVIRONMENTS, BREAK_GLASS_STACKS, breakGlassRepoStackName } from '../stack-names.mjs';
 
 // Pinned runtime inputs. Changing any of them is a reviewed template change.
 export const LAMBDA_RUNTIME = 'nodejs24.x';
@@ -193,4 +193,26 @@ export function codeSha256Of(hex) {
     throw new Error('the artifact sha256 must be 64 lower-case hex characters');
   }
   return Buffer.from(hex, 'hex').toString('base64');
+}
+
+// Phase 3D: everything one repository's stack in one environment names. All
+// derived from the environment and the immutable repository_id.
+export const INVOKER_POLICY_NAME = 'ssd-break-glass-invoke-ci';
+export function invokerNames(environment, repositoryId) {
+  const stack = breakGlassRepoStackName(environment, repositoryId);
+  return Object.freeze({
+    environment,
+    repositoryId,
+    stack,
+    role: `ssd-break-glass-${environment}-invoker-${repositoryId}`,
+    policyName: INVOKER_POLICY_NAME,
+    approverParameter: `${breakGlassNames(environment).approverPrefix}${repositoryId}`
+  });
+}
+export function invokerArns(environment, repositoryId, { partition = 'aws', account, region }) {
+  const n = invokerNames(environment, repositoryId);
+  return Object.freeze({
+    role: `arn:${partition}:iam::${account}:role/${n.role}`,
+    approverParameter: `arn:${partition}:ssm:${region}:${account}:parameter${n.approverParameter}`
+  });
 }

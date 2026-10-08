@@ -178,7 +178,7 @@ describe('read-only allowlist', () => {
 
   it('the allowlist names no mutating operation, and there is no mutating wrapper', () => {
     const MUTATING = /^(put|create|update|delete|attach|detach|tag|untag|set|execute|send|start|stop|enable|disable|register|deregister|import|modify|run|terminate|reboot|batch-delete|upload|complete|initiate|add|remove|reset|associate|disassociate|cancel|restore|replace)-/;
-    for (const table of [READ_ONLY_OPERATIONS, awsCli.BREAK_GLASS_READ_OPERATIONS, awsCli.GOVERNANCE_READ_OPERATIONS]) {
+    for (const table of [READ_ONLY_OPERATIONS, awsCli.BREAK_GLASS_READ_OPERATIONS, awsCli.GOVERNANCE_READ_OPERATIONS, awsCli.REPOSITORY_READ_OPERATIONS]) {
       for (const [service, operations] of Object.entries(table)) {
         for (const operation of Object.keys(operations)) {
           assert.doesNotMatch(operation, MUTATING, `${service} ${operation}`);
@@ -190,10 +190,11 @@ describe('read-only allowlist', () => {
     // (aws apply, test/aws-apply-wrapper.test.js) and the two Phase 3C
     // break-glass ones (read-only verify and planning,
     // test/aws-break-glass-plan.test.js) and the two Phase 3D governance ones
-    // (test/aws-break-glass-governance.test.js); there is no generic mutating wrapper.
+    // (test/aws-break-glass-governance.test.js) and the two Phase 3D repository
+    // ones (test/aws-break-glass-repository.test.js); there is no generic mutating wrapper.
     assert.deepEqual(Object.keys(awsCli).sort(), [
-      'AwsCliError', 'BREAK_GLASS_PLANNING_OPERATIONS', 'BREAK_GLASS_READ_OPERATIONS', 'DEFAULT_DEADLINE_MS', 'DEFAULT_MAX_BUFFER', 'DEFAULT_TIMEOUT_MS', 'EMPTY_SUCCESS_OPERATIONS', 'GOVERNANCE_PLANNING_OPERATIONS', 'GOVERNANCE_READ_OPERATIONS', 'MAX_TEMPLATE_BODY', 'PLANNING_OPERATIONS', 'READ_ONLY_OPERATIONS',
-      'applyAws', 'applyOperations', 'assertApply', 'assertBreakGlassPlanning', 'assertBreakGlassRead', 'assertGovernancePlanning', 'assertGovernanceRead', 'assertPlanning', 'assertReadOnly', 'breakGlassPlanningAws', 'breakGlassReadAws', 'classifyFailure', 'execAws', 'executeArgv', 'governancePlanningAws', 'governanceReadAws', 'planningAws', 'readOnlyAws', 'redact'
+      'AwsCliError', 'BREAK_GLASS_PLANNING_OPERATIONS', 'BREAK_GLASS_READ_OPERATIONS', 'DEFAULT_DEADLINE_MS', 'DEFAULT_MAX_BUFFER', 'DEFAULT_TIMEOUT_MS', 'EMPTY_SUCCESS_OPERATIONS', 'GOVERNANCE_PLANNING_OPERATIONS', 'GOVERNANCE_READ_OPERATIONS', 'MAX_TEMPLATE_BODY', 'PLANNING_OPERATIONS', 'READ_ONLY_OPERATIONS', 'REPOSITORY_PLANNING_OPERATIONS', 'REPOSITORY_READ_OPERATIONS',
+      'applyAws', 'applyOperations', 'assertApply', 'assertBreakGlassPlanning', 'assertBreakGlassRead', 'assertGovernancePlanning', 'assertGovernanceRead', 'assertPlanning', 'assertReadOnly', 'assertRepositoryPlanning', 'assertRepositoryRead', 'breakGlassPlanningAws', 'breakGlassReadAws', 'classifyFailure', 'execAws', 'executeArgv', 'governancePlanningAws', 'governanceReadAws', 'planningAws', 'readOnlyAws', 'redact', 'repositoryPlanningAws', 'repositoryReadAws'
     ]);
   });
 

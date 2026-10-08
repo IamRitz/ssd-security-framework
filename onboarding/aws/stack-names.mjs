@@ -49,6 +49,24 @@ export const BREAK_GLASS_GOVERNANCE_STACKS = Object.freeze({
 // The plan stack kind of each environment's stack (plan/scope.mjs).
 export const breakGlassStackKind = (environment) => `break-glass-${environment}`;
 export const breakGlassGovernanceStackKind = (environment) => `break-glass-governance-${environment}`;
+// Phase 3D: one repository stack per repository AND environment, named after
+// the IMMUTABLE GitHub repository_id (never the slug, which can be renamed).
+export const breakGlassRepoStackKind = (environment) => `break-glass-repo-${environment}`;
+export const REPOSITORY_ID = /^[1-9][0-9]{0,19}$/;
+export function breakGlassRepoStackName(environment, repositoryId) {
+  if (!BREAK_GLASS_ENVIRONMENTS.includes(environment) || typeof repositoryId !== 'string' || !REPOSITORY_ID.test(repositoryId)) {
+    throw new Error(`cannot derive a break-glass repository stack from environment '${environment}' and repository_id '${repositoryId}'`);
+  }
+  return `ssd-break-glass-${environment}-repo-${repositoryId}`;
+}
+// stack name -> the repository_id it is named after, or null when it is not
+// exactly a repository stack of that environment.
+export function repositoryIdOfStack(environment, stackName) {
+  if (!BREAK_GLASS_ENVIRONMENTS.includes(environment) || typeof stackName !== 'string') return null;
+  const prefix = `ssd-break-glass-${environment}-repo-`;
+  const id = stackName.startsWith(prefix) ? stackName.slice(prefix.length) : null;
+  return id !== null && REPOSITORY_ID.test(id) ? id : null;
+}
 
 // Every break-glass stack kind, by family. A family is never inferred from a
 // prefix: only these exact kinds exist.
@@ -56,11 +74,12 @@ const BREAK_GLASS_KINDS = Object.freeze(
   Object.fromEntries(
     BREAK_GLASS_ENVIRONMENTS.flatMap((environment) => [
       [breakGlassStackKind(environment), Object.freeze({ family: 'shared', environment })],
-      [breakGlassGovernanceStackKind(environment), Object.freeze({ family: 'governance', environment })]
+      [breakGlassGovernanceStackKind(environment), Object.freeze({ family: 'governance', environment })],
+      [breakGlassRepoStackKind(environment), Object.freeze({ family: 'repo', environment })]
     ])
   )
 );
-// stack kind -> { family: 'shared' | 'governance', environment }, or null.
+// stack kind -> { family: 'shared' | 'governance' | 'repo', environment }, or null.
 export const breakGlassKindOf = (stackKind) => (typeof stackKind === 'string' && Object.hasOwn(BREAK_GLASS_KINDS, stackKind) ? BREAK_GLASS_KINDS[stackKind] : null);
 // stack kind -> environment, or null for a kind that is not a break-glass stack.
 export const breakGlassEnvironmentOf = (stackKind) => breakGlassKindOf(stackKind)?.environment ?? null;
