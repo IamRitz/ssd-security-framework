@@ -28,17 +28,22 @@ export const SIGNING_SECRET = 'identity-test-signing-secret';
 export const RESPONSE_URL = 'https://hooks.slack.com/actions/T0/1/abc';
 export const APPROVERS = { [REPO_A.repositoryId]: [SLACK_A], [REPO_B.repositoryId]: [SLACK_B] };
 
-export const payloadFor = (repo = REPO_A, { pullRequest = '51', sha = SHA_A, ...context } = {}) => ({
+// `environment` is the framework-derived request environment (Phase 3E).
+export const payloadFor = (repo = REPO_A, { pullRequest = '51', sha = SHA_A, environment = 'production', ...context } = {}) => ({
   schemaVersion: 1,
+  environment,
   gateDigest: 'a'.repeat(64),
   timeoutSeconds: 900,
   context: { repository: repo.repository, commitSha: sha, pullRequest, ...context },
   findings: [{ source: 'semgrep', id: 'demo.rule', action: 'BLOCK', policyRule: 'sast.high_new', reason: 'new high' }]
 });
 
+// `environment` is the broker's BREAK_GLASS_ENVIRONMENT (default production);
+// the approver and framework-policy fakes serve that environment's parameters.
 export function brokerEnv(options = {}) {
-  const { approvers = approversById(APPROVERS), events = null } = options;
-  const framework = options.framework ?? fakeFrameworkPolicy({ events });
+  const { environment = 'production', events = null } = options;
+  const approvers = options.approvers ?? approversById(APPROVERS, { environment });
+  const framework = options.framework ?? fakeFrameworkPolicy({ events, environment });
   let clock = NOW_MS;
   const now = () => new Date(clock);
   const dynamo = createFakeDynamo();
@@ -89,6 +94,7 @@ export function brokerEnv(options = {}) {
       return v.verify(identityToken);
     },
     frameworkPolicy: 'frameworkPolicy' in options ? options.frameworkPolicy : framework.policy,
+    environment: 'brokerEnvironment' in options ? options.brokerEnvironment : environment,
     slackChannelId: 'C',
     now,
     log: (entry) => logs.push(entry)
@@ -98,7 +104,7 @@ export function brokerEnv(options = {}) {
   const interactions = createInteractionsHandler({ getBroker: async () => broker, enqueue: async (job) => enqueued.push(job) });
   const tokenFor = (overrides = {}) => signToken(githubClaims({ nowSeconds: Math.floor(clock / 1000), ...overrides }), { key: KEY });
   return {
-    dynamo, store, slack, github, logs, ci, interactions, enqueued, broker, failNext, framework,
+    dynamo, store, slack, github, logs, ci, interactions, enqueued, broker, failNext, framework, approvers, environment,
     advance: (ms) => (clock += ms),
     tokenFor,
     notify: (payload, identityToken) => ci({ action: 'notify', payload, identityToken }),
@@ -108,9 +114,9 @@ export function brokerEnv(options = {}) {
   };
 }
 
-export async function fileRequest(env, { repo = REPO_A, runId = '700001', runAttempt = '1', pullRequest = '51', sha = SHA_A } = {}) {
+export async function fileRequest(env, { repo = REPO_A, runId = '700001', runAttempt = '1', pullRequest = '51', sha = SHA_A, environment = env.environment } = {}) {
   const result = await env.notify(
-    payloadFor(repo, { pullRequest, sha }),
+    payloadFor(repo, { pullRequest, sha, environment }),
     env.tokenFor({ repo, runId, runAttempt, pullRequest, sha })
   );
   assert.equal(result.statusCode, 201, JSON.stringify(result));

@@ -745,7 +745,11 @@ describe('approval and audit: keyed by the verified repository_id', () => {
       doc: { S: JSON.stringify(legacy) }
     });
     assert.equal((await env.status(requestId, env.tokenFor())).statusCode, 403);
-    assert.equal((await env.interactions(signedClick(requestId, SLACK_A))).headers['x-break-glass-outcome'], 'unauthorized');
+    // It records no environment either (Phase 3E), so it belongs to no broker:
+    // a click is rejected before any approver or policy lookup.
+    assert.equal((await env.interactions(signedClick(requestId, SLACK_A))).headers['x-break-glass-outcome'], 'rejected');
+    assert.equal(env.approvers.requested.length, 0, 'no approver lookup');
+    assert.equal(JSON.parse(env.dynamo.table.get(requestId).doc.S).status, 'pending');
     // Even if such a request were somehow decided, the audit comment refuses it.
     env.dynamo.table.set(requestId, {
       ...env.dynamo.table.get(requestId),

@@ -1,15 +1,26 @@
 // Slack Block Kit builders — the same message shape the n8n workflow produced,
 // so the channel experience is unchanged after the migration.
 
+// A synthetic request (Phase 3E) carries a FABRICATED finding: it says so in
+// its first line, before anything an approver could mistake for a real one.
+const SYNTHETIC_PREFIX = '[SYNTHETIC] ';
+const prefix = (request) => (request.environment === 'synthetic' ? SYNTHETIC_PREFIX : '');
+
 export function buildApprovalMessage(request, channel) {
   const lines = request.findings.map(
     (finding) => `- ${finding.policyRule}: ${finding.id} - ${finding.reason}`
   );
+  const title = `${prefix(request)}Break-glass security exception requested`;
+  const synthetic =
+    request.environment === 'synthetic'
+      ? [{ type: 'context', elements: [{ type: 'mrkdwn', text: '*Synthetic test request* (synthetic environment, fabricated finding). Not a production approval.' }] }]
+      : [];
   return {
     channel,
-    text: 'Break-glass security exception requested',
+    text: title,
     blocks: [
-      { type: 'header', text: { type: 'plain_text', text: 'Break-glass security exception requested' } },
+      { type: 'header', text: { type: 'plain_text', text: title } },
+      ...synthetic,
       { type: 'section', text: { type: 'mrkdwn', text: lines.join('\n').slice(0, 2900) } },
       {
         type: 'section',
@@ -53,13 +64,13 @@ export function buildDecisionUpdate(request) {
   return {
     channel: request.slack.channel,
     ts: request.slack.ts,
-    text: `Break-glass ${decision}`,
+    text: `${prefix(request)}Break-glass ${decision}`,
     blocks: [
       {
         type: 'section',
         text: {
           type: 'mrkdwn',
-          text: `*Break-glass ${decision.toUpperCase()}* by <@${approver.id}>\n${findingText}`
+          text: `*${prefix(request)}Break-glass ${decision.toUpperCase()}* by <@${approver.id}>\n${findingText}`
         }
       },
       {

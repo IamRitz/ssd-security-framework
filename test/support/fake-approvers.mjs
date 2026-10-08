@@ -34,6 +34,6 @@ export function fakeApproverSource(parameters = {}, { environment = 'production'
 // The common case: repository_id -> list of Slack user IDs.
 export const approversById = (byId, options) =>
   fakeApproverSource(
-    Object.fromEntries(Object.entries(byId).map(([id, users]) => [approverParameter(id), JSON.stringify(users)])),
+    Object.fromEntries(Object.entries(byId).map(([id, users]) => [approverParameter(id, options?.environment), JSON.stringify(users)])),
     options
   );

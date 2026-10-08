@@ -23,7 +23,8 @@ export const TESTS = [
   'test/break-glass-ux.test.js',
   'test/break-glass-oidc-boundary.test.js',
   'test/break-glass-scenarios.test.js',
-  'test/break-glass-live.test.js'
+  'test/break-glass-live.test.js',
+  'test/break-glass-environment.test.js'
 ];
 
 const OIDC = 'broker/identity/github-oidc.mjs';
@@ -34,6 +35,7 @@ const APPROVERS = 'broker/authorize/approvers.mjs';
 const POLICY = 'broker/identity/framework-policy.mjs';
 const RUNTIME = 'broker/lambda/runtime.mjs';
 const LIVE = 'tools/break-glass-live.mjs';
+const NOTIFY = 'security/scripts/break-glass-notify.mjs';
 
 // authenticate(): the framework check before the replay claim (as shipped), and
 // moved after it.
@@ -149,7 +151,24 @@ export const MUTATIONS = [
   ['3E live: the secret never enters the evidence', LIVE, '    Object.assign(evidence, await runScenario(options, {', '    Object.assign(evidence, { signingSecret: secret }, await runScenario(options, {'],
   ['3E live: exactly one racing click may decide', LIVE, "    expect(JSON.stringify(outcomes) === JSON.stringify(['claimed', 'duplicate']),", "    expect(outcomes.includes('claimed'),"],
   ['3E live: the stale forgery is outside the five-minute window', LIVE, 'export const STALE_SECONDS = 600;', 'export const STALE_SECONDS = 60;'],
-  ['3E live: a forgery must be refused 401', LIVE, "      expect(r.httpStatus === 401 && r.outcome === null,", "      expect(r.httpStatus !== 500,"]
+  ['3E live: a forgery must be refused 401', LIVE, "      expect(r.httpStatus === 401 && r.outcome === null,", "      expect(r.httpStatus !== 500,"],
+  // --- Phase 3E: broker-side environment binding --------------------------------
+  ['3E env: notify checks the request environment', BROKER, "    const misrouted = environmentRejection(payload.environment);\n    if (misrouted) return misrouted;\n", ''],
+  ['3E env: the environment is checked before the token is spent', BROKER, "    const misrouted = environmentRejection(payload.environment);\n    if (misrouted) return misrouted;\n\n    const auth = await authenticate('notify', identityToken, payload.context.repository);\n    if (auth.rejected) return auth.rejected;\n", "    const auth = await authenticate('notify', identityToken, payload.context.repository);\n    if (auth.rejected) return auth.rejected;\n    const misrouted = environmentRejection(payload.environment);\n    if (misrouted) return misrouted;\n"],
+  ['3E env: another environment is refused', BROKER, '    if (requested !== environment) {', '    if (false) {'],
+  ['3E env: a malformed environment is refused as malformed', BROKER, '    if (!BREAK_GLASS_ENVIRONMENTS.includes(requested)) {', '    if (requested === undefined) {'],
+  ['3E env: a broker without an environment refuses everything', BROKER, '    if (!BREAK_GLASS_ENVIRONMENTS.includes(environment)) {\n      log({ event: \'environment_rejected\', reason: \'broker_misconfigured\'', '    if (false) {\n      log({ event: \'environment_rejected\', reason: \'broker_misconfigured\''],
+  ['3E env: the stored request records its environment', REQUEST, '    requestId: randomUUID(),\n    environment,\n', '    requestId: randomUUID(),\n'],
+  ['3E env: status acts only on this environment\'s request', BROKER, '    if (!ownEnvironment(request)) {', '    if (false) {'],
+  ['3E env: a click acts only on this environment\'s request', BROKER, '    if (stored && !ownEnvironment(stored)) {', '    if (false) {'],
+  ['3E env: a request without an environment belongs nowhere', BROKER, '&& request?.environment === environment;', '&& (request?.environment ?? environment) === environment;'],
+  ['3E env: the runtime binds the broker to BREAK_GLASS_ENVIRONMENT', RUNTIME, '    environment: env.BREAK_GLASS_ENVIRONMENT,\n', ''],
+  ['3E env: Slack labels a synthetic request', 'broker/messages.mjs', "const prefix = (request) => (request.environment === 'synthetic' ? SYNTHETIC_PREFIX : '');", "const prefix = () => '';"],
+  ['3E env: the client derives synthetic from a recorded fixture', NOTIFY, "  return active ? 'synthetic' : 'production';", "  return active ? 'production' : 'synthetic';"],
+  ['3E env: the client refuses evidence without a synthetic record', NOTIFY, "  assert(typeof active === 'boolean', 'the gate evidence does not record whether it is synthetic; refusing to choose a broker environment');\n", ''],
+  ['3E env: the client refuses a disagreeing preflight route', NOTIFY, "      assert(route === environment, `the preflight route '${route}' disagrees with the gate evidence ('${environment}'); refusing to send`);\n", ''],
+  ['3E env: the Lambda payload carries the environment', NOTIFY, "    ...(environment ? { environment } : {}),\n", ''],
+  ['3E env: the workflow passes the preflight route, never an input', '.github/workflows/_break-glass-lambda.yml', '          BREAK_GLASS_ROUTE: ${{ steps.preflight.outputs.route }}\n', '          BREAK_GLASS_ROUTE: ${{ inputs.toolkit_ref }}\n']
 ];
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

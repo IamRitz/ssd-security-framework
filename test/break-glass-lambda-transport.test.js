@@ -10,6 +10,9 @@ import { pollBreakGlass } from '../security/scripts/break-glass-poll.mjs';
 
 const gate = {
   verdict: 'BLOCK',
+  // The gate always records whether a synthetic fixture was injected; the
+  // Lambda request's environment is derived from it (Phase 3E).
+  synthetic: { active: false, fixture: null },
   breakGlass: {
     eligible: true,
     eligibleFindings: [{ id: 'demo.rule', action: 'BLOCK', policyRule: 'sast.high_new', reason: 'new high' }],

@@ -65,10 +65,14 @@ async function syntheticGate() {
   });
 }
 
-const approvers = (users = [SLACK_A, SLACK_B]) => approversById({ [REPO_A.repositoryId]: users });
+// The fixture is synthetic, so every row runs against a SYNTHETIC broker: its
+// approver and framework parameters are the synthetic ones.
+const ENVIRONMENT = 'synthetic';
+const approvers = (users = [SLACK_A, SLACK_B]) => approversById({ [REPO_A.repositoryId]: users }, { environment: ENVIRONMENT });
 const setApprovers = (source, users) => {
-  source.parameters[approverParameter(REPO_A.repositoryId)] = JSON.stringify(users);
+  source.parameters[approverParameter(REPO_A.repositoryId, ENVIRONMENT)] = JSON.stringify(users);
 };
+const syntheticBroker = (options) => brokerEnv({ environment: ENVIRONMENT, ...options });
 
 // Runs one break-glass job against `env`. `onTick(tick, ctx)` runs at every
 // poll interval (tick 1 is the first wait after the request was filed): that
@@ -96,7 +100,8 @@ async function runJob(env, { timeoutSeconds = 120, onTick = async () => {} } = {
       context: { repository: RUN.repository, commitSha: RUN.commitSha, pullRequest: PULL_REQUEST, ciSystem: 'github-actions' },
       timeoutSeconds,
       invoke: (event) => env.ci(event),
-      mintIdentityToken: token
+      mintIdentityToken: token,
+      route: route.route
     });
     requestOutcome = 'success';
     ctx.requestId = request.requestId;
@@ -159,7 +164,7 @@ const blockStands = (run) => {
 
 describe('Phase 3E scenario table: the whole chain, in process', () => {
   it('A + R: eligible BLOCK -> request -> approval -> overridden BLOCK, every digest identical', async () => {
-    const env = brokerEnv({ approvers: approvers() });
+    const env = syntheticBroker({ approvers: approvers() });
     const run = await runJob(env, { onTick: async (tick, ctx) => tick === 1 && ctx.click(SLACK_A) });
 
     assert.equal(run.validated.synthetic, true, 'the fixture is recorded in the evidence');
@@ -179,7 +184,7 @@ describe('Phase 3E scenario table: the whole chain, in process', () => {
   });
 
   it('B: an explicit denial leaves the BLOCK', async () => {
-    const env = brokerEnv({ approvers: approvers() });
+    const env = syntheticBroker({ approvers: approvers() });
     const run = await runJob(env, { onTick: async (tick, ctx) => tick === 1 && ctx.click(SLACK_A, 'deny') });
     assert.equal(run.decision.status, 'denied');
     assert.equal(run.result.decisionStatus, 'denied');
@@ -187,7 +192,7 @@ describe('Phase 3E scenario table: the whole chain, in process', () => {
   });
 
   it('C: no decision before the deadline leaves the BLOCK (timeout or expiry, never a denial)', async () => {
-    const env = brokerEnv({ approvers: approvers() });
+    const env = syntheticBroker({ approvers: approvers() });
     const run = await runJob(env, { timeoutSeconds: 60 });
     assert.ok(['timeout', 'expired'].includes(run.result.decisionStatus), run.result.decisionStatus);
     blockStands(run);
@@ -195,7 +200,7 @@ describe('Phase 3E scenario table: the whole chain, in process', () => {
   });
 
   it('E + F: two approvers click at once -> exactly one decision; a later click changes nothing', async () => {
-    const env = brokerEnv({ approvers: approvers() });
+    const env = syntheticBroker({ approvers: approvers() });
     const run = await runJob(env, {
       onTick: async (tick, ctx) => {
         if (tick !== 1) return;
@@ -215,7 +220,7 @@ describe('Phase 3E scenario table: the whole chain, in process', () => {
   });
 
   it('G + H: the framework commit is revoked while CI polls -> the poll fails closed and a click is refused', async () => {
-    const env = brokerEnv({ approvers: approvers() });
+    const env = syntheticBroker({ approvers: approvers() });
     const run = await runJob(env, {
       onTick: async (tick, ctx) => {
         if (tick !== 1) return;
@@ -232,7 +237,7 @@ describe('Phase 3E scenario table: the whole chain, in process', () => {
 
   it('I: an approver removed after filing cannot decide; the current list does', async () => {
     const source = approvers([SLACK_A, SLACK_B]);
-    const env = brokerEnv({ approvers: source });
+    const env = syntheticBroker({ approvers: source });
     const run = await runJob(env, {
       onTick: async (tick, ctx) => {
         if (tick !== 1) return;
@@ -247,7 +252,7 @@ describe('Phase 3E scenario table: the whole chain, in process', () => {
   });
 
   it('J: an empty approver list `[]` authorizes nobody; the BLOCK stands', async () => {
-    const env = brokerEnv({ approvers: approvers([]) });
+    const env = syntheticBroker({ approvers: approvers([]) });
     const run = await runJob(env, {
       timeoutSeconds: 60,
       onTick: async (tick, ctx) => {

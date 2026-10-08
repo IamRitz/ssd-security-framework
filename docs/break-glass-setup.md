@@ -298,9 +298,13 @@ guards. TTL deletion is lazy and happens only after that.
 
 `notify` writes in this order, and nothing before step 2 writes at all:
 
-1. **Check the payload shape, verify the token, and check its framework
-   commit** against this environment's allowed set. Nothing is written, and no
-   secret is read.
+1. **Check the payload shape and the request's environment, verify the
+   token, and check its framework commit** against this environment's allowed
+   set. The environment (`production` or `synthetic`) is derived by the
+   framework from its gate evidence and must be the broker's own
+   `BREAK_GLASS_ENVIRONMENT` (Phase 3E): otherwise `403 environment_mismatch`
+   (`400` when omitted or malformed), before the token is even verified.
+   Nothing is written, and no secret is read.
 2. **Claim the token's `jti`** with a conditional write. This is the first write.
 3. **Bind the payload to the token.** A disagreement is refused, and the token
    is already spent. This order is **intentional**: claiming first means no

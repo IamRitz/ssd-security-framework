@@ -29,6 +29,10 @@ only, PR number from the verified ref) are not weakened for it.
 
 ### Environment binding (broker side)
 
+**Status: implemented** (client, workflow and broker; `test/break-glass-environment.test.js`,
+16 targeted mutations). Not yet live: the synthetic stack still runs the 3D
+broker until it is updated with an artifact built from this code.
+
 The client routes synthetic evidence to the synthetic broker and refuses
 identifiers equal to production's. Those identifiers are supplied by the
 caller, so that comparison alone does not prove which environment the
@@ -57,7 +61,14 @@ the gate digest. 3E binds the environment on both sides:
    (including a request stored before 3E, with none) is refused without a
    state change.
 5. **Slack labels it.** A synthetic approval message and its decision update
-   say so in their first line.
+   say so in their first line (`[SYNTHETIC]`), and the approval message adds
+   "Synthetic test request … Not a production approval".
+
+Every 3E broker refuses a request without `environment`, so a framework commit
+from before 3E (Phase 3D's included) can no longer file against it: the
+governance stack must admit a 3E commit. A broker without a valid
+`BREAK_GLASS_ENVIRONMENT` refuses every request
+(`500 environment_misconfigured`).
 
 ## Evidence matrix
 

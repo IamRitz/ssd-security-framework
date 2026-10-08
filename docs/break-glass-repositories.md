@@ -487,7 +487,9 @@ Slack and move to Phase 3E.
   (the bound framework derives the request's environment from validated
   evidence, and the broker refuses one that is not its own
   `BREAK_GLASS_ENVIRONMENT`) before production readiness. Production stays
-  untouched until that is complete.
+  untouched until that is complete. **Status:** implemented on the Phase 3E
+  branch, not yet live-validated
+  ([break-glass-validation.md § Environment binding](break-glass-validation.md#environment-binding-broker-side)).
 - **Customized OIDC subjects** (future work). Supporting one needs the
   subject GitHub emits to be proven from a recorded run of that repository,
   and trust and verify built from that proven subject. Until then such a

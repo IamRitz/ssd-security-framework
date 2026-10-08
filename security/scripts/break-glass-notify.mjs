@@ -49,6 +49,18 @@ export function validateEligibleGate(gate) {
   return gate.breakGlass.eligibleFindings;
 }
 
+// The broker environment a request belongs to, derived from the gate evidence
+// itself (Phase 3E): the same object whose SHA-256 is the request's gateDigest,
+// re-validated by the preflight before this runs. A recorded synthetic fixture
+// is `synthetic`; a recorded absence is `production`; anything else refuses.
+// No workflow input can choose it.
+export const REQUEST_ENVIRONMENTS = Object.freeze(['production', 'synthetic']);
+export function requestEnvironment(gate) {
+  const active = gate?.synthetic?.active;
+  assert(typeof active === 'boolean', 'the gate evidence does not record whether it is synthetic; refusing to choose a broker environment');
+  return active ? 'synthetic' : 'production';
+}
+
 function requireHttps(value, label) {
   assert(typeof value === 'string' && value !== '', `${label} is not configured`);
   const url = new URL(value);
@@ -69,9 +81,22 @@ export async function notifyBreakGlass({
   // Lambda transport only: async () -> a fresh `ssd-break-glass` GitHub OIDC
   // token. The broker derives the repository, PR and run from it and refuses a
   // request without one. It travels beside the payload, never inside it.
-  mintIdentityToken = null
+  mintIdentityToken = null,
+  // Lambda transport: the route the preflight resolved from the same evidence
+  // (_break-glass-lambda.yml's steps.preflight.outputs.route). When given, it
+  // must equal the environment derived here, or nothing is sent.
+  route = null
 }) {
   const findings = validateEligibleGate(gate);
+  // Lambda transport only: the request names its broker environment, and the
+  // broker refuses one that is not its own. The legacy HTTP payload is unchanged.
+  let environment = null;
+  if (invoke) {
+    environment = requestEnvironment(gate);
+    if (route !== null && route !== undefined && route !== '') {
+      assert(route === environment, `the preflight route '${route}' disagrees with the gate evidence ('${environment}'); refusing to send`);
+    }
+  }
   let send;
   if (invoke) {
     assert(typeof mintIdentityToken === 'function', 'the Lambda transport needs a GitHub OIDC identity token minter');
@@ -106,6 +131,7 @@ export async function notifyBreakGlass({
   const gateDigest = createHash('sha256').update(JSON.stringify(gate)).digest('hex');
   const payload = {
     schemaVersion: 1,
+    ...(environment ? { environment } : {}),
     gateDigest,
     timeoutSeconds,
     context,
@@ -165,7 +191,8 @@ async function main() {
       context,
       timeoutSeconds,
       invoke: lambdaInvokerFromEnv(process.env),
-      mintIdentityToken: () => mintBreakGlassIdentityToken()
+      mintIdentityToken: () => mintBreakGlassIdentityToken(),
+      route: process.env.BREAK_GLASS_ROUTE || null
     });
     await mkdir(dirname(options.output), { recursive: true });
     await writeFile(options.output, `${JSON.stringify(result, null, 2)}\n`);
