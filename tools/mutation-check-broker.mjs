@@ -21,7 +21,8 @@ export const TESTS = [
   'test/broker-authorize.test.js',
   'test/break-glass-lambda-transport.test.js',
   'test/break-glass-ux.test.js',
-  'test/break-glass-oidc-boundary.test.js'
+  'test/break-glass-oidc-boundary.test.js',
+  'test/break-glass-scenarios.test.js'
 ];
 
 const OIDC = 'broker/identity/github-oidc.mjs';
@@ -130,7 +131,11 @@ export const MUTATIONS = [
   ['notify sends the identity token', 'security/scripts/break-glass-notify.mjs', "await invoke({ action: 'notify', payload, identityToken });", "await invoke({ action: 'notify', payload });"],
   ['every poll sends its own identity token', 'security/scripts/break-glass-poll.mjs', "await invoke({ action: 'status', requestId: request.requestId, identityToken });", "await invoke({ action: 'status', requestId: request.requestId });"],
   // --- the OIDC boundary --------------------------------------------------------
-  ['_source-scan.yml stays OIDC-free', '.github/workflows/_source-scan.yml', '      pull-requests: write\n', '      pull-requests: write\n      id-token: write\n']
+  ['_source-scan.yml stays OIDC-free', '.github/workflows/_source-scan.yml', '      pull-requests: write\n', '      pull-requests: write\n      id-token: write\n'],
+  // --- Phase 3E: the end-to-end scenario table (test/break-glass-scenarios.test.js) ---
+  ['3E: two concurrent claims cannot both win', STORE, "ConditionExpression: 'attribute_exists(#status) AND #status = :pending AND expiresAt > :now'", "ConditionExpression: 'attribute_exists(#status) AND expiresAt > :now'"],
+  ['3E: a commit revoked while CI polls fails the poll', BROKER, "    const framework = await decideFramework(frameworkPolicy, verified.jobWorkflow?.sha);\n    if (framework.state !== 'allowed') {", "    const framework = await decideFramework(frameworkPolicy, verified.jobWorkflow?.sha);\n    if (framework.state !== 'allowed' && action !== 'status') {"],
+  ['3E: only an approval overrides the BLOCK', 'security/scripts/final-gate.mjs', "    [f.breakGlassDecision === 'approved',", "    [['approved', 'denied'].includes(f.breakGlassDecision),"]
 ];
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
