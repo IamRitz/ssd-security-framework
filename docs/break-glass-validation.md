@@ -21,7 +21,7 @@ only, PR number from the verified ref) are not weakened for it.
 | --- | --- |
 | Repository | one dedicated synthetic repository, onboarded to **synthetic only** (`environments.synthetic` in its repository file; no production stack). It is never a production consumer |
 | Trigger | `pull_request` from a branch of that repository (fork pull requests get no OIDC token and fail closed) |
-| Caller | the template `examples/synthetic-break-glass/security.yml`: `_source-scan.yml` with `synthetic_block_fixture` set, and a separate `break-glass` job calling `_break-glass-lambda.yml` |
+| Caller | the template [`examples/synthetic-break-glass/security.yml`](../examples/synthetic-break-glass/security.yml) (structure asserted by `test/break-glass-synthetic-caller.test.js`): `_source-scan.yml` with `synthetic_block_fixture` set, and a separate `break-glass` job calling `_break-glass-lambda.yml` |
 | Identifiers | the synthetic function and invoker role **and** the production pair, each different. Production does not exist yet, so the production pair is the derived names (`ssd-break-glass-production-ci`, `ssd-break-glass-production-invoker-<repository_id>`); they are compared, never invoked |
 | Framework commit | admitted in the synthetic governance stack only. A candidate commit not yet on `main` may be admitted there, explicitly; production cannot admit it |
 | Secrets | the synthetic stack's three secrets are populated (bot token, signing secret, GitHub token scoped to the synthetic repository). The interaction function reads all three at start-up, so it cannot start without them. Production secrets stay empty |
