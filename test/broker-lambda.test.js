@@ -21,6 +21,7 @@ const RESPONSE_URL = 'https://hooks.slack.com/actions/T0/1/abc';
 
 const eligiblePayload = (overrides = {}) => ({
   schemaVersion: 1,
+  environment: 'production',
   gateDigest: 'a'.repeat(64),
   timeoutSeconds: 900,
   context: { repository: REPO_A, commitSha: SHA_A, pullRequest: '51' },
@@ -59,6 +60,7 @@ function setup({ approvers = approversById(APPROVERS), slack = fakeSlack(), now 
     approverSource: approvers.source,
     verifyIdentity: (token) => verifyGithubOidcToken(token, { jwks, now: () => now().getTime() }),
     frameworkPolicy: fakeFrameworkPolicy().policy,
+    environment: 'production',
     slackChannelId: 'C-TEST',
     now,
     log: () => {}

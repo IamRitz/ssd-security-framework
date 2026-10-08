@@ -378,6 +378,10 @@ landed:
    synthetic isolation rests on caller-supplied identifiers, which guard
    against misrouting only as far as the caller configures them honestly
    ([break-glass-repositories.md § Not in Phase 3D](break-glass-repositories.md#not-in-phase-3d)).
+   Implemented in Phase 3E
+   ([break-glass-validation.md § Environment binding](break-glass-validation.md#environment-binding-broker-side));
+   the production broker's refusal of a synthetic request is proven live at
+   this gate, since 3E has no production broker to send one to.
 
 ## Residual limitations
 

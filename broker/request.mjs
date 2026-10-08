@@ -91,13 +91,17 @@ export function bindRequestIdentity(payload, verified) {
 
 // Clamp the CI-requested timeout exactly as n8n did: default 900s, 60s..3600s.
 // `bound` is bindRequestIdentity's result; nothing here reads payload.context.
-export function createPendingRequest(payload, { now, randomUUID, bound, limits = TIMEOUT_LIMITS }) {
+// `environment` is the broker's own BREAK_GLASS_ENVIRONMENT, which the request's
+// framework-derived environment has already been required to equal (Phase 3E):
+// every later status call and click acts only on a request of that environment.
+export function createPendingRequest(payload, { now, randomUUID, bound, environment, limits = TIMEOUT_LIMITS }) {
   const timeout = Math.min(
     Math.max(Number(payload.timeoutSeconds) || limits.defaultSeconds, limits.minSeconds),
     limits.maxSeconds
   );
   return {
     requestId: randomUUID(),
+    environment,
     gateDigest: payload.gateDigest,
     status: 'pending',
     createdAt: now.toISOString(),

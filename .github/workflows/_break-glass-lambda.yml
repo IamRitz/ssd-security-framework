@@ -342,6 +342,10 @@ jobs:
           BREAK_GLASS_FUNCTION_NAME: ${{ steps.preflight.outputs.function_name }}
           AWS_REGION: ${{ steps.preflight.outputs.region }}
           BREAK_GLASS_TIMEOUT_SECONDS: ${{ inputs.timeout_seconds }}
+          # The environment the request names is derived by the notify script
+          # from the gate evidence; it must also equal the route the preflight
+          # resolved from that evidence. Never a workflow input.
+          BREAK_GLASS_ROUTE: ${{ steps.preflight.outputs.route }}
           CI_REPOSITORY: ${{ github.repository }}
           CI_COMMIT_SHA: ${{ github.sha }}
           CI_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

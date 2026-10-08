@@ -1,0 +1,168 @@
+# EXAMPLE CALLER — the SYNTHETIC break-glass demonstration (Phase 3E,
+# docs/break-glass-validation.md § The synthetic live contract).
+#
+# Use it ONLY in a dedicated synthetic repository: one that is onboarded to the
+# synthetic break-glass environment and to nothing else, and is never a
+# production consumer. Every pull request here files a FABRICATED eligible
+# BLOCK (`synthetic_block_fixture`), which must only ever reach the synthetic
+# broker and its Slack channel.
+#
+# How the isolation holds:
+#   - the fixture is a LITERAL below, never a variable, so no setting can turn
+#     a run of this file into a production request;
+#   - the gate records the fixture in its evidence, and _break-glass-lambda.yml
+#     routes synthetic evidence to the synthetic function and role only,
+#     refusing identifiers equal to production's (there is no fallback);
+#   - the request carries the environment derived from that evidence, and the
+#     broker refuses a request whose environment is not its own;
+#   - the synthetic and production identifiers come from SEPARATE repository
+#     variables. Production does not exist yet: set the production variables to
+#     the derived names (ssd-break-glass-production-ci and
+#     arn:aws:iam::<account>:role/ssd-break-glass-production-invoker-<repository_id>).
+#     They are compared, never invoked.
+#
+# Before the first run:
+#   - commit a Semgrep baseline (docs/onboarding.md § bootstrap): the gate
+#     enforces, so it needs one;
+#   - replace every `v1` below (the three `uses:` refs, `toolkit_ref` and the
+#     toolkit checkout `ref`) with the exact framework commit admitted in the
+#     synthetic governance stack. The broker authorizes that commit, never the
+#     ref spelling.
+#
+# TRIGGER: `pull_request` ONLY. No `workflow_dispatch` (the broker refuses any
+# event but `pull_request`), no `schedule`, and never `pull_request_target`.
+name: Synthetic break-glass
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  source-security:
+    # OIDC-free: no job of `_source-scan.yml` can request a token. The eligible,
+    # enforced synthetic BLOCK is DELEGATED to the `break-glass` job below.
+    uses: IamRitz/ssd-security-framework/.github/workflows/_source-scan.yml@v1
+    permissions:
+      contents: read
+      pull-requests: write
+    with:
+      toolkit_ref: v1
+      # A synthetic BLOCK is delegated only when the gate enforces.
+      gate_mode: enforce
+      semgrep_configs: |
+        p/owasp-top-ten
+        p/javascript
+      semgrep_paths: .
+      break_glass_enabled: true
+      break_glass_transport: lambda
+      # THE fixture: a literal, never an expression. `sast` or `dependency`.
+      synthetic_block_fixture: sast
+
+  break-glass:
+    # THE ONLY JOB IN THIS FILE GRANTED `id-token: write`. The called workflow
+    # binds itself to its own commit, re-validates this run's gate evidence and
+    # resolves the synthetic route from it BEFORE assuming any role.
+    needs: source-security
+    if: ${{ always() && needs.source-security.outputs.break_glass_delegated == 'true' }}
+    uses: IamRitz/ssd-security-framework/.github/workflows/_break-glass-lambda.yml@v1
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      toolkit_ref: v1
+      gate_mode: ${{ needs.source-security.outputs.gate_mode }}
+      expected_gate_digest: ${{ needs.source-security.outputs.gate_digest }}
+      # The SYNTHETIC broker and invoker role: the only ones a synthetic request uses.
+      synthetic_lambda_function: ${{ vars.SYNTHETIC_BREAK_GLASS_LAMBDA_FUNCTION }}
+      synthetic_lambda_role_arn: ${{ vars.SYNTHETIC_BREAK_GLASS_LAMBDA_ROLE_ARN }}
+      synthetic_aws_region: ${{ vars.SYNTHETIC_BREAK_GLASS_AWS_REGION }}
+      # The PRODUCTION identifiers, from separate variables: compared against the
+      # synthetic ones so isolation is proven, never invoked by this file.
+      lambda_function: ${{ vars.BREAK_GLASS_LAMBDA_FUNCTION }}
+      lambda_role_arn: ${{ vars.BREAK_GLASS_LAMBDA_ROLE_ARN }}
+      aws_region: ${{ vars.AWS_REGION }}
+      # Short, so the timeout case of the live session ends quickly. 60..3600.
+      timeout_seconds: ${{ vars.SYNTHETIC_BREAK_GLASS_TIMEOUT_SECONDS || '900' }}
+
+  security-gate:
+    # The overridden BLOCK is decided here, by the framework's final-gate.mjs,
+    # exactly as a production caller decides it.
+    name: security-gate
+    needs:
+      - source-security
+      - break-glass
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      source_outcome: ${{ steps.gate.outputs.source_outcome }}
+      source_override: ${{ steps.gate.outputs.source_override }}
+    steps:
+      - name: Check out the security framework toolkit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: IamRitz/ssd-security-framework
+          ref: v1
+          path: .ssd-toolkit
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24.21.0'
+          package-manager-cache: false
+      - name: Require every security control that gates this pull request
+        id: gate
+        env:
+          SSD_TOOLKIT: ${{ github.workspace }}/.ssd-toolkit/security
+          SOURCE_RESULT: ${{ needs.source-security.result }}
+          SOURCE_VERDICT: ${{ needs.source-security.outputs.verdict }}
+          SOURCE_GATE_MODE: ${{ needs.source-security.outputs.gate_mode }}
+          SOURCE_INTEGRITY_TRUSTED: ${{ needs.source-security.outputs.integrity_trusted }}
+          SOURCE_BREAK_GLASS_ELIGIBLE: ${{ needs.source-security.outputs.break_glass_eligible }}
+          SOURCE_BREAK_GLASS_DELEGATED: ${{ needs.source-security.outputs.break_glass_delegated }}
+          SOURCE_SECRET_SCAN_RESULT: ${{ needs.source-security.outputs.secret_scan_result }}
+          SOURCE_DEPENDENCY_SCAN_RESULT: ${{ needs.source-security.outputs.dependency_scan_result }}
+          SOURCE_SAST_RESULT: ${{ needs.source-security.outputs.sast_result }}
+          SOURCE_GATE_DIGEST: ${{ needs.source-security.outputs.gate_digest }}
+          BREAK_GLASS_RESULT: ${{ needs.break-glass.result }}
+          BREAK_GLASS_DECISION: ${{ needs.break-glass.outputs.decision_status }}
+          BREAK_GLASS_REQUEST_DELIVERED: ${{ needs.break-glass.outputs.request_delivered }}
+          BREAK_GLASS_GATE_DIGEST: ${{ needs.break-glass.outputs.gate_digest }}
+        run: |
+          set -euo pipefail
+          echo "source-security: result=$SOURCE_RESULT verdict=${SOURCE_VERDICT:-unknown}"
+          failed=0
+          # pass | overridden-block | block, decided by the framework helper.
+          if ! node "$SSD_TOOLKIT/scripts/final-gate.mjs"; then
+            failed=1
+          fi
+          if [ "$failed" -ne 0 ]; then
+            exit 1
+          fi
+          echo "All pull-request security controls passed."
+
+  conformance:
+    needs:
+      - source-security
+      - break-glass
+      - security-gate
+    if: ${{ always() }}
+    uses: IamRitz/ssd-security-framework/.github/workflows/_conformance.yml@v1
+    with:
+      toolkit_ref: v1
+      phase: pr
+      artifact_type: library
+      registry: none
+      deploy_target: none
+      break_glass_enabled: true
+      strict_break_glass_evidence: true
+      observed: >-
+        {"secret-scan":{"status":"${{ needs.source-security.outputs.secret_scan_result }}","evidence":"Secret scanning job (per-control output)"},
+         "dependency-scan":{"status":"${{ needs.source-security.outputs.dependency_scan_result }}","evidence":"Dependency scanning job (per-control output)"},
+         "sast":{"status":"${{ needs.source-security.outputs.sast_result }}","evidence":"SAST job (per-control output)"},
+         "source-gate":{"status":"${{ needs.source-security.outputs.source_gate_result }}","verdict":"${{ needs.source-security.outputs.verdict }}","gate_mode":"${{ needs.source-security.outputs.gate_mode }}","integrity_trusted":"${{ needs.source-security.outputs.integrity_trusted }}","break_glass_eligible":"${{ needs.source-security.outputs.break_glass_eligible }}","gate_digest":"${{ needs.source-security.outputs.gate_digest }}","override":"${{ needs.security-gate.outputs.source_override }}","evidence":"source-gate job; override claim from security-gate, verified against break-glass"},
+         "break-glass":{"status":"${{ needs.break-glass.result }}","decision":"${{ needs.break-glass.outputs.decision_status }}","request_delivered":"${{ needs.break-glass.outputs.request_delivered }}","gate_digest":"${{ needs.break-glass.outputs.gate_digest }}","delegated":"${{ needs.source-security.outputs.break_glass_delegated }}","evidence":"_break-glass-lambda.yml (observed decision, synthetic route)"}}

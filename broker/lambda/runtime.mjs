@@ -9,8 +9,10 @@
 //                                 /ssd/break-glass/<environment>/governance/allowed-framework-shas
 //                                 (both functions) and
 //                                 /ssd/break-glass/<environment>/approvers/<repository_id>
-//                                 (interactions function). Missing or anything else ->
-//                                 no framework commit is allowed and nobody is authorized.
+//                                 (interactions function), and is the only environment
+//                                 a request may carry (both; Phase 3E). Missing or
+//                                 anything else -> no framework commit is allowed,
+//                                 nobody is authorized and every request is refused.
 //                                 No approver map is read from the environment (neither the
 //                                 name-keyed SLACK_APPROVER_IDS_BY_REPO nor the 3A
 //                                 SLACK_APPROVER_IDS_BY_REPOSITORY_ID).
@@ -132,6 +134,9 @@ export async function buildBroker(env, { role, sdk: injected, jwks = createJwksC
     // This environment's allowed framework commits, read on every notify,
     // status and click; every failure allows nothing (identity/framework-policy.mjs).
     frameworkPolicy: createFrameworkPolicy({ environment: env.BREAK_GLASS_ENVIRONMENT, getParameter }),
+    // Every request must be of this environment, derived by the framework from
+    // its gate evidence (Phase 3E). Missing or invalid refuses every request.
+    environment: env.BREAK_GLASS_ENVIRONMENT,
     // GitHub's JWKS from its fixed URL, cached per warm container.
     verifyIdentity: (token) => verifyGithubOidcToken(token, { jwks }),
     slackChannelId: env.SLACK_CHANNEL_ID

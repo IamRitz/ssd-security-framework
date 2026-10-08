@@ -472,7 +472,8 @@ Slack and move to Phase 3E.
   invalid broker response leaving the BLOCK; the concurrent-click race and a
   repeated click; the click-time revoke and a revoke during polling; approver
   changes at click time; Slack signature, replay and status-binding refusals;
-  and the ported `verify-live` suite.
+  and the ported `verify-live` suite
+  ([break-glass-validation.md](break-glass-validation.md)).
 - **Open Phase 3E security item: synthetic environment binding.** Today a
   synthetic request is kept away from the production broker by the client
   alone: `_break-glass-lambda.yml` routes synthetic evidence to the synthetic
@@ -486,7 +487,9 @@ Slack and move to Phase 3E.
   (the bound framework derives the request's environment from validated
   evidence, and the broker refuses one that is not its own
   `BREAK_GLASS_ENVIRONMENT`) before production readiness. Production stays
-  untouched until that is complete.
+  untouched until that is complete. **Status:** implemented on the Phase 3E
+  branch, not yet live-validated
+  ([break-glass-validation.md § Environment binding](break-glass-validation.md#environment-binding-broker-side)).
 - **Customized OIDC subjects** (future work). Supporting one needs the
   subject GitHub emits to be proven from a recorded run of that repository,
   and trust and verify built from that proven subject. Until then such a

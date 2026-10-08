@@ -9,7 +9,7 @@
 // endpoint) through the real broker, store and handler.
 import assert from 'node:assert/strict';
 import { Buffer } from 'node:buffer';
-import { createHmac, sign } from 'node:crypto';
+import { sign } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { describe, it } from 'node:test';
 
@@ -25,17 +25,14 @@ import {
   pullRequestFromIdentity,
   verifyGithubOidcToken
 } from '../broker/identity/github-oidc.mjs';
-import { createBroker } from '../broker/lambda/broker.mjs';
-import { TOKEN_RECORD_GRACE_SECONDS, createDynamoStore } from '../broker/lambda/dynamodb-store.mjs';
-import { createCiHandler, createInteractionsHandler } from '../broker/lambda/handlers.mjs';
+import { TOKEN_RECORD_GRACE_SECONDS } from '../broker/lambda/dynamodb-store.mjs';
 import { notifyBreakGlass } from '../security/scripts/break-glass-notify.mjs';
 import { describePollOutcome, pollBreakGlass } from '../security/scripts/break-glass-poll.mjs';
 import { deriveBreakGlassResult } from '../security/scripts/break-glass-result.mjs';
 import { explainBreakGlass } from '../security/scripts/conformance.mjs';
 import { decideSourceGate } from '../security/scripts/final-gate.mjs';
-import { SLACK_A, SLACK_B, approversById } from './support/fake-approvers.mjs';
-import { createFakeDynamo } from './support/fake-dynamodb.mjs';
-import { fakeFrameworkPolicy } from './support/fake-framework-policy.mjs';
+import { KEY, NOW, NOW_MS, RESPONSE_URL, SIGNING_SECRET, brokerEnv, fileRequest, payloadFor, signedClick, verifier } from './support/broker-env.mjs';
+import { SLACK_A, SLACK_B } from './support/fake-approvers.mjs';
 import {
   FRAMEWORK_SHA,
   REPO_A,
@@ -50,12 +47,9 @@ import {
   unsignedToken
 } from './support/jwt-fixtures.mjs';
 
-const KEY = createSigningKey({ kid: 'github-key-1' });
 const ROTATED = createSigningKey({ kid: 'github-key-2' });
 const ATTACKER = createSigningKey({ kid: 'github-key-1' }); // same kid, different key
 const SMALL = createSigningKey({ kid: 'small-key', bits: 1024 });
-const NOW_MS = Date.UTC(2026, 9, 3, 12, 0, 0);
-const NOW = Math.floor(NOW_MS / 1000);
 
 const rejects = async (promise, code) => {
   await assert.rejects(promise, (error) => {
@@ -64,12 +58,6 @@ const rejects = async (promise, code) => {
     return true;
   });
 };
-
-function verifier({ keys = [KEY], fail = false, clock = () => NOW_MS } = {}) {
-  const jwksFetch = fakeJwksFetch(keys, { fail });
-  const jwks = createJwksCache({ fetchImpl: jwksFetch.fetchImpl, now: clock });
-  return { jwksFetch, jwks, verify: (token, options = {}) => verifyGithubOidcToken(token, { jwks, now: clock, ...options }) };
-}
 
 const claims = (overrides = {}) => githubClaims({ nowSeconds: NOW, ...overrides });
 const token = (overrides = {}, key = KEY) => signToken(claims(overrides), { key });
@@ -404,117 +392,6 @@ describe('pull-request binding: the PR number comes from the verified ref', () =
 
 // =================================================================================
 // Broker integration: the real verifier, store, handler and decision path.
-
-const SIGNING_SECRET = 'identity-test-signing-secret';
-const RESPONSE_URL = 'https://hooks.slack.com/actions/T0/1/abc';
-const APPROVERS = { [REPO_A.repositoryId]: [SLACK_A], [REPO_B.repositoryId]: [SLACK_B] };
-
-const payloadFor = (repo = REPO_A, { pullRequest = '51', sha = SHA_A, ...context } = {}) => ({
-  schemaVersion: 1,
-  gateDigest: 'a'.repeat(64),
-  timeoutSeconds: 900,
-  context: { repository: repo.repository, commitSha: sha, pullRequest, ...context },
-  findings: [{ source: 'semgrep', id: 'demo.rule', action: 'BLOCK', policyRule: 'sast.high_new', reason: 'new high' }]
-});
-
-function brokerEnv(options = {}) {
-  const { approvers = approversById(APPROVERS), events = null } = options;
-  const framework = options.framework ?? fakeFrameworkPolicy({ events });
-  let clock = NOW_MS;
-  const now = () => new Date(clock);
-  const dynamo = createFakeDynamo();
-  // Failure injection for the ordering tests: `failNext.put` fails the next
-  // request PutItem, `failNext.delete` the next DeleteItem, `failNext.slack`
-  // the next chat.postMessage (after Slack may or may not have posted it).
-  const failNext = { put: 0, delete: 0, slack: 0 };
-  const call = dynamo.client.call;
-  dynamo.client.call = async (operation, input) => {
-    const key = (input.Key ?? input.Item)?.requestId?.S ?? '';
-    // Ordering log (optional): every store call, with replay records marked.
-    events?.push(`${operation}${key.startsWith('oidc-jti:') ? ':jti' : ''}`);
-    if (operation === 'PutItem' && !key.startsWith('oidc-jti:') && failNext.put > 0) {
-      failNext.put -= 1;
-      throw new Error('ProvisionedThroughputExceededException');
-    }
-    if (operation === 'DeleteItem' && failNext.delete > 0) {
-      failNext.delete -= 1;
-      throw new Error('InternalServerError');
-    }
-    return call(operation, input);
-  };
-  const slack = { posted: [], updated: [], responded: [] };
-  const github = [];
-  const logs = [];
-  const v = verifier({ clock: () => clock });
-  const store = createDynamoStore({ client: dynamo.client, tableName: 't' });
-  const broker = createBroker({
-    store,
-    slack: {
-      postMessage: async (m) => {
-        events?.push('slack');
-        if (failNext.slack > 0) {
-          failNext.slack -= 1;
-          throw new Error('Slack chat.postMessage failed: not_in_channel');
-        }
-        slack.posted.push(m);
-        return { ok: true, channel: 'C', ts: '1.2' };
-      },
-      update: async (m) => slack.updated.push(m),
-      respond: async (url, m) => slack.responded.push({ url, m })
-    },
-    github: { postComment: async (repo, pr, body) => github.push({ repo, pr, body }) },
-    signingSecret: SIGNING_SECRET,
-    approverSource: approvers.source,
-    verifyIdentity: 'verifyIdentity' in options ? options.verifyIdentity : async (identityToken) => {
-      events?.push('verify');
-      return v.verify(identityToken);
-    },
-    frameworkPolicy: 'frameworkPolicy' in options ? options.frameworkPolicy : framework.policy,
-    slackChannelId: 'C',
-    now,
-    log: (entry) => logs.push(entry)
-  });
-  const ci = createCiHandler({ getBroker: async () => broker });
-  const enqueued = [];
-  const interactions = createInteractionsHandler({ getBroker: async () => broker, enqueue: async (job) => enqueued.push(job) });
-  const tokenFor = (overrides = {}) => signToken(githubClaims({ nowSeconds: Math.floor(clock / 1000), ...overrides }), { key: KEY });
-  return {
-    dynamo, store, slack, github, logs, ci, interactions, enqueued, broker, failNext, framework,
-    advance: (ms) => (clock += ms),
-    tokenFor,
-    notify: (payload, identityToken) => ci({ action: 'notify', payload, identityToken }),
-    status: (requestId, identityToken) => ci({ action: 'status', requestId, identityToken }),
-    requests: () => [...dynamo.table.values()].filter((item) => item.doc),
-    tokenRecords: () => [...dynamo.table.values()].filter((item) => item.kind?.S === 'oidc-jti')
-  };
-}
-
-async function fileRequest(env, { repo = REPO_A, runId = '700001', runAttempt = '1', pullRequest = '51', sha = SHA_A } = {}) {
-  const result = await env.notify(
-    payloadFor(repo, { pullRequest, sha }),
-    env.tokenFor({ repo, runId, runAttempt, pullRequest, sha })
-  );
-  assert.equal(result.statusCode, 201, JSON.stringify(result));
-  return result.body.requestId;
-}
-
-function signedClick(requestId, userId, action = 'approve') {
-  const interaction = {
-    type: 'block_actions',
-    user: { id: userId, username: `user-${userId}` },
-    actions: [{ action_id: `breakglass:${requestId}:${action}` }],
-    response_url: RESPONSE_URL
-  };
-  const ts = String(NOW);
-  const rawBody = `payload=${encodeURIComponent(JSON.stringify(interaction))}`;
-  const signature = `v0=${createHmac('sha256', SIGNING_SECRET).update(`v0:${ts}:${rawBody}`).digest('hex')}`;
-  return {
-    requestContext: { http: { method: 'POST' } },
-    headers: { 'X-Slack-Signature': signature, 'X-Slack-Request-Timestamp': ts },
-    body: rawBody,
-    isBase64Encoded: false
-  };
-}
 
 describe('notify: identity is derived from the verified token', () => {
   it('stores the verified identity separately from display context, all derived from the token', async () => {
@@ -868,7 +745,11 @@ describe('approval and audit: keyed by the verified repository_id', () => {
       doc: { S: JSON.stringify(legacy) }
     });
     assert.equal((await env.status(requestId, env.tokenFor())).statusCode, 403);
-    assert.equal((await env.interactions(signedClick(requestId, SLACK_A))).headers['x-break-glass-outcome'], 'unauthorized');
+    // It records no environment either (Phase 3E), so it belongs to no broker:
+    // a click is rejected before any approver or policy lookup.
+    assert.equal((await env.interactions(signedClick(requestId, SLACK_A))).headers['x-break-glass-outcome'], 'rejected');
+    assert.equal(env.approvers.requested.length, 0, 'no approver lookup');
+    assert.equal(JSON.parse(env.dynamo.table.get(requestId).doc.S).status, 'pending');
     // Even if such a request were somehow decided, the audit comment refuses it.
     env.dynamo.table.set(requestId, {
       ...env.dynamo.table.get(requestId),

@@ -179,6 +179,7 @@ function brokerEnv(approvers = approversById({ [REPO_A.repositoryId]: [SLACK_A],
     approverSource: approvers.source,
     verifyIdentity: (token) => verifyGithubOidcToken(token, { jwks, now: () => clock }),
     frameworkPolicy: fakeFrameworkPolicy().policy,
+    environment: 'production',
     slackChannelId: 'C',
     now: () => new Date(clock),
     log: (entry) => logs.push(entry)
@@ -190,6 +191,7 @@ function brokerEnv(approvers = approversById({ [REPO_A.repositoryId]: [SLACK_A],
     const identityToken = signToken(githubClaims({ repo, sha, nowSeconds: Math.floor(clock / 1000) }), { key: KEY });
     const payload = {
       schemaVersion: 1,
+      environment: 'production',
       gateDigest: 'a'.repeat(64),
       timeoutSeconds: 900,
       context: { repository: repo.repository, commitSha: sha, pullRequest: '51' },

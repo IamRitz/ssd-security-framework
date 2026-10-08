@@ -21,6 +21,13 @@
 // BEFORE the token is spent, on notify and every status call, so a refused
 // commit writes nothing; and again at click time against the stored request's
 // commit, before any claim, so removing a commit revokes its pending requests.
+//
+// ENVIRONMENT (Phase 3E). The framework derives a request's environment
+// (production | synthetic) from its validated gate evidence and sends it as the
+// notify payload's `environment`. The broker refuses one that is not its own
+// BREAK_GLASS_ENVIRONMENT before the token is verified or spent, so a misrouted
+// request writes nothing. The stored request records the environment, and a
+// status call or click acts only on a request of this broker's environment.
 import { createHash } from 'node:crypto';
 
 import {
@@ -28,6 +35,7 @@ import {
   parseSlackInteraction,
   extractSlackDecision
 } from '../authorize/slack-interaction-verify.mjs';
+import { BREAK_GLASS_ENVIRONMENTS } from '../authorize/approvers.mjs';
 import { authorizeSlackInteraction } from '../authorize/slack-authorize.mjs';
 import {
   claimDecision,
@@ -57,6 +65,9 @@ export function createBroker({
   verifyIdentity,
   // { check(sha) } -> a framework-policy.mjs result. Absent = nothing allowed.
   frameworkPolicy,
+  // This broker's BREAK_GLASS_ENVIRONMENT. Anything but production or
+  // synthetic refuses every request.
+  environment,
   slackChannelId,
   now = () => new Date(),
   randomUUID = () => globalThis.crypto.randomUUID(),
@@ -103,6 +114,28 @@ export function createBroker({
       ? { ok: false, statusCode: 403, error: 'framework_rejected: framework_sha_not_allowed' }
       : { ok: false, statusCode: 503, error: `framework_policy_unavailable: ${framework.state}` };
 
+  // The request's framework-derived environment must be this broker's own.
+  // -> null (accepted) or the refusal. Runs before anything is verified or written.
+  function environmentRejection(requested) {
+    if (!BREAK_GLASS_ENVIRONMENTS.includes(environment)) {
+      log({ event: 'environment_rejected', reason: 'broker_misconfigured', requested: claimed(requested) });
+      return { ok: false, statusCode: 500, error: 'environment_misconfigured' };
+    }
+    if (!BREAK_GLASS_ENVIRONMENTS.includes(requested)) {
+      log({ event: 'environment_rejected', reason: 'invalid', requested: claimed(requested), environment });
+      return { ok: false, statusCode: 400, error: 'invalid request environment' };
+    }
+    if (requested !== environment) {
+      log({ event: 'environment_rejected', reason: 'mismatch', requested, environment });
+      return { ok: false, statusCode: 403, error: 'environment_mismatch' };
+    }
+    return null;
+  }
+
+  // A stored request belongs to this broker only when it records this
+  // environment. A request without one (filed before Phase 3E) belongs nowhere.
+  const ownEnvironment = (request) => BREAK_GLASS_ENVIRONMENTS.includes(environment) && request?.environment === environment;
+
   const who = (identity) => ({
     repositoryId: identity.repositoryId,
     repository: identity.repository,
@@ -112,7 +145,8 @@ export function createBroker({
 
   // --- CI notify ------------------------------------------------------------
   // Write order (asserted in test/broker-oidc-identity.test.js, "notify ordering"):
-  //   1. payload shape, token verification              no writes
+  //   1. payload shape, request environment, token verification,
+  //      framework commit                               no writes
   //   2. replay claim on the token's jti                first write
   //   3. payload must agree with the token              no writes
   //   4. putPending (fresh UUID, conditional)
@@ -128,6 +162,9 @@ export function createBroker({
       return { ok: false, statusCode: 400, error: error.message };
     }
     if (!slackChannelId) return { ok: false, statusCode: 500, error: 'SLACK_CHANNEL_ID is not configured' };
+    // Before the token is verified or spent: a misrouted request writes nothing.
+    const misrouted = environmentRejection(payload.environment);
+    if (misrouted) return misrouted;
 
     const auth = await authenticate('notify', identityToken, payload.context.repository);
     if (auth.rejected) return auth.rejected;
@@ -147,7 +184,7 @@ export function createBroker({
       return { ok: false, statusCode: 403, error: error.message };
     }
 
-    const request = createPendingRequest(payload, { now: now(), randomUUID, bound });
+    const request = createPendingRequest(payload, { now: now(), randomUUID, bound, environment });
     // Store before posting so a fast click finds the request; roll back and fail
     // closed if Slack refuses the message.
     await store.putPending(request);
@@ -189,6 +226,10 @@ export function createBroker({
     const id = String(requestId || '');
     const request = REQUEST_ID.test(id) ? await store.get(id) : undefined;
     if (!request) return { ok: false, statusCode: 404, error: 'unknown_request' };
+    if (!ownEnvironment(request)) {
+      log({ event: 'status_environment_mismatch', requestId: id, stored: request.environment ?? null, environment, ...who(auth.identity) });
+      return { ok: false, statusCode: 403, error: 'request_environment_mismatch' };
+    }
     const owner = request.identity;
     if (
       !owner ||
@@ -248,6 +289,12 @@ export function createBroker({
     // The stored request's framework commit is re-checked at the same time (in
     // parallel, inside Slack's 3 s ack budget).
     const stored = await store.get(decision.requestId);
+    // Only a request of this broker's environment can be decided here; any
+    // other is answered like an unknown one, with no lookup and no state change.
+    if (stored && !ownEnvironment(stored)) {
+      log({ event: 'click_environment_mismatch', requestId: decision.requestId, stored: stored.environment ?? null, environment });
+      return reply('rejected', 'Unknown or invalid approval request.', { requestId: decision.requestId });
+    }
     const repositoryId = stored?.identity?.repositoryId;
     const [approvers, framework] = await Promise.all([
       repositoryId

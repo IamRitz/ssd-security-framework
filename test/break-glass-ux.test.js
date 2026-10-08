@@ -601,6 +601,7 @@ describe('machine semantics are unchanged', () => {
 describe('request step: a failed request is an ERROR, never a decision', () => {
   const ELIGIBLE_GATE = {
     verdict: 'BLOCK',
+    synthetic: { active: false, fixture: null },
     breakGlass: {
       eligible: true,
       eligibleFindings: [{ id: 'demo.rule', action: 'BLOCK', policyRule: 'sast.high_new', reason: 'new high' }],

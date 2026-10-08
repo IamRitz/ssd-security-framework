@@ -238,6 +238,7 @@ const INTERACTIONS_ENV = {
 
 const payload = () => ({
   schemaVersion: 1,
+  environment: CI_ENV.BREAK_GLASS_ENVIRONMENT,
   gateDigest: 'a'.repeat(64),
   timeoutSeconds: 900,
   context: { repository: REPO_A.repository, commitSha: SHA_A, pullRequest: '51' },
@@ -315,7 +316,9 @@ describe('CI broker secrets: read only after identity and framework acceptance, 
     const aws = fakeAws({ parameters: { [POLICY_NAME]: renderFrameworkPolicy('synthetic', [FRAMEWORK_SHA]) } });
     const { notify, token } = await ciBroker(aws, { ...CI_ENV, BREAK_GLASS_ENVIRONMENT: undefined });
     const refused = await notify(token());
-    assert.equal(refused.error, 'framework_policy_unavailable: misconfigured');
+    // Without an environment the broker refuses every request first (Phase 3E
+    // environment binding), before the token or any policy is read.
+    assert.deepEqual([refused.statusCode, refused.error], [500, 'environment_misconfigured']);
     assert.ok(!aws.events.some((event) => event.startsWith('ssm:')), 'no SSM call without an environment');
   });
 });

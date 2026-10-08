@@ -1333,7 +1333,7 @@ What exists, and where it refines D.8:
 | 3B | broker reads approvers from per-repository SSM parameters (E.3) | merged (PR #17) |
 | 3C | shared production and synthetic broker stacks (E.4), plus synthetic infrastructure live validation | merged (PR #18); live-validated on the synthetic stack only; production stack not deployed |
 | 3D | the governance stack per environment (allowed framework commits) and the per-repository invoker role and approver parameter; the workflow's self-binding and the broker's framework-commit check; the live role checks that apply (E.7) | implemented ([break-glass-repositories.md](break-glass-repositories.md)); live synthetic validation pending |
-| 3E | end-to-end validation of the synthetic workflow contract: the positive path, negative, race and timeout cases, and everything needing a live Slack interaction (E.7) | not implemented |
+| 3E | end-to-end validation of the synthetic workflow contract: the positive path, negative, race and timeout cases, and everything needing a live Slack interaction (E.7); broker-side environment binding | specified ([break-glass-validation.md](break-glass-validation.md)); in implementation |
 | pre-production | production deployed and verified on the final reviewed artifact; production secrets; production Slack Request URL; repository approver parameters | after 3D and 3E |
 
 Gates per phase: [break-glass-provisioning.md § Phase sequence and gates](break-glass-provisioning.md#phase-sequence-and-gates).
