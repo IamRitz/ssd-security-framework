@@ -121,6 +121,104 @@ describe('negative policies FAIL the offline analysis', () => {
   });
 });
 
+// =================================================================================
+// Phase 3D: both functions read EXACTLY their own environment's framework policy
+// parameter, and nothing else changes.
+describe('Phase 3D: the framework policy read grant', () => {
+  const ENVS = ['production', 'synthetic'];
+  const otherOf = (env) => (env === 'production' ? 'synthetic' : 'production');
+  const ssmStatements = (doc) => statementsOf(doc).filter((st) => [].concat(st.Action).some((a) => a.startsWith('ssm:')));
+  const statementsOf = (doc) => (Array.isArray(doc.Statement) ? doc.Statement : [doc.Statement]);
+
+  for (const env of ENVS) {
+    it(`${env}: CI has exactly one ssm statement, GetParameter on its own governance parameter`, () => {
+      const a = breakGlassArns(env, TARGET);
+      assert.equal(a.frameworkPolicyParameter, `arn:aws:ssm:${TARGET.region}:${TARGET.account}:parameter/ssd/break-glass/${env}/governance/allowed-framework-shas`);
+      assert.deepEqual(ssmStatements(executionRolePolicy('ci', env, TARGET)), [
+        { Sid: 'ReadFrameworkPolicy', Effect: 'Allow', Action: 'ssm:GetParameter', Resource: a.frameworkPolicyParameter }
+      ]);
+    });
+
+    it(`${env}: interactions keeps its approver read and adds exactly the governance read`, () => {
+      const a = breakGlassArns(env, TARGET);
+      assert.deepEqual(ssmStatements(executionRolePolicy('interactions', env, TARGET)), [
+        { Sid: 'ReadApprovers', Effect: 'Allow', Action: 'ssm:GetParameter', Resource: a.approverParameters },
+        { Sid: 'ReadFrameworkPolicy', Effect: 'Allow', Action: 'ssm:GetParameter', Resource: a.frameworkPolicyParameter }
+      ]);
+    });
+
+    it(`${env}: effective access — own governance read only, never written, never the other environment`, () => {
+      const a = breakGlassArns(env, TARGET);
+      const o = breakGlassArns(otherOf(env), TARGET);
+      for (const role of ['ci', 'interactions']) {
+        const doc = executionRolePolicy(role, env, TARGET);
+        assert.equal(decision(doc, 'ssm:GetParameter', a.frameworkPolicyParameter), 'allowed', role);
+        assert.equal(decision(doc, 'ssm:GetParameter', o.frameworkPolicyParameter), 'not-granted', `${role}: other environment`);
+        assert.equal(decision(doc, 'ssm:GetParameter', a.governanceSiblingSample), 'not-granted', `${role}: governance/* sibling`);
+        for (const action of ['ssm:PutParameter', 'ssm:DeleteParameter', 'ssm:GetParameters', 'ssm:GetParametersByPath', 'ssm:LabelParameterVersion']) {
+          assert.equal(decision(doc, action, a.frameworkPolicyParameter), 'not-granted', `${role}: ${action}`);
+          assert.equal(decision(doc, action, o.frameworkPolicyParameter), 'not-granted', `${role}: ${action} on the other environment`);
+        }
+        assert.equal(decision(doc, 'ssm:PutParameter', a.approverParameterSample), 'not-granted', `${role}: approvers are never written`);
+        // No identifier of the other environment appears anywhere in the document.
+        assert.doesNotMatch(JSON.stringify(doc), new RegExp(`break-glass[/-]${otherOf(env)}`), `${role}: cross-environment ARN`);
+      }
+      assert.equal(decision(executionRolePolicy('ci', env, TARGET), 'ssm:GetParameter', a.approverParameterSample), 'not-granted', 'the CI broker never reads approvers');
+      assert.equal(decision(executionRolePolicy('interactions', env, TARGET), 'ssm:GetParameter', a.approverParameterSample), 'allowed', 'the interaction function still reads approvers');
+    });
+
+    it(`${env}: the verify probes require the read and deny every broadening`, () => {
+      const a = breakGlassArns(env, TARGET);
+      const o = breakGlassArns(otherOf(env), TARGET);
+      for (const role of ['ci', 'interactions']) {
+        const { required, denied } = executionProbes(role, env, TARGET);
+        const has = (list, action, resource) => list.some((p) => p.action === action && p.resource === resource);
+        assert.ok(has(required, 'ssm:GetParameter', a.frameworkPolicyParameter), `${role}: own read required`);
+        assert.ok(has(denied, 'ssm:GetParameter', o.frameworkPolicyParameter), `${role}: other environment read denied`);
+        for (const action of ['ssm:PutParameter', 'ssm:DeleteParameter']) {
+          assert.ok(has(denied, action, a.frameworkPolicyParameter), `${role}: own ${action} denied`);
+          assert.ok(has(denied, action, o.frameworkPolicyParameter), `${role}: other ${action} denied`);
+        }
+        assert.ok(has(denied, 'ssm:GetParameter', a.governanceSiblingSample), `${role}: governance/* denied`);
+        assert.ok(has(denied, 'ssm:PutParameter', a.approverParameterSample), `${role}: approver write denied`);
+        assert.ok(denied.every((p) => p.severity === 'FAIL'));
+      }
+      assert.ok(executionProbes('ci', env, TARGET).denied.some((p) => p.action === 'ssm:GetParameter' && p.resource === a.approverParameterSample), 'CI approver read denied');
+      assert.ok(executionProbes('interactions', env, TARGET).required.some((p) => p.action === 'ssm:GetParameter' && p.resource === a.approverParameterSample), 'interaction approver read still required');
+    });
+  }
+
+  describe('every broadening or removal FAILs the offline analysis', () => {
+    const prod = breakGlassArns('production', TARGET);
+    const synth = breakGlassArns('synthetic', TARGET);
+    const governance = (doc) => doc.Statement.find((st) => st.Sid === 'ReadFrameworkPolicy');
+    const approvers = (doc) => doc.Statement.find((st) => st.Sid === 'ReadApprovers');
+    const cases = [
+      ['CI governance read removed', 'ci', (d) => { d.Statement = d.Statement.filter((st) => st.Sid !== 'ReadFrameworkPolicy'); }],
+      ['interaction governance read removed', 'interactions', (d) => { d.Statement = d.Statement.filter((st) => st.Sid !== 'ReadFrameworkPolicy'); }],
+      ['CI governance resource governance/*', 'ci', (d) => { governance(d).Resource = `arn:aws:ssm:${TARGET.region}:${TARGET.account}:parameter/ssd/break-glass/production/governance/*`; }],
+      ['interaction governance resource governance/*', 'interactions', (d) => { governance(d).Resource = `arn:aws:ssm:${TARGET.region}:${TARGET.account}:parameter/ssd/break-glass/production/governance/*`; }],
+      ['CI governance resource *', 'ci', (d) => { governance(d).Resource = '*'; }],
+      ['CI admits the other environment too', 'ci', (d) => { governance(d).Resource = [prod.frameworkPolicyParameter, synth.frameworkPolicyParameter]; }],
+      ['interaction reads the other environment instead', 'interactions', (d) => { governance(d).Resource = synth.frameworkPolicyParameter; }],
+      ['CI governance action ssm:*', 'ci', (d) => { governance(d).Action = 'ssm:*'; }],
+      ['interaction governance action ssm:Get*', 'interactions', (d) => { governance(d).Action = 'ssm:Get*'; }],
+      ['CI granted PutParameter on governance', 'ci', (d) => { governance(d).Action = ['ssm:GetParameter', 'ssm:PutParameter']; }],
+      ['interaction granted PutParameter on governance', 'interactions', (d) => { governance(d).Action = ['ssm:GetParameter', 'ssm:PutParameter']; }],
+      ['CI given approver read by mistake', 'ci', (d) => { d.Statement.push({ Sid: 'ReadApprovers', Effect: 'Allow', Action: 'ssm:GetParameter', Resource: prod.approverParameters }); }],
+      ['interaction loses approver read', 'interactions', (d) => { d.Statement = d.Statement.filter((st) => st.Sid !== 'ReadApprovers'); }],
+      ['interaction approver read moved onto the governance ARN', 'interactions', (d) => { approvers(d).Resource = prod.frameworkPolicyParameter; }]
+    ];
+    for (const [name, role, mutate] of cases) {
+      it(name, () => {
+        const doc = clone(executionRolePolicy(role, 'production', TARGET));
+        mutate(doc);
+        assert.equal(analyze(role, 'production', doc).status, 'FAIL', name);
+      });
+    }
+  });
+});
+
 describe('trust: lambda.amazonaws.com only', () => {
   it('accepts the generated trust policy', () => {
     assert.deepEqual(trustProblems(executionTrustPolicy()), []);

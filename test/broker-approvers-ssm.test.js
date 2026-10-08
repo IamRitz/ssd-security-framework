@@ -24,6 +24,7 @@ import { createDynamoStore } from '../broker/lambda/dynamodb-store.mjs';
 import { createCiHandler, createInteractionsHandler } from '../broker/lambda/handlers.mjs';
 import { SLACK_A, SLACK_B, approverParameter, approversById, fakeApproverSource, ssmError } from './support/fake-approvers.mjs';
 import { createFakeDynamo } from './support/fake-dynamodb.mjs';
+import { fakeFrameworkPolicy } from './support/fake-framework-policy.mjs';
 import { REPO_A, REPO_B, SHA_A, SHA_B, createSigningKey, fakeJwksFetch, githubClaims, signToken } from './support/jwt-fixtures.mjs';
 
 const PARAM_A = '/ssd/break-glass/production/approvers/1001';
@@ -177,6 +178,7 @@ function brokerEnv(approvers = approversById({ [REPO_A.repositoryId]: [SLACK_A],
     signingSecret: SIGNING_SECRET,
     approverSource: approvers.source,
     verifyIdentity: (token) => verifyGithubOidcToken(token, { jwks, now: () => clock }),
+    frameworkPolicy: fakeFrameworkPolicy().policy,
     slackChannelId: 'C',
     now: () => new Date(clock),
     log: (entry) => logs.push(entry)

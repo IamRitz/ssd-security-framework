@@ -29,8 +29,13 @@ import { createBroker } from '../broker/lambda/broker.mjs';
 import { TOKEN_RECORD_GRACE_SECONDS, createDynamoStore } from '../broker/lambda/dynamodb-store.mjs';
 import { createCiHandler, createInteractionsHandler } from '../broker/lambda/handlers.mjs';
 import { notifyBreakGlass } from '../security/scripts/break-glass-notify.mjs';
+import { describePollOutcome, pollBreakGlass } from '../security/scripts/break-glass-poll.mjs';
+import { deriveBreakGlassResult } from '../security/scripts/break-glass-result.mjs';
+import { explainBreakGlass } from '../security/scripts/conformance.mjs';
+import { decideSourceGate } from '../security/scripts/final-gate.mjs';
 import { SLACK_A, SLACK_B, approversById } from './support/fake-approvers.mjs';
 import { createFakeDynamo } from './support/fake-dynamodb.mjs';
+import { fakeFrameworkPolicy } from './support/fake-framework-policy.mjs';
 import {
   FRAMEWORK_SHA,
   REPO_A,
@@ -83,21 +88,17 @@ describe('verifyGithubOidcToken: what a valid token proves', () => {
       runId: '700001',
       runAttempt: '1',
       eventName: 'pull_request',
-      jobWorkflow: { repository: FRAMEWORK_REPOSITORY, path: '.github/workflows/_break-glass-lambda.yml', sha: FRAMEWORK_SHA },
+      jobWorkflow: { repository: FRAMEWORK_REPOSITORY, path: '.github/workflows/_break-glass-lambda.yml', ref: FRAMEWORK_SHA, sha: FRAMEWORK_SHA },
       jti: 'jti-1',
       exp: NOW + 300,
       iat: NOW
     });
   });
 
-  it('accepts the legacy in-job workflow too, and nothing else', async () => {
+  it('accepts only _break-glass-lambda.yml: the legacy in-job _source-security.yml is refused (Phase 3D)', async () => {
     const { verify } = verifier();
-    assert.deepEqual(ALLOWED_JOB_WORKFLOW_PATHS, [
-      '.github/workflows/_break-glass-lambda.yml',
-      '.github/workflows/_source-security.yml'
-    ]);
-    const identity = await verify(token({ jobWorkflowPath: '.github/workflows/_source-security.yml' }));
-    assert.equal(identity.jobWorkflow.path, '.github/workflows/_source-security.yml');
+    assert.deepEqual(ALLOWED_JOB_WORKFLOW_PATHS, ['.github/workflows/_break-glass-lambda.yml']);
+    await rejects(verify(token({ jobWorkflowPath: '.github/workflows/_source-security.yml' })), 'job_workflow_path_not_allowed');
   });
 });
 
@@ -239,26 +240,48 @@ describe('verifyGithubOidcToken: job_workflow_ref is parsed, not prefix-matched'
     ['another framework workflow', { jobWorkflowPath: '.github/workflows/_source-scan.yml' }, 'job_workflow_path_not_allowed'],
     ['an allowlisted name in another directory', { jobWorkflowPath: 'evil/.github/workflows/_break-glass-lambda.yml' }, 'job_workflow_path_not_allowed'],
     ['a path suffix trick', { jobWorkflowPath: '.github/workflows/_break-glass-lambda.yml.evil' }, 'job_workflow_path_not_allowed'],
-    ['a moving tag ref', { jobWorkflowSha: 'refs/tags/v1' }, 'job_workflow_ref_not_sha'],
-    ['a branch ref', { jobWorkflowSha: 'refs/heads/main' }, 'job_workflow_ref_not_sha'],
-    ['a short SHA', { jobWorkflowSha: 'f'.repeat(7) }, 'job_workflow_ref_not_sha'],
-    ['an uppercase SHA', { jobWorkflowSha: 'F'.repeat(40) }, 'job_workflow_ref_not_sha']
+    ['the legacy in-job workflow', { jobWorkflowPath: '.github/workflows/_source-security.yml' }, 'job_workflow_path_not_allowed'],
+    ['the path in another case', { jobWorkflowPath: '.github/workflows/_Break-glass-lambda.yml' }, 'job_workflow_path_not_allowed'],
+    ['an empty ref', { jobWorkflowRefName: '' }, 'job_workflow_ref_malformed'],
+    ['a ref with whitespace', { jobWorkflowRefName: 'refs/heads/a b' }, 'job_workflow_ref_malformed'],
+    ['a ref with a control character', { jobWorkflowRefName: 'refs/heads/a\nb' }, 'job_workflow_ref_malformed'],
+    ['an over-long ref', { jobWorkflowRefName: `refs/heads/${'x'.repeat(250)}` }, 'job_workflow_ref_malformed'],
+    ['a short job_workflow_sha', { jobWorkflowSha: 'f'.repeat(7), jobWorkflowRefName: FRAMEWORK_SHA }, 'claim_job_workflow_sha_invalid'],
+    ['an uppercase job_workflow_sha', { jobWorkflowSha: 'F'.repeat(40), jobWorkflowRefName: FRAMEWORK_SHA }, 'claim_job_workflow_sha_invalid'],
+    ['a job_workflow_sha that is a ref', { jobWorkflowSha: 'refs/tags/v1', jobWorkflowRefName: 'refs/tags/v1' }, 'claim_job_workflow_sha_invalid'],
+    ['a missing job_workflow_sha', { job_workflow_sha: undefined }, 'claim_job_workflow_sha_invalid']
   ]) {
     it(`rejects ${name}`, async () => {
       await rejects(verifier().verify(token(overrides)), code);
     });
   }
 
-  it('rejects job_workflow_sha that disagrees with the ref', async () => {
-    await rejects(verifier().verify(token({ job_workflow_sha: 'e'.repeat(40) })), 'job_workflow_sha_mismatch');
+  // Phase 3D: the commit is job_workflow_sha; the ref part is how the caller
+  // spelled it, recorded and never authorized.
+  for (const [name, refName] of [
+    ['a tag ref', 'refs/tags/v1'],
+    ['a branch ref', 'refs/heads/main'],
+    ['a ref that is a different SHA', 'e'.repeat(40)]
+  ]) {
+    it(`accepts ${name}: the authorized commit is still job_workflow_sha`, async () => {
+      const identity = await verifier().verify(token({ jobWorkflowRefName: refName }));
+      assert.equal(identity.jobWorkflow.sha, FRAMEWORK_SHA);
+      assert.equal(identity.jobWorkflow.ref, refName);
+    });
+  }
+
+  it('compares the framework repository case-insensitively', async () => {
+    const identity = await verifier().verify(token({ jobWorkflowRepository: 'iamritz/SSD-Security-Framework' }));
+    assert.equal(identity.jobWorkflow.sha, FRAMEWORK_SHA);
   });
 
-  it('parses into exactly repository, path and SHA', () => {
+  it('parses into exactly repository, path and ref', () => {
     assert.deepEqual(
       parseJobWorkflowRef(`IamRitz/ssd-security-framework/.github/workflows/_break-glass-lambda.yml@${FRAMEWORK_SHA}`),
-      { repository: 'IamRitz/ssd-security-framework', path: '.github/workflows/_break-glass-lambda.yml', sha: FRAMEWORK_SHA }
+      { repository: 'IamRitz/ssd-security-framework', path: '.github/workflows/_break-glass-lambda.yml', ref: FRAMEWORK_SHA }
     );
-    assert.throws(() => parseJobWorkflowRef(`IamRitz/ssd-security-framework/.github/workflows/_break-glass-lambda.yml@a@${FRAMEWORK_SHA}`), IdentityRejected);
+    assert.equal(parseJobWorkflowRef('IamRitz/ssd-security-framework/.github/workflows/_break-glass-lambda.yml@refs/tags/v1').ref, 'refs/tags/v1');
+    assert.throws(() => parseJobWorkflowRef('IamRitz/ssd-security-framework/.github/workflows/_break-glass-lambda.yml'), IdentityRejected);
     assert.throws(() => parseJobWorkflowRef('IamRitz/ssd-security-framework'), IdentityRejected);
   });
 });
@@ -395,7 +418,8 @@ const payloadFor = (repo = REPO_A, { pullRequest = '51', sha = SHA_A, ...context
 });
 
 function brokerEnv(options = {}) {
-  const { approvers = approversById(APPROVERS) } = options;
+  const { approvers = approversById(APPROVERS), events = null } = options;
+  const framework = options.framework ?? fakeFrameworkPolicy({ events });
   let clock = NOW_MS;
   const now = () => new Date(clock);
   const dynamo = createFakeDynamo();
@@ -406,6 +430,8 @@ function brokerEnv(options = {}) {
   const call = dynamo.client.call;
   dynamo.client.call = async (operation, input) => {
     const key = (input.Key ?? input.Item)?.requestId?.S ?? '';
+    // Ordering log (optional): every store call, with replay records marked.
+    events?.push(`${operation}${key.startsWith('oidc-jti:') ? ':jti' : ''}`);
     if (operation === 'PutItem' && !key.startsWith('oidc-jti:') && failNext.put > 0) {
       failNext.put -= 1;
       throw new Error('ProvisionedThroughputExceededException');
@@ -425,6 +451,7 @@ function brokerEnv(options = {}) {
     store,
     slack: {
       postMessage: async (m) => {
+        events?.push('slack');
         if (failNext.slack > 0) {
           failNext.slack -= 1;
           throw new Error('Slack chat.postMessage failed: not_in_channel');
@@ -438,7 +465,11 @@ function brokerEnv(options = {}) {
     github: { postComment: async (repo, pr, body) => github.push({ repo, pr, body }) },
     signingSecret: SIGNING_SECRET,
     approverSource: approvers.source,
-    verifyIdentity: 'verifyIdentity' in options ? options.verifyIdentity : v.verify,
+    verifyIdentity: 'verifyIdentity' in options ? options.verifyIdentity : async (identityToken) => {
+      events?.push('verify');
+      return v.verify(identityToken);
+    },
+    frameworkPolicy: 'frameworkPolicy' in options ? options.frameworkPolicy : framework.policy,
     slackChannelId: 'C',
     now,
     log: (entry) => logs.push(entry)
@@ -448,7 +479,7 @@ function brokerEnv(options = {}) {
   const interactions = createInteractionsHandler({ getBroker: async () => broker, enqueue: async (job) => enqueued.push(job) });
   const tokenFor = (overrides = {}) => signToken(githubClaims({ nowSeconds: Math.floor(clock / 1000), ...overrides }), { key: KEY });
   return {
-    dynamo, store, slack, github, logs, ci, interactions, enqueued, broker, failNext,
+    dynamo, store, slack, github, logs, ci, interactions, enqueued, broker, failNext, framework,
     advance: (ms) => (clock += ms),
     tokenFor,
     notify: (payload, identityToken) => ci({ action: 'notify', payload, identityToken }),
@@ -503,6 +534,7 @@ describe('notify: identity is derived from the verified token', () => {
       runId: '700001',
       runAttempt: '1',
       jobWorkflowRef: `IamRitz/ssd-security-framework/.github/workflows/_break-glass-lambda.yml@${FRAMEWORK_SHA}`,
+      jobWorkflowSha: FRAMEWORK_SHA,
       jti: stored.identity.jti
     });
     assert.deepEqual(stored.context, {
@@ -848,6 +880,268 @@ describe('approval and audit: keyed by the verified repository_id', () => {
   });
 });
 
+describe('framework commit policy: checked after verification, before the token is spent (Phase 3D)', () => {
+  const OTHER_SHA = 'e'.repeat(40);
+
+  it('notify: verify -> policy -> replay claim -> request -> Slack, in that order', async () => {
+    const events = [];
+    const env = brokerEnv({ events });
+    await fileRequest(env);
+    assert.deepEqual(events, ['verify', 'policy', 'PutItem:jti', 'PutItem', 'slack', 'UpdateItem']);
+    assert.deepEqual(env.framework.requested, ['/ssd/break-glass/production/governance/allowed-framework-shas']);
+  });
+
+  it('notify: a commit not in the set is 403 and writes nothing, pages nobody, spends no token', async () => {
+    const events = [];
+    const env = brokerEnv({ events });
+    env.framework.allow([OTHER_SHA]);
+    const identityToken = env.tokenFor();
+    const refused = await env.notify(payloadFor(REPO_A), identityToken);
+    assert.deepEqual(refused, { ok: false, statusCode: 403, error: 'framework_rejected: framework_sha_not_allowed' });
+    assert.deepEqual(events, ['verify', 'policy']);
+    assert.equal(env.dynamo.table.size, 0, 'no request and no replay record');
+    assert.equal(env.slack.posted.length, 0);
+    const logged = env.logs.find((entry) => entry.event === 'framework_rejected');
+    assert.equal(logged.state, 'not_allowed');
+    assert.equal(logged.frameworkSha, FRAMEWORK_SHA);
+    assert.equal(logged.repositoryId, REPO_A.repositoryId);
+    // The token was not spent: once the commit is admitted, the SAME token works.
+    env.framework.allow([FRAMEWORK_SHA]);
+    assert.equal((await env.notify(payloadFor(REPO_A), identityToken)).statusCode, 201);
+  });
+
+  it('an empty set admits nothing', async () => {
+    const env = brokerEnv();
+    env.framework.allow([]);
+    assert.equal((await env.notify(payloadFor(REPO_A), env.tokenFor())).error, 'framework_rejected: framework_sha_not_allowed');
+  });
+
+  const unavailable = {
+    absent: (env) => env.framework.remove(),
+    malformed: (env) => env.framework.set('["not","canonical"]'),
+    'malformed (another environment\'s value)': (env) => env.framework.set(JSON.stringify({ schemaVersion: 1, environment: 'synthetic', shas: [FRAMEWORK_SHA] })),
+    'malformed (not a String parameter)': (env) => env.framework.set({ Type: 'SecureString', Value: JSON.stringify({ schemaVersion: 1, environment: 'production', shas: [FRAMEWORK_SHA] }) }),
+    unverified: (env) => env.framework.set(Object.assign(new Error('denied'), { name: 'AccessDeniedException' }))
+  };
+  for (const [name, arrange] of Object.entries(unavailable)) {
+    it(`notify: a policy that is ${name} is 503 and writes nothing`, async () => {
+      const env = brokerEnv();
+      arrange(env);
+      const refused = await env.notify(payloadFor(REPO_A), env.tokenFor());
+      assert.equal(refused.statusCode, 503);
+      assert.equal(refused.error, `framework_policy_unavailable: ${name.split(' ')[0]}`);
+      assert.equal(env.dynamo.table.size, 0);
+      assert.equal(env.slack.posted.length, 0);
+    });
+  }
+
+  for (const [name, frameworkPolicy, state] of [
+    ['no policy configured', undefined, 'misconfigured'],
+    ['a policy whose check throws', { check: async () => { throw new Error('boom'); } }, 'unverified'],
+    ['a policy answering an unknown state', { check: async () => ({ state: 'ALLOWED' }) }, 'misconfigured'],
+    ['a policy answering nothing', { check: async () => undefined }, 'misconfigured'],
+    ['a policy answering a truthy non-object', { check: async () => 'allowed' }, 'misconfigured']
+  ]) {
+    it(`notify: ${name} never becomes allowed (${state})`, async () => {
+      const env = brokerEnv({ frameworkPolicy });
+      const refused = await env.notify(payloadFor(REPO_A), env.tokenFor());
+      assert.equal(refused.error, `framework_policy_unavailable: ${state}`);
+      assert.equal(env.dynamo.table.size, 0);
+    });
+  }
+
+  it('status: checked on EVERY call; a removed commit is refused without spending the token', async () => {
+    const events = [];
+    const env = brokerEnv({ events });
+    const requestId = await fileRequest(env);
+    events.length = 0;
+    assert.equal((await env.status(requestId, env.tokenFor())).statusCode, 200);
+    assert.deepEqual(events.slice(0, 3), ['verify', 'policy', 'PutItem:jti']);
+    env.framework.allow([OTHER_SHA]);
+    const records = env.tokenRecords().length;
+    events.length = 0;
+    const statusToken = env.tokenFor();
+    assert.deepEqual(await env.status(requestId, statusToken), { ok: false, statusCode: 403, error: 'framework_rejected: framework_sha_not_allowed' });
+    assert.deepEqual(events, ['verify', 'policy']);
+    assert.equal(env.tokenRecords().length, records, 'the refused status token was not spent');
+    env.framework.remove();
+    assert.equal((await env.status(requestId, statusToken)).error, 'framework_policy_unavailable: absent');
+  });
+
+  it('a tag-spelled call is decided by the commit it resolved to', async () => {
+    const env = brokerEnv();
+    const viaTag = (sha) => env.tokenFor({ jobWorkflowRefName: 'refs/tags/v1', jobWorkflowSha: sha });
+    assert.equal((await env.notify(payloadFor(REPO_A), viaTag(FRAMEWORK_SHA))).statusCode, 201);
+    // @v1 moved to a commit nobody admitted:
+    assert.equal((await env.notify(payloadFor(REPO_A), viaTag(OTHER_SHA))).error, 'framework_rejected: framework_sha_not_allowed');
+    const stored = JSON.parse(env.requests()[0].doc.S);
+    assert.equal(stored.identity.jobWorkflowRef, 'IamRitz/ssd-security-framework/.github/workflows/_break-glass-lambda.yml@refs/tags/v1');
+    assert.equal(stored.identity.jobWorkflowSha, FRAMEWORK_SHA);
+  });
+});
+
+describe('framework commit policy at click time: removing a commit revokes its pending requests', () => {
+  const OTHER_SHA = 'e'.repeat(40);
+  const status = (env) => JSON.parse(env.requests()[0].doc.S).status;
+
+  it('an approver click on a revoked commit is refused before any claim; re-admitting restores it', async () => {
+    const events = [];
+    const env = brokerEnv({ events });
+    const requestId = await fileRequest(env);
+    env.framework.allow([OTHER_SHA]);
+    events.length = 0;
+    const response = await env.interactions(signedClick(requestId, SLACK_A));
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.headers['x-break-glass-outcome'], 'revoked');
+    assert.ok(events.includes('policy'));
+    assert.ok(!events.includes('UpdateItem'), 'no claim, no state transition');
+    assert.equal(status(env), 'pending');
+    assert.ok(!env.enqueued.some((job) => job.kind === 'side-effects'), 'no audit comment, no Slack update');
+    assert.match(env.enqueued.find((job) => job.kind === 'ephemeral').text, /no longer allowed/);
+    const logged = env.logs.find((entry) => entry.event === 'framework_revoked');
+    assert.deepEqual([logged.state, logged.frameworkSha, logged.userId], ['not_allowed', FRAMEWORK_SHA, SLACK_A]);
+
+    env.framework.allow([FRAMEWORK_SHA]);
+    events.length = 0;
+    assert.equal((await env.interactions(signedClick(requestId, SLACK_A))).headers['x-break-glass-outcome'], 'claimed');
+    assert.ok(events.indexOf('policy') < events.indexOf('UpdateItem'), 'the commit is checked before the claim');
+  });
+
+  for (const [name, arrange] of [
+    ['absent', (env) => env.framework.remove()],
+    ['unverified', (env) => env.framework.set(Object.assign(new Error('slow'), { name: 'TimeoutError' }))],
+    ['malformed', (env) => env.framework.set('{}')]
+  ]) {
+    it(`a click while the policy is ${name} is revoked, not decided`, async () => {
+      const env = brokerEnv();
+      const requestId = await fileRequest(env);
+      arrange(env);
+      assert.equal((await env.interactions(signedClick(requestId, SLACK_A))).headers['x-break-glass-outcome'], 'revoked');
+      assert.equal(status(env), 'pending');
+    });
+  }
+
+  it('a stored request without a recorded commit is never decided', async () => {
+    const env = brokerEnv();
+    const requestId = await fileRequest(env);
+    const [item] = env.requests();
+    const doc = JSON.parse(item.doc.S);
+    delete doc.identity.jobWorkflowSha;
+    item.doc = { S: JSON.stringify(doc) };
+    assert.equal((await env.interactions(signedClick(requestId, SLACK_A))).headers['x-break-glass-outcome'], 'revoked');
+    assert.equal(status(env), 'pending');
+  });
+
+  it('a non-approver learns nothing about the policy: unauthorized comes first', async () => {
+    const env = brokerEnv();
+    const requestId = await fileRequest(env);
+    env.framework.allow([OTHER_SHA]);
+    assert.equal((await env.interactions(signedClick(requestId, SLACK_B))).headers['x-break-glass-outcome'], 'unauthorized');
+    assert.ok(!env.logs.some((entry) => entry.event === 'framework_revoked'));
+  });
+});
+
+describe('`revoked` never reaches CI as anything but a non-approval (Phase 3D)', () => {
+  // `revoked` is an interaction OUTCOME only (the x-break-glass-outcome header
+  // and an ephemeral reply). It is never stored: the request stays `pending`.
+  // CI then either cannot read status (the commit is refused) or keeps seeing
+  // `pending` until its timeout. Every CI-side reader is a closed set in which
+  // only `approved` succeeds; these tests drive the real ones.
+  const OTHER_SHA = 'e'.repeat(40);
+  const DIGEST = 'a'.repeat(64);
+  const PREFLIGHT = { accepted: true, gateDigest: DIGEST, synthetic: false, route: 'production' };
+  const approvedFacts = {
+    sourceResult: 'failure', verdict: 'BLOCK', gateMode: 'enforce', integrityTrusted: 'true',
+    breakGlassEligible: 'true', breakGlassDelegated: 'true', secretScanResult: 'success',
+    dependencyScanResult: 'success', sastResult: 'success', sourceGateDigest: DIGEST,
+    breakGlassResult: 'success', breakGlassDecision: 'approved', breakGlassDelivered: 'true', breakGlassGateDigest: DIGEST
+  };
+  const sourceGate = { status: 'failure', verdict: 'BLOCK', gate_mode: 'enforce', integrity_trusted: 'true', break_glass_eligible: 'true', gate_digest: DIGEST };
+  const approvedEvidence = { status: 'success', decision: 'approved', request_delivered: 'true', gate_digest: DIGEST, delegated: 'true' };
+
+  async function revokedRequest() {
+    const env = brokerEnv();
+    const requestId = await fileRequest(env);
+    env.framework.allow([OTHER_SHA]);
+    const click = await env.interactions(signedClick(requestId, SLACK_A));
+    assert.equal(click.headers['x-break-glass-outcome'], 'revoked');
+    const stored = JSON.parse(env.requests()[0].doc.S);
+    assert.equal(stored.status, 'pending', 'revoked is never stored');
+    assert.ok(!('decidedAt' in stored) && !('approver' in stored));
+    return { env, requestId };
+  }
+  const poller = (env, requestId, { timeoutSeconds = 60 } = {}) => {
+    let clock = 0;
+    return pollBreakGlass({
+      request: { requestId, gateDigest: DIGEST },
+      invoke: (event) => env.ci(event),
+      mintIdentityToken: async () => env.tokenFor(),
+      timeoutSeconds,
+      intervalMilliseconds: 10_000,
+      now: () => clock,
+      sleep: async (ms) => {
+        clock += ms;
+      }
+    });
+  };
+
+  it('still revoked: the CI poll is refused, the result is error, the gate and conformance stay BLOCK', async () => {
+    const { env, requestId } = await revokedRequest();
+    let pollError;
+    await poller(env, requestId).catch((error) => {
+      pollError = error;
+    });
+    assert.match(pollError?.message ?? '', /framework_rejected: framework_sha_not_allowed/);
+    assert.equal(describePollOutcome({ error: pollError }).approved, false);
+    const result = deriveBreakGlassResult({
+      preflightOutcome: 'success', requestOutcome: 'success', pollOutcome: 'failure',
+      preflight: PREFLIGHT, request: { requestId, gateDigest: DIGEST }, decision: null
+    });
+    assert.deepEqual([result.decisionStatus, result.controlResult], ['error', 'failure']);
+    assert.equal(decideSourceGate({ ...approvedFacts, breakGlassResult: 'failure', breakGlassDecision: result.decisionStatus }).outcome, 'block');
+    assert.equal(explainBreakGlass({ ...approvedEvidence, status: 'failure', decision: result.decisionStatus }, sourceGate).passed, false);
+  });
+
+  it('re-admitted after a revoked click: status is still pending, and an undecided poll ends in timeout', async () => {
+    const { env, requestId } = await revokedRequest();
+    env.framework.allow([FRAMEWORK_SHA]);
+    const polled = await poller(env, requestId, { timeoutSeconds: 30 });
+    assert.equal(polled.status, 'timeout');
+    assert.equal(describePollOutcome({ result: polled }).approved, false);
+    const result = deriveBreakGlassResult({
+      preflightOutcome: 'success', requestOutcome: 'success', pollOutcome: 'failure',
+      preflight: PREFLIGHT, request: { requestId, gateDigest: DIGEST }, decision: polled
+    });
+    assert.deepEqual([result.decisionStatus, result.controlResult], ['timeout', 'failure']);
+  });
+
+  it('defence in depth: a `revoked` status, wherever it came from, is never success in any reader', async () => {
+    // The poll's status set is closed: an unknown status is an error, not a wait or a pass.
+    await assert.rejects(
+      pollBreakGlass({
+        request: { requestId: 'r-1', gateDigest: DIGEST },
+        invoke: async () => ({ ok: true, body: { requestId: 'r-1', gateDigest: DIGEST, status: 'revoked' } }),
+        mintIdentityToken: async () => 'token',
+        sleep: async () => {}
+      }),
+      /unsupported break-glass status revoked/
+    );
+    assert.equal(describePollOutcome({ result: { requestId: 'r-1', status: 'revoked' } }).approved, false);
+    // The result switch defaults to error, even with a successful poll step.
+    const result = deriveBreakGlassResult({
+      preflightOutcome: 'success', requestOutcome: 'success', pollOutcome: 'success',
+      preflight: PREFLIGHT, request: { requestId: 'r-1', gateDigest: DIGEST },
+      decision: { requestId: 'r-1', gateDigest: DIGEST, status: 'revoked', approver: { username: 'x' } }
+    });
+    assert.deepEqual([result.decisionStatus, result.controlResult], ['error', 'failure']);
+    // The final gate and conformance accept only `approved`, even with every other fact in place.
+    assert.equal(decideSourceGate(approvedFacts).outcome, 'overridden-block', 'fixture sanity: approved overrides');
+    assert.equal(decideSourceGate({ ...approvedFacts, breakGlassDecision: 'revoked' }).outcome, 'block');
+    assert.equal(explainBreakGlass(approvedEvidence, { ...sourceGate, override: 'approved' }).passed, true, 'fixture sanity: approved passes');
+    assert.equal(explainBreakGlass({ ...approvedEvidence, decision: 'revoked' }, { ...sourceGate, override: 'approved' }).passed, false);
+  });
+});
+
 describe('no token leaks into state, logs or responses', () => {
   it('the token never appears in a stored item, a log entry or a response', async () => {
     const env = brokerEnv();
@@ -892,9 +1186,25 @@ describe('the OIDC boundary is unchanged by Phase 3A', () => {
   });
 
   it('no workflow references the identity-token minter directly; only the notify/poll scripts do', () => {
-    for (const file of ['_source-scan.yml', '_source-security.yml', '_break-glass-lambda.yml']) {
+    for (const file of ['_source-scan.yml', '_source-security.yml']) {
       assert.doesNotMatch(read(`.github/workflows/${file}`), /break-glass-oidc-token|ACTIONS_ID_TOKEN_REQUEST/);
     }
+    assert.doesNotMatch(read('.github/workflows/_break-glass-lambda.yml'), /break-glass-oidc-token/);
+  });
+
+  it('_break-glass-lambda.yml mints inline only in its binding step, and only for the inert audience', () => {
+    // Phase 3D: the first step reads job_workflow_sha from a token whose
+    // audience neither AWS (sts.amazonaws.com) nor the broker (ssd-break-glass)
+    // accepts. Broker tokens still come only from the notify/poll scripts.
+    const text = read('.github/workflows/_break-glass-lambda.yml');
+    const bindStart = text.indexOf("      - name: Bind to this workflow's own framework commit\n");
+    const bindEnd = text.indexOf('\n      - name: ', bindStart + 1);
+    assert.ok(bindStart > 0 && bindEnd > bindStart);
+    const uses = [...text.matchAll(/ACTIONS_ID_TOKEN_REQUEST/g)].map((match) => match.index);
+    assert.ok(uses.length > 0 && uses.every((at) => at > bindStart && at < bindEnd), 'the OIDC request variables are read only by the binding step');
+    const binding = text.slice(bindStart, bindEnd).split('\n').filter((line) => !/^\s*#/.test(line)).join('\n');
+    assert.match(binding, /\n {10}BINDING_AUDIENCE: ssd-framework-binding\n/);
+    assert.doesNotMatch(binding, /ssd-break-glass\b(?!-)|sts\.amazonaws\.com\n|audience=ssd-break-glass/);
   });
 
   it('the HTTP transport (the only one _source-scan.yml runs in-job) never mints a token', async () => {

@@ -669,7 +669,7 @@ strictly read-only and plan has its own, separate planning allowlist.)*
 | Scope | Resources | Default | Change requires |
 | --- | --- | --- | --- |
 | **shared** (account/region) | GitHub OIDC provider; ECR registry scanning configuration; Inspector enablement; break-glass broker stacks (prod and synthetic) | discover, validate, report | `aws plan --scope shared` + `aws apply` of that plan |
-| **per repository** | ECR repository; push+scan role; deploy role; break-glass invoker role; GitHub secret | `existing` (validate) or `managed` (stack) | `aws plan` + `aws apply` |
+| **per repository** | ECR repository; push+scan role; deploy role; GitHub secret. (The break-glass invoker role is Phase 3D's own per-environment stack, always managed: [break-glass-repositories.md](break-glass-repositories.md).) | `existing` (validate) or `managed` (stack) | `aws plan` + `aws apply` |
 
 A resource is **managed** only if it is a physical resource of **the expected
 CloudFormation stack** — the exact derived name (`ssd-delivery-<owner>-<repo>-<h8>`
@@ -728,7 +728,12 @@ test/aws-*.test.js           fixture-driven: recorded CLI responses, no network
 - Contexts: push+scan role `ref:refs/heads/<default branch>` only; deploy role
   `environment:<delivery.environment>` (the generated deploy job gains
   `environment:` so GitHub required reviewers can gate it); break-glass invoker
-  `pull_request` + `ref:refs/heads/<default branch>`.
+  `pull_request` only (the broker refuses every other event). The invoker is
+  provisioned by Phase 3D's own scope, not by the delivery stack. It uses
+  GitHub's default subject only: a repository with a customized subject fails
+  closed (plan blocks, verify fails), and a subject is never constructed from
+  ids. Customized-subject support is future work
+  ([break-glass-repositories.md](break-glass-repositories.md#invoker-role-ssd-break-glass-env-invoker-repository_id)).
 - Trust documents use `StringEquals` on `aud = sts.amazonaws.com` and an exact
   `sub` list. `StringLike`, `*` and org-wide subjects are rejected by the builder.
 - Offline tests with the evaluator: correct repo/branch assumes; another repo,
@@ -1326,9 +1331,9 @@ What exists, and where it refines D.8:
 | --- | --- | --- |
 | 3A | broker verifies the caller's GitHub OIDC identity (E.2) | merged (PR #16) |
 | 3B | broker reads approvers from per-repository SSM parameters (E.3) | merged (PR #17) |
-| 3C | shared production and synthetic stacks (E.4), plus synthetic infrastructure live validation | implemented; live-validated on the synthetic stack only; production stack not deployed |
-| 3D | per-repository invoker roles, approver parameters, reviewed/allowed framework-SHA policy, and the live role checks that apply (E.7) | not implemented |
-| 3E | synthetic workflow contract; synthetic negative, race and timeout suite (E.7) | not implemented |
+| 3C | shared production and synthetic broker stacks (E.4), plus synthetic infrastructure live validation | merged (PR #18); live-validated on the synthetic stack only; production stack not deployed |
+| 3D | the governance stack per environment (allowed framework commits) and the per-repository invoker role and approver parameter; the workflow's self-binding and the broker's framework-commit check; the live role checks that apply (E.7) | implemented ([break-glass-repositories.md](break-glass-repositories.md)); live synthetic validation pending |
+| 3E | end-to-end validation of the synthetic workflow contract: the positive path, negative, race and timeout cases, and everything needing a live Slack interaction (E.7) | not implemented |
 | pre-production | production deployed and verified on the final reviewed artifact; production secrets; production Slack Request URL; repository approver parameters | after 3D and 3E |
 
 Gates per phase: [break-glass-provisioning.md § Phase sequence and gates](break-glass-provisioning.md#phase-sequence-and-gates).
@@ -1339,8 +1344,9 @@ Design:
 Shared: CI broker Lambda (no URL, IAM invoke only), interaction Lambda (the one
 public Function URL, Slack HMAC is the authentication), DynamoDB table with
 conditional-write claims, Secrets Manager. Per repository: an invoker role that
-may invoke only the CI broker, and an approver mapping. Lambda transport remains
-preferred; the HTTP transport is not generated.
+may invoke only the CI broker, and an approver mapping. The Lambda transport is
+the only path the hardened broker supports, and only from
+`_break-glass-lambda.yml`; the HTTP transport is not generated.
 
 ### E.2 Concrete defect to fix first: caller-asserted repository
 
@@ -1375,7 +1381,9 @@ the sketch above in three places, each one stricter:
   Notify and **every status poll** mint their own token, and each token is
   accepted once (`jti`, conditional write).
 - **More is bound than `iss`/`aud`/`exp`.** `job_workflow_ref` must name one of
-  the two framework workflows at an exact SHA. A production request must be a
+  the two framework workflows at an exact SHA (3A; superseded in 3D, item 5
+  below: only `_break-glass-lambda.yml` is accepted, and the commit
+  `job_workflow_sha` is authorized whatever the ref spelling). A production request must be a
   `pull_request` run, with the PR number taken from `ref` =
   `refs/pull/<N>/merge`. A status read must come from the same `repository_id`,
   `run_id` and `run_attempt` that filed the request.
@@ -1408,13 +1416,28 @@ synthetic stack only, for live validation:
    unmerged branch. That does not reopen cross-repository forgery, because
    identity still comes from the token. But production acceptance must be
    restricted to reviewed or allowed framework SHAs.
+   **Specified for 3D** ([break-glass-repositories.md](break-glass-repositories.md)):
+   the authorized commit is the verified `job_workflow_sha`, admitted per
+   environment from an explicit set (production: only commits listed there,
+   each also required at plan time to be an ancestor of `origin/main`, which
+   guards admission but does not prove review) and checked on notify, status
+   and click. Two gaps are closed with it:
+   `_break-glass-lambda.yml` now checks itself out at `job_workflow_sha` before
+   any framework script runs (a caller-chosen `toolkit_ref` could otherwise
+   run other code under an admitted commit), and `_source-security.yml` is no
+   longer accepted (its credential-bearing job runs caller-controlled code).
 4. **Synthetic demo path:** production rules refuse `workflow_dispatch`, so the
    manually dispatched synthetic demo must move to an explicitly separate
    synthetic contract against the synthetic stack (3E). Production validation
    is not to be weakened for it.
-5. **The exact-SHA caller requirement stays.** Tag or branch trust (`@v1`) is
-   not reintroduced. Tag-pinned callers, including `examples/container-ecr`,
-   fail closed once the hardened broker is deployed.
+5. **Superseded in 3D: the commit is authorized, not the ref spelling.** 3A
+   refused any `job_workflow_ref` whose ref was not a SHA. 3D authorizes the
+   verified `job_workflow_sha` against an explicit per-environment set
+   instead, so a caller may spell the ref as a SHA, tag or branch: a tag that
+   moves to a commit that is not admitted is refused, and an admitted commit
+   is accepted however it was spelled. This is not tag trust, because nothing
+   is decided by the tag. Exact-SHA pins stay recommended as supply-chain
+   hardening.
 6. **Stale approval messages (audit noise, not a bypass).** If a delivered
    request's response is lost and the job is re-run, the earlier Slack message
    stays approvable. Approving it cannot unblock any gate, because only the
@@ -1446,11 +1469,14 @@ remains. Contract: [break-glass-setup.md § Authorization](break-glass-setup.md#
 Two separately named and separately tagged shared stacks
 (`ssd-break-glass-production`, `ssd-break-glass-synthetic`), each with its own
 functions, table, secrets and Slack app. Plan refuses when the synthetic and
-production function ARNs, invoker role ARNs, tables, secret ARNs or Slack
-channel IDs coincide, and when a synthetic stack's parameters reference a
-production-tagged resource. Phase 1's config deliberately holds no break-glass
-identifiers (B.8); Phase 3 reintroduces production and synthetic identifiers as
-separate fields and refuses equal values (the reusable workflow already does).
+production function ARNs, tables, secret ARNs or Slack channel IDs coincide
+(3C). Phase 3D keeps the same separation by construction for its own stacks:
+invoker roles, approver parameters and allowed-commit parameters are named per
+environment, each environment's allowed commits come from its own file, and
+no role reads the other environment's parameters. Phase 1's config
+deliberately holds no break-glass identifiers (B.8); Phase 3 reintroduces
+production and synthetic identifiers as separate fields and refuses equal
+values (the reusable workflow already does).
 
 ### E.5 Secrets
 
@@ -1477,10 +1503,12 @@ in Secrets Manager, in a dedicated broker change. Not silently redesigned here.
 ### E.7 Verification
 
 The shared stacks' own checks are Phase 3C (`aws verify --scope break-glass`).
-The per-invoker-role checks below are Phase 3D, and the `verify-live.mjs`
-suite is Phase 3E.
+The per-invoker-role checks below are Phase 3D (`aws verify --scope
+break-glass-repo`; the complete probe list is in
+[break-glass-repositories.md § Verification](break-glass-repositories.md#verification)),
+and the `verify-live.mjs` suite is Phase 3E.
 
-`aws verify --break-glass` must include, per repository invoker role, negative
+Per repository invoker role, verify must include negative
 checks via `iam simulate-principal-policy` (read-only) **and** a GitHub-run probe
 job (the POC smoke workflow's pattern, holding the real OIDC session):
 

@@ -7,6 +7,7 @@ import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { describe, it } from 'node:test';
 
+import { frameworkPolicyParameterName } from '../broker/identity/framework-policy.mjs';
 import { OperatorConfigError, parseOperatorConfig, validateOperatorConfig } from '../onboarding/aws/break-glass/operator-config.mjs';
 import { assertSeparated, breakGlassArns, breakGlassNames, codeSha256Of, separationIdentifiers, separationProblems } from '../onboarding/aws/break-glass/names.mjs';
 import { ScopeError, assertChangeScope, assertTemplateScope } from '../onboarding/aws/plan/scope.mjs';
@@ -197,7 +198,8 @@ describe('the template', () => {
     assert.deepEqual(ci.Architectures, ['arm64']);
     assert.equal(ci.Handler, 'broker/lambda/index.ciHandler');
     assert.deepEqual(ci.Code, { S3Bucket: ARTIFACT.bucket, S3Key: ARTIFACT.key, S3ObjectVersion: ARTIFACT.versionId });
-    assert.deepEqual(ci.Environment.Variables, { TABLE_NAME: 'ssd-break-glass-production-requests', SLACK_CHANNEL_ID: CHANNELS.production, SLACK_BOT_TOKEN_SECRET_ARN: { Ref: 'SlackBotTokenSecret' } });
+    assert.deepEqual(ci.Environment.Variables, { TABLE_NAME: 'ssd-break-glass-production-requests', SLACK_CHANNEL_ID: CHANNELS.production, BREAK_GLASS_ENVIRONMENT: 'production', SLACK_BOT_TOKEN_SECRET_ARN: { Ref: 'SlackBotTokenSecret' } });
+    assert.equal(resources('synthetic').CiFunction.Properties.Environment.Variables.BREAK_GLASS_ENVIRONMENT, 'synthetic', 'each environment names itself');
     assert.equal(ci.VpcConfig, undefined);
     assert.equal(ci.ReservedConcurrentExecutions, undefined, 'the IAM-only CI broker has no reservation');
     for (const [id, res] of Object.entries(r)) {
@@ -225,6 +227,45 @@ describe('the template', () => {
     assert.equal(r.InteractionsEventInvokeConfig.Properties.MaximumRetryAttempts, 0);
     assert.equal(i.ReservedConcurrentExecutions, 5, 'the public function is capped');
     assert.equal(resources('production').InteractionsFunction.Properties.ReservedConcurrentExecutions, 5, 'production too');
+  });
+
+  it('Phase 3D changes the shared template by exactly three additions, and nothing else', () => {
+    // sha256 of canonicalJson(template) for this file's operator fixture.
+    // PHASE_3C: rendered by the committed 3C code (main 9733a7a; onboarding/
+    // unchanged up to this commit's parent). PHASE_3D: this commit.
+    const PHASE_3C = {
+      production: '55932a67a5332ca4f785d59d125e10740dce63a450e794ca6c625e7d4881f921',
+      synthetic: 'a0543ac5cbcce7fbe359d275d6652760ae25906baaf5ccf1c816d4dbba78d8d8'
+    };
+    const PHASE_3D = {
+      production: 'a4bacd32a078451edb8a1676e14bb55d6be29a77228371069ec357b6719c0183',
+      synthetic: 'cf1821c890309e5b50f20d1ce1b3baf3d5cf5dd537d73044d1f68e776ad3d4a3'
+    };
+    const digest = (template) => createHash('sha256').update(canonicalJson(template)).digest('hex');
+    for (const env of ['production', 'synthetic']) {
+      const template = render(env).template;
+      assert.equal(digest(template), PHASE_3D[env], `${env}: the rendered template changed; review it and update this pin`);
+      // Remove exactly the three Phase 3D additions: the 3C template must remain.
+      const r = JSON.parse(JSON.stringify(template)).Resources;
+      assert.equal(r.CiFunction.Properties.Environment.Variables.BREAK_GLASS_ENVIRONMENT, env);
+      delete r.CiFunction.Properties.Environment.Variables.BREAK_GLASS_ENVIRONMENT;
+      for (const role of ['CiExecutionRole', 'InteractionsExecutionRole']) {
+        const doc = r[role].Properties.Policies[0].PolicyDocument;
+        const added = doc.Statement.filter((st) => st.Sid === 'ReadFrameworkPolicy');
+        assert.deepEqual(added, [{ Sid: 'ReadFrameworkPolicy', Effect: 'Allow', Action: 'ssm:GetParameter', Resource: breakGlassArns(env, TARGET).frameworkPolicyParameter }]);
+        doc.Statement = doc.Statement.filter((st) => st.Sid !== 'ReadFrameworkPolicy');
+      }
+      assert.equal(digest({ ...template, Resources: r }), PHASE_3C[env], `${env}: something other than the three Phase 3D additions changed`);
+    }
+  });
+
+  it('the shared stack never creates the governance parameter (the governance stack owns it)', () => {
+    for (const env of ['production', 'synthetic']) {
+      assert.ok(!Object.values(resources(env)).some((res) => res.Type === 'AWS::SSM::Parameter'));
+      assert.equal(breakGlassNames(env).frameworkPolicyParameter, `/ssd/break-glass/${env}/governance/allowed-framework-shas`);
+      // One name, two derivations: the grant must name what the broker reads.
+      assert.equal(breakGlassNames(env).frameworkPolicyParameter, frameworkPolicyParameterName(env));
+    }
   });
 
   it('tags: framework, managed-by and the stack\'s own environment on every taggable resource; no consumer repository', () => {

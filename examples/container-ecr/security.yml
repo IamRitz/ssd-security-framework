@@ -69,6 +69,13 @@ jobs:
     # re-validates this run's own gate evidence (eligibility, run binding, gate
     # digest, synthetic route) BEFORE it assumes any AWS role, and executes no
     # code from this repository.
+    #
+    # The broker admits a request only if the framework commit this resolves to
+    # (job_workflow_sha) is in its environment's allowed set. `@v1` works while
+    # v1 points at an admitted commit; pinning an exact SHA here is recommended
+    # supply-chain hardening. The called workflow always loads its toolkit from
+    # its own commit, so `toolkit_ref` below selects nothing there (it is kept
+    # in sync with `uses:` like every other framework call).
     needs: source-security
     if: ${{ always() && needs.source-security.outputs.break_glass_delegated == 'true' }}
     uses: IamRitz/ssd-security-framework/.github/workflows/_break-glass-lambda.yml@v1

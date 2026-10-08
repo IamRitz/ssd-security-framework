@@ -14,6 +14,13 @@
 // repository_id; the audit comment goes to the token's repository and PR; and a
 // status read must come from the same repository, run and run attempt that
 // filed the request. Tokens are never logged, stored or echoed.
+//
+// FRAMEWORK COMMIT (Phase 3D). A verified token is accepted only if its
+// job_workflow_sha is in this environment's allowed set
+// (identity/framework-policy.mjs). The check runs after verification and
+// BEFORE the token is spent, on notify and every status call, so a refused
+// commit writes nothing; and again at click time against the stored request's
+// commit, before any claim, so removing a commit revokes its pending requests.
 import { createHash } from 'node:crypto';
 
 import {
@@ -28,6 +35,7 @@ import {
   buildAuditComment
 } from '../authorize/break-glass-decision.mjs';
 import { buildApprovalMessage, buildDecisionUpdate, ephemeral } from '../messages.mjs';
+import { decideFramework } from '../identity/framework-policy.mjs';
 import { IdentityRejected } from '../identity/github-oidc.mjs';
 import { bindRequestIdentity, createPendingRequest, statusView, validateNotifyPayload } from '../request.mjs';
 import { ConditionFailed } from './dynamodb-store.mjs';
@@ -47,13 +55,16 @@ export function createBroker({
   approverSource,
   // async (token) -> verified GitHub identity, or throws IdentityRejected.
   verifyIdentity,
+  // { check(sha) } -> a framework-policy.mjs result. Absent = nothing allowed.
+  frameworkPolicy,
   slackChannelId,
   now = () => new Date(),
   randomUUID = () => globalThis.crypto.randomUUID(),
   log = (entry) => console.log(JSON.stringify(entry))
 }) {
   // --- CI identity -------------------------------------------------------------
-  // Verify the token, then spend it. Returns { identity } or { rejected }.
+  // Verify the token, check its framework commit, then spend it. Returns
+  // { identity } or { rejected }.
   // Rejections log enough to investigate (code, any verified ids, what the
   // payload claimed) and never the token.
   async function authenticate(action, identityToken, claimedRepository) {
@@ -65,6 +76,12 @@ export function createBroker({
       if (!(error instanceof IdentityRejected)) throw error;
       log({ event: 'identity_rejected', action, code: error.code, claimedRepository: claimed(claimedRepository) });
       return { rejected: { ok: false, statusCode: 401, error: error.message } };
+    }
+    // Before the token is spent: a refused commit writes nothing.
+    const framework = await decideFramework(frameworkPolicy, verified.jobWorkflow?.sha);
+    if (framework.state !== 'allowed') {
+      log({ event: 'framework_rejected', action, state: framework.state, reason: framework.reason, frameworkSha: verified.jobWorkflow?.sha ?? null, ...who(verified) });
+      return { rejected: frameworkRejection(framework) };
     }
     const fresh = await store.consumeTokenId({
       jtiHash: createHash('sha256').update(verified.jti).digest('hex'),
@@ -80,6 +97,11 @@ export function createBroker({
     }
     return { identity: verified };
   }
+
+  const frameworkRejection = (framework) =>
+    framework.state === 'not_allowed'
+      ? { ok: false, statusCode: 403, error: 'framework_rejected: framework_sha_not_allowed' }
+      : { ok: false, statusCode: 503, error: `framework_policy_unavailable: ${framework.state}` };
 
   const who = (identity) => ({
     repositoryId: identity.repositoryId,
@@ -223,11 +245,16 @@ export function createBroker({
     // The approver list is the one named by the STORED request's VERIFIED
     // repository_id — never the click payload, never the display context —
     // read at click time. No stored identity -> no lookup, nobody authorized.
+    // The stored request's framework commit is re-checked at the same time (in
+    // parallel, inside Slack's 3 s ack budget).
     const stored = await store.get(decision.requestId);
     const repositoryId = stored?.identity?.repositoryId;
-    const approvers = repositoryId
-      ? await approverSource.approversFor(repositoryId)
-      : { state: 'misconfigured', reason: 'request has no verified identity', userIds: null };
+    const [approvers, framework] = await Promise.all([
+      repositoryId
+        ? approverSource.approversFor(repositoryId)
+        : { state: 'misconfigured', reason: 'request has no verified identity', userIds: null },
+      decideFramework(frameworkPolicy, stored?.identity?.jobWorkflowSha)
+    ]);
     const auth = authorizeSlackInteraction({ interaction, approvers });
     if (!auth.authorized) {
       log({
@@ -239,6 +266,23 @@ export function createBroker({
         reason: approvers.reason ?? auth.reason ?? null
       });
       return reply('unauthorized', 'You are not an authorized break-glass approver.', {
+        requestId: decision.requestId
+      });
+    }
+
+    // Decided only for an authorized approver, and BEFORE any claim: a request
+    // whose commit is no longer allowed is not decided and changes no state.
+    if (framework.state !== 'allowed') {
+      log({
+        event: 'framework_revoked',
+        requestId: decision.requestId,
+        repositoryId,
+        userId: auth.userId,
+        state: framework.state,
+        reason: framework.reason,
+        frameworkSha: stored?.identity?.jobWorkflowSha ?? null
+      });
+      return reply('revoked', 'This request was filed by a framework commit that is no longer allowed. It cannot be decided.', {
         requestId: decision.requestId
       });
     }

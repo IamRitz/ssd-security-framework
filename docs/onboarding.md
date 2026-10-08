@@ -665,20 +665,30 @@ Once per account, shared by every repo:
 
 ### 3.2 The invoker role **[REPO]**
 
-A dedicated OIDC role that can invoke **only** the break-glass function — not
-the interaction handler, not the DynamoDB table, not the secrets. Scope its
-trust policy the same way as §2.2, and confirm the negative case: assuming it
-and calling anything else must return AccessDenied.
+A dedicated OIDC role that can invoke **only** the CI broker function — not
+the interaction handler, not the DynamoDB table, not the secrets. Do not write
+it by hand: `ssd-onboard aws plan --scope break-glass-repo` provisions it, one
+stack per repository and environment, from an operator-owned repository file
+(Phase 3D, [break-glass-repositories.md](break-glass-repositories.md)). Unlike
+§2.2's roles, its trust admits the repository's **`pull_request`** subject
+only, and `aws verify` confirms the negative case: assuming it and calling
+anything else must return AccessDenied.
+
+The framework commit your caller resolves to must also be admitted for the
+environment. Pin `_break-glass-lambda.yml` to an exact SHA (recommended as
+supply-chain hardening); a tag works only while it resolves to an admitted
+commit. The workflow ignores `toolkit_ref` and always runs its own commit.
 
 Call `_source-scan.yml` with `break_glass_transport: lambda`, and pass the role
 to a separate `break-glass` job calling `_break-glass-lambda.yml`
 (`lambda_role_arn`) — the only job granted `id-token: write`. See
 `examples/container-ecr/security.yml` and
 [workflow-contracts.md](workflow-contracts.md#_break-glass-lambdayml). (Existing
-v1 callers of `_source-security.yml` keep passing `break_glass_lambda_role_arn`
-there.) Set `strict_break_glass_evidence: true` on `_conformance.yml` and feed
-it the structured `break-glass` record, as the example does. This path needs
-**no repository secret at all**.
+v1 callers of `_source-security.yml` may still pass `break_glass_lambda_role_arn`
+there, but the hardened broker refuses that path; move to
+`_break-glass-lambda.yml`.) Set `strict_break_glass_evidence: true` on
+`_conformance.yml` and feed it the structured `break-glass` record, as the
+example does. This path needs **no repository secret at all**.
 
 ### 3.3 The Slack app **[ORG]**
 
@@ -743,7 +753,12 @@ The interaction function needs `ssm:GetParameter` on
 `arn:aws:ssm:<region>:<account>:parameter/ssd/break-glass/<environment>/approvers/*`
 and nothing broader. Phase 3C grants exactly that on the interaction function's
 execution role. Creating, owning and verifying the parameters, one per
-repository alongside its invoker role, is Phase 3D.
+repository alongside its invoker role, is Phase 3D: the approver list lives in
+the operator-owned repository file, never in `.ssd/onboarding.yml`.
+
+`[]` is valid: it authorizes nobody and is how a repository is offboarded
+(resources are retained, so empty the list before removing anything).
+`aws verify` reports it as "enabled but not operationally ready".
 
 ### 3.5 A repo with no Slack
 

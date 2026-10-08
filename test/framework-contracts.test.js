@@ -43,6 +43,10 @@ const CREDENTIAL_FREE = ['_image-scan-prepush.yml', '_artifact-gate.yml', '_conf
 // The credential-bearing break-glass workflow loads its validation code from a
 // FIXED repository, never from an input a caller could repoint.
 const FIXED_TOOLKIT_REPOSITORY = ['_break-glass-lambda.yml'];
+// Reusable workflows that hold `id-token: write` and therefore bind their
+// toolkit checkout to their own commit (job_workflow_sha) instead of trusting
+// toolkit_ref (Phase 3D, docs/break-glass-repositories.md).
+const SELF_BOUND_TOOLKIT = ['_break-glass-lambda.yml'];
 
 // Every reusable workflow that accepts the Slack webhook as a declared secret.
 // The URL is itself a credential, so it must reach exactly one notifier step.
@@ -100,6 +104,13 @@ describe('the toolkit no longer travels with the consumer', () => {
         assert.ok(!/toolkit_repository|toolkit_path/.test(source), 'a credential-bearing workflow must not let its caller repoint or vendor the toolkit');
       } else {
         assert.match(source, /repository: \$\{\{ inputs\.toolkit_repository \}\}/, 'must check out the toolkit repo');
+      }
+      if (SELF_BOUND_TOOLKIT.includes(file)) {
+        // Checked out at the commit its binding step proved (job_workflow_sha),
+        // never at a caller-supplied ref (test/break-glass-oidc-boundary.test.js).
+        assert.match(source, /ref: \$\{\{ steps\.bind-framework-commit\.outputs\.sha \}\}/, 'must check out its own bound commit');
+        assert.ok(!/ref: \$\{\{ inputs\.toolkit_ref \}\}/.test(source), 'toolkit_ref must not select the checkout');
+        return;
       }
       assert.match(source, /ref: \$\{\{ inputs\.toolkit_ref \}\}/, 'must check out at the toolkit ref');
       // An empty ref would silently resolve to the framework's default branch —

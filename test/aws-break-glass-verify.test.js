@@ -160,6 +160,8 @@ describe('aws verify --scope break-glass: cross-environment reuse fails', () => 
 describe('aws verify --scope break-glass: logging access (own log group only)', () => {
   const logs = (role, environment = 'production') => breakGlassArns(environment, TARGET).logGroupProbes[role];
   const writeOwnLogs = (role) => role.policy.Statement.find((st) => st.Sid === 'WriteOwnLogs');
+  const readFrameworkPolicy = (role) => role.policy.Statement.find((st) => st.Sid === 'ReadFrameworkPolicy');
+  const governanceArn = (environment = 'production') => `arn:aws:ssm:${TARGET.region}:${ACCOUNT}:parameter/ssd/break-glass/${environment}/governance/allowed-framework-shas`;
   const roleOf = (world, environment, role) => world.__roles[`ssd-break-glass-${environment}-${role}-execution`];
   const simulate = (world, roleArn, action, resource) =>
     JSON.parse(world['iam simulate-principal-policy *'](['iam', 'simulate-principal-policy', '--policy-source-arn', roleArn, '--action-names', JSON.stringify([action]), '--resource-arns', JSON.stringify([resource])]).stdout).EvaluationResults[0].EvalDecision;
@@ -206,7 +208,17 @@ describe('aws verify --scope break-glass: logging access (own log group only)', 
     ['synthetic CI granted production\'s CI group', 'synthetic', (w) => (writeOwnLogs(roleOf(w, 'synthetic', 'ci')).Resource = [logs('ci', 'synthetic'), logs('ci', 'production')]), ['bg.ci-negative-access']],
     ['a broad Resource "*" Logs grant', 'production', (w) => roleOf(w, 'production', 'ci').policy.Statement.push({ Sid: 'Broad', Effect: 'Allow', Action: ['logs:CreateLogStream', 'logs:PutLogEvents'], Resource: '*' }), ['bg.ci-policy-document', 'bg.ci-negative-access']],
     ['an account-wide log-group:* grant', 'production', (w) => roleOf(w, 'production', 'ci').policy.Statement.push({ Sid: 'AllGroups', Effect: 'Allow', Action: ['logs:CreateLogStream', 'logs:PutLogEvents'], Resource: `arn:aws:logs:${TARGET.region}:${ACCOUNT}:log-group:*` }), ['bg.ci-policy-document', 'bg.ci-negative-access']],
-    ['a logs:* action on its own group', 'production', (w) => (writeOwnLogs(roleOf(w, 'production', 'ci')).Action = ['logs:*']), ['bg.ci-policy-document']]
+    ['a logs:* action on its own group', 'production', (w) => (writeOwnLogs(roleOf(w, 'production', 'ci')).Action = ['logs:*']), ['bg.ci-policy-document']],
+    // --- Phase 3D: the framework policy read and the CI environment -------------
+    ['the CI function deployed without BREAK_GLASS_ENVIRONMENT (the 3C shape)', 'production', (w) => delete w.__functions.ci.Environment.Variables.BREAK_GLASS_ENVIRONMENT, ['bg.ci-function']],
+    ['the production CI function naming synthetic', 'production', (w) => (w.__functions.ci.Environment.Variables.BREAK_GLASS_ENVIRONMENT = 'synthetic'), ['bg.ci-function', 'bg.separation']],
+    ['the CI role without its governance read', 'production', (w) => (roleOf(w, 'production', 'ci').policy.Statement = roleOf(w, 'production', 'ci').policy.Statement.filter((st) => st.Sid !== 'ReadFrameworkPolicy')), ['bg.ci-required-access']],
+    ['the interaction role without its governance read', 'synthetic', (w) => (roleOf(w, 'synthetic', 'interactions').policy.Statement = roleOf(w, 'synthetic', 'interactions').policy.Statement.filter((st) => st.Sid !== 'ReadFrameworkPolicy')), ['bg.interactions-required-access']],
+    ['the CI governance read broadened to governance/*', 'production', (w) => (readFrameworkPolicy(roleOf(w, 'production', 'ci')).Resource = `arn:aws:ssm:${TARGET.region}:${ACCOUNT}:parameter/ssd/break-glass/production/governance/*`), ['bg.ci-policy-document', 'bg.ci-negative-access']],
+    ['the interaction role also reading the other environment\'s commits', 'synthetic', (w) => (readFrameworkPolicy(roleOf(w, 'synthetic', 'interactions')).Resource = [governanceArn('synthetic'), governanceArn('production')]), ['bg.interactions-negative-access']],
+    ['the CI role able to write the governance parameter', 'production', (w) => (readFrameworkPolicy(roleOf(w, 'production', 'ci')).Action = ['ssm:GetParameter', 'ssm:PutParameter']), ['bg.ci-negative-access']],
+    ['the CI role given approver read', 'production', (w) => roleOf(w, 'production', 'ci').policy.Statement.push({ Sid: 'ReadApprovers', Effect: 'Allow', Action: 'ssm:GetParameter', Resource: `arn:aws:ssm:${TARGET.region}:${ACCOUNT}:parameter/ssd/break-glass/production/approvers/*` }), ['bg.ci-negative-access']],
+    ['the interaction role without its approver read', 'production', (w) => (roleOf(w, 'production', 'interactions').policy.Statement = roleOf(w, 'production', 'interactions').policy.Statement.filter((st) => st.Sid !== 'ReadApprovers')), ['bg.interactions-required-access']]
   ];
   for (const [what, environment, mutate, ids] of drift) {
     it(`FAILS: ${what}`, async () => {

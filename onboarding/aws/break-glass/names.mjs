@@ -10,10 +10,12 @@
 //   SLACK_BOT_TOKEN_SECRET_ARN    both functions
 //   SLACK_SIGNING_SECRET_ARN      interactions function only
 //   GITHUB_TOKEN_SECRET_ARN       interactions function only
-//   BREAK_GLASS_ENVIRONMENT       interactions function: selects
+//   BREAK_GLASS_ENVIRONMENT       both functions (CI since Phase 3D): selects
+//                                 /ssd/break-glass/<environment>/governance/allowed-framework-shas
+//                                 (both) and
 //                                 /ssd/break-glass/<environment>/approvers/<repository_id>
-//                                 (Phase 3B, PR #17)
-import { BREAK_GLASS_ENVIRONMENTS, BREAK_GLASS_STACKS } from '../stack-names.mjs';
+//                                 (interactions; Phase 3B, PR #17)
+import { BREAK_GLASS_ENVIRONMENTS, BREAK_GLASS_STACKS, breakGlassRepoStackName } from '../stack-names.mjs';
 
 // Pinned runtime inputs. Changing any of them is a reviewed template change.
 export const LAMBDA_RUNTIME = 'nodejs24.x';
@@ -85,7 +87,10 @@ export function breakGlassNames(environment) {
     secrets: Object.freeze(Object.fromEntries(SECRET_KEYS.map((k) => [k, `ssd/break-glass/${environment}/${SECRET_SLUGS[k]}`]))),
     logGroups: Object.freeze({ ci: `/aws/lambda/${functions.ci}`, interactions: `/aws/lambda/${functions.interactions}` }),
     // Phase 3B contract (PR #17): one String parameter per repository_id.
-    approverPrefix: `/ssd/break-glass/${environment}/approvers/`
+    approverPrefix: `/ssd/break-glass/${environment}/approvers/`,
+    // Phase 3D: the environment's allowed framework commits, ONE parameter
+    // owned by the governance stack (broker/identity/framework-policy.mjs).
+    frameworkPolicyParameter: `/ssd/break-glass/${environment}/governance/allowed-framework-shas`
   });
 }
 
@@ -122,7 +127,12 @@ export function breakGlassArns(environment, { partition = 'aws', account, region
     approverParameters: `arn:${partition}:ssm:${region}:${account}:parameter${n.approverPrefix}*`,
     approverParameterSample: `arn:${partition}:ssm:${region}:${account}:parameter${n.approverPrefix}1001`,
     // Same environment, outside the approver path: never readable.
-    nonApproverParameterSample: `arn:${partition}:ssm:${region}:${account}:parameter/ssd/break-glass/${environment}/not-approvers/1001`
+    nonApproverParameterSample: `arn:${partition}:ssm:${region}:${account}:parameter/ssd/break-glass/${environment}/not-approvers/1001`,
+    // The exact governance parameter both execution roles read (Phase 3D), and
+    // a sibling under the same prefix that neither may read: the grant is the
+    // one ARN, never governance/*.
+    frameworkPolicyParameter: `arn:${partition}:ssm:${region}:${account}:parameter${n.frameworkPolicyParameter}`,
+    governanceSiblingSample: `arn:${partition}:ssm:${region}:${account}:parameter/ssd/break-glass/${environment}/governance/other`
   });
 }
 
@@ -144,6 +154,7 @@ export function separationIdentifiers(environment, target, { slackChannelId } = 
     'GitHub token secret': [n.secrets.githubToken, a.secretPatterns.githubToken],
     'log groups': [n.logGroups.ci, n.logGroups.interactions],
     'approver parameter path': [n.approverPrefix],
+    'framework policy parameter': [n.frameworkPolicyParameter],
     ...(slackChannelId ? { 'Slack channel': [slackChannelId] } : {})
   };
 }
@@ -182,4 +193,26 @@ export function codeSha256Of(hex) {
     throw new Error('the artifact sha256 must be 64 lower-case hex characters');
   }
   return Buffer.from(hex, 'hex').toString('base64');
+}
+
+// Phase 3D: everything one repository's stack in one environment names. All
+// derived from the environment and the immutable repository_id.
+export const INVOKER_POLICY_NAME = 'ssd-break-glass-invoke-ci';
+export function invokerNames(environment, repositoryId) {
+  const stack = breakGlassRepoStackName(environment, repositoryId);
+  return Object.freeze({
+    environment,
+    repositoryId,
+    stack,
+    role: `ssd-break-glass-${environment}-invoker-${repositoryId}`,
+    policyName: INVOKER_POLICY_NAME,
+    approverParameter: `${breakGlassNames(environment).approverPrefix}${repositoryId}`
+  });
+}
+export function invokerArns(environment, repositoryId, { partition = 'aws', account, region }) {
+  const n = invokerNames(environment, repositoryId);
+  return Object.freeze({
+    role: `arn:${partition}:iam::${account}:role/${n.role}`,
+    approverParameter: `arn:${partition}:ssm:${region}:${account}:parameter${n.approverParameter}`
+  });
 }

@@ -18,7 +18,9 @@ export async function discoverRole(aws, arn) {
     roleId: typeof role.RoleId === 'string' ? role.RoleId : null,
     trust: role.AssumeRolePolicyDocument ?? null,
     tags: tagList(role.Tags),
-    permissionsBoundary: role.PermissionsBoundary?.PermissionsBoundaryArn ?? null
+    permissionsBoundary: role.PermissionsBoundary?.PermissionsBoundaryArn ?? null,
+    maxSessionDuration: Number.isInteger(role.MaxSessionDuration) ? role.MaxSessionDuration : null,
+    path: typeof role.Path === 'string' ? role.Path : null
   });
 }
 

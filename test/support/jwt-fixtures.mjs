@@ -34,6 +34,9 @@ export function githubClaims({
   jobWorkflowPath = '.github/workflows/_break-glass-lambda.yml',
   jobWorkflowRepository = 'IamRitz/ssd-security-framework',
   jobWorkflowSha = FRAMEWORK_SHA,
+  // The ref part of job_workflow_ref as the caller spelled it (an exact SHA by
+  // default; a tag or branch is legal, and authorizes nothing).
+  jobWorkflowRefName = jobWorkflowSha,
   nowSeconds = Math.floor(Date.now() / 1000),
   jti = globalThis.crypto.randomUUID(),
   ...overrides
@@ -62,7 +65,7 @@ export function githubClaims({
     ref_type: 'branch',
     workflow_ref: `${repo.repository}/.github/workflows/security.yml@refs/pull/${pullRequest}/merge`,
     workflow_sha: sha,
-    job_workflow_ref: `${jobWorkflowRepository}/${jobWorkflowPath}@${jobWorkflowSha}`,
+    job_workflow_ref: `${jobWorkflowRepository}/${jobWorkflowPath}@${jobWorkflowRefName}`,
     job_workflow_sha: jobWorkflowSha,
     runner_environment: 'github-hosted',
     iss: GITHUB_OIDC_ISSUER,

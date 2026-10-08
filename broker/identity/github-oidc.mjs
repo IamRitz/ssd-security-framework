@@ -16,7 +16,11 @@
 //   JWKS      https://token.actions.githubusercontent.com/.well-known/jwks
 //   audience  ssd-break-glass
 //   alg       RS256 (the only algorithm GitHub's discovery document advertises)
-//   workflow  IamRitz/ssd-security-framework/.github/workflows/<allowlisted file>@<40-hex SHA>
+//   workflow  IamRitz/ssd-security-framework/.github/workflows/_break-glass-lambda.yml@<ref>
+//             (repository case-insensitively, path exactly; the ref part is
+//             recorded only). The framework COMMIT is job_workflow_sha, which
+//             the broker then checks against its environment's allowed set
+//             (identity/framework-policy.mjs, Phase 3D).
 //
 // Live evidence (Phase 3A probe, ssd-scratch-consumer runs 37118241635,
 // 37118245381, 37118248911, calling the framework by exact SHA): GitHub emitted
@@ -34,12 +38,12 @@ export const GITHUB_OIDC_ISSUER = 'https://token.actions.githubusercontent.com';
 export const GITHUB_OIDC_JWKS_URL = `${GITHUB_OIDC_ISSUER}/.well-known/jwks`;
 export const BREAK_GLASS_AUDIENCE = 'ssd-break-glass';
 export const FRAMEWORK_REPOSITORY = 'IamRitz/ssd-security-framework';
-// The only framework workflows whose jobs may file a break-glass request: the
-// dedicated Lambda job, and the legacy v1 in-job path.
-export const ALLOWED_JOB_WORKFLOW_PATHS = Object.freeze([
-  '.github/workflows/_break-glass-lambda.yml',
-  '.github/workflows/_source-security.yml'
-]);
+// The only framework workflow whose job may file a break-glass request. The
+// legacy `_source-security.yml` is NOT accepted (Phase 3D): its credential-
+// bearing job checks out the consumer repository and takes a caller-chosen
+// toolkit_repository / toolkit_path, so code its caller controls runs under its
+// identity and no commit of it can vouch for a request.
+export const ALLOWED_JOB_WORKFLOW_PATHS = Object.freeze(['.github/workflows/_break-glass-lambda.yml']);
 
 // GitHub tokens live 300 s (observed). A token older than that is refused even
 // if `exp` were somehow later; iat/nbf may sit at most SKEW in the future.
@@ -70,9 +74,13 @@ const reject = (code) => {
 const B64URL = /^[A-Za-z0-9_-]+$/;
 const DECIMAL_ID = /^[1-9][0-9]{0,19}$/;
 const COMMIT_SHA = /^[0-9a-f]{40}$/;
-// owner/repo/<path>@<ref>. Owner and repository names cannot contain '/' or
-// '@'; the path is everything up to the single '@'.
-const JOB_WORKFLOW_REF = /^([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/([^@]+)@([^@]+)$/;
+// owner/repo/<rest>. Owner and repository names cannot contain '/', so the
+// repository is exactly the first two segments; <rest> must be an allowlisted
+// path, '@', and a ref.
+const JOB_WORKFLOW_REF = /^([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/(.+)$/;
+// The ref part (SHA, tag or branch) is recorded, never authorized: printable,
+// no whitespace, bounded.
+const WORKFLOW_REF_NAME = /^[\x21-\x7e]{1,255}$/;
 const PULL_REQUEST_MERGE_REF = /^refs\/pull\/([1-9][0-9]{0,9})\/merge$/;
 
 // Header parameters that point at, or embed, key material. GitHub never sends
@@ -191,20 +199,22 @@ function requireNumericDate(claims, name) {
   return value;
 }
 
-// job_workflow_ref -> { repository, path, sha }, or rejection. Parsed and
-// compared component by component — never a prefix or suffix match.
+// job_workflow_ref -> { repository, path, ref }, or rejection. Parsed and
+// compared component by component. The repository is compared
+// case-insensitively (GitHub owner and repository names are; capitalization is
+// not part of the boundary); the path exactly. The ref part may be a SHA, tag
+// or branch: it is returned for the record and authorizes nothing — the
+// framework commit is job_workflow_sha (Phase 3D).
 export function parseJobWorkflowRef(value) {
   const match = typeof value === 'string' ? JOB_WORKFLOW_REF.exec(value) : null;
   if (!match) reject('job_workflow_ref_malformed');
-  const [, repository, path, ref] = match;
-  // GitHub owner/repository names are case-insensitive; the path is not.
+  const [, repository, rest] = match;
   if (repository.toLowerCase() !== FRAMEWORK_REPOSITORY.toLowerCase()) reject('job_workflow_repository_not_allowed');
-  if (!ALLOWED_JOB_WORKFLOW_PATHS.includes(path)) reject('job_workflow_path_not_allowed');
-  // Observed live: a caller pinned by SHA yields the bare 40-hex SHA. A tag or
-  // branch ref (`refs/tags/v1`, `refs/heads/main`) is a moving reference and is
-  // refused.
-  if (!COMMIT_SHA.test(ref)) reject('job_workflow_ref_not_sha');
-  return { repository, path, sha: ref };
+  const path = ALLOWED_JOB_WORKFLOW_PATHS.find((allowed) => rest.startsWith(`${allowed}@`));
+  if (!path) reject('job_workflow_path_not_allowed');
+  const ref = rest.slice(path.length + 1);
+  if (!WORKFLOW_REF_NAME.test(ref)) reject('job_workflow_ref_malformed');
+  return { repository, path, ref };
 }
 
 // Verifies `token` and returns the GitHub identity it proves. Async only for
@@ -252,9 +262,10 @@ export async function verifyGithubOidcToken(
     if (nbf > nowSeconds + skewSeconds) reject('token_not_yet_valid');
   }
 
-  const jobWorkflow = parseJobWorkflowRef(requireString(claims, 'job_workflow_ref'));
-  const jobWorkflowSha = requireString(claims, 'job_workflow_sha', COMMIT_SHA);
-  if (jobWorkflowSha !== jobWorkflow.sha) reject('job_workflow_sha_mismatch');
+  const workflow = parseJobWorkflowRef(requireString(claims, 'job_workflow_ref'));
+  // THE framework commit: exactly 40 lower-case hex. Whether it may file a
+  // request is the environment's framework policy, checked by the broker.
+  const jobWorkflow = { ...workflow, sha: requireString(claims, 'job_workflow_sha', COMMIT_SHA) };
 
   return {
     repository: requireString(claims, 'repository', /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/),

@@ -9,6 +9,7 @@ import { createDynamoStore } from '../broker/lambda/dynamodb-store.mjs';
 import { createCiHandler, createInteractionsHandler } from '../broker/lambda/handlers.mjs';
 import { SLACK_A, SLACK_B, approversById, fakeApproverSource } from './support/fake-approvers.mjs';
 import { createFakeDynamo } from './support/fake-dynamodb.mjs';
+import { fakeFrameworkPolicy } from './support/fake-framework-policy.mjs';
 import { REPO_A as ID_A, REPO_B as ID_B, SHA_A, createSigningKey, fakeJwksFetch, githubClaims, signToken } from './support/jwt-fixtures.mjs';
 
 const SIGNING_SECRET = 'test-signing-secret';
@@ -57,6 +58,7 @@ function setup({ approvers = approversById(APPROVERS), slack = fakeSlack(), now 
     signingSecret: SIGNING_SECRET,
     approverSource: approvers.source,
     verifyIdentity: (token) => verifyGithubOidcToken(token, { jwks, now: () => now().getTime() }),
+    frameworkPolicy: fakeFrameworkPolicy().policy,
     slackChannelId: 'C-TEST',
     now,
     log: () => {}

@@ -40,7 +40,7 @@ and runs on every framework PR.
 | --- | --- | --- |
 | `_source-scan.yml` | secret scan, dependency scan, SAST, source gate — **for new callers**; no job can request OIDC | **none** (optional Slack webhook secret, notifier only) |
 | `_break-glass-lambda.yml` | the dedicated credential-bearing path: Lambda break-glass for an eligible BLOCK; validates this run's gate evidence before assuming any role | break-glass invoker role, **after** validation (optional Slack webhook secret, notifier only) |
-| `_source-security.yml` | the v1 source workflow (the twin above is generated from it); keeps in-job Lambda break-glass for existing callers, so callers must grant `id-token: write` | break-glass invoker role only, after eligibility (optional Slack webhook secret, notifier only) |
+| `_source-security.yml` | the v1 source workflow (the twin above is generated from it); keeps in-job Lambda break-glass for existing callers, so callers must grant `id-token: write`. The hardened broker refuses that path; use `_break-glass-lambda.yml` | break-glass invoker role only, after eligibility (optional Slack webhook secret, notifier only) |
 | `_image-scan-prepush.yml` | Trivy over a built image tarball + pre-push gate | **none** (optional Slack webhook secret, notifier only) |
 | `_artifact-gate.yml` | policy over a normalized registry report; names no registry | **none** (optional Slack webhook secret, notifier only) |
 | `_ecr-collect.yml` | the ECR adapter: push, poll by digest, normalize | ECR push+scan role |

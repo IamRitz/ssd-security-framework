@@ -156,3 +156,28 @@ export async function discoverArtifact(aws, artifact) {
     policyStatus: policyStatus.state === 'present' ? present({ isPublic: policyStatus.value.PolicyStatus?.IsPublic ?? null }) : policyStatus
   };
 }
+
+// An SSM String parameter (Phase 3D): its value and identity. Never
+// --with-decryption — a SecureString is reported by Type and refused by its
+// caller, never decrypted.
+// -> { name, type, value, dataType, arn, version }
+export async function discoverParameter(aws, name) {
+  const got = await read(aws, ['ssm', 'get-parameter', '--name', name], { notFound: ['ParameterNotFound'] });
+  if (got.state !== 'present') return got;
+  const p = got.value.Parameter;
+  if (!p || typeof p.Name !== 'string' || typeof p.Type !== 'string') return malformed('ssm get-parameter', 'no Parameter/Name/Type in the answer');
+  return present({ name: p.Name, type: p.Type, value: typeof p.Value === 'string' ? p.Value : null, dataType: p.DataType ?? null, arn: p.ARN ?? null, version: p.Version ?? null });
+}
+
+// Its metadata, for the tier (get-parameter does not report it).
+// -> { name, type, tier, dataType }
+export async function discoverParameterMetadata(aws, name) {
+  const got = await read(aws, ['ssm', 'describe-parameters', '--parameter-filters', JSON.stringify([{ Key: 'Name', Option: 'Equals', Values: [name] }])]);
+  if (got.state !== 'present') return got;
+  if (!Array.isArray(got.value.Parameters)) return malformed('ssm describe-parameters', 'Parameters is not a list');
+  const matching = got.value.Parameters.filter((p) => p?.Name === name);
+  if (matching.length > 1) return malformed('ssm describe-parameters', `more than one parameter named ${name}`);
+  if (matching.length === 0) return absent('NotListed');
+  const p = matching[0];
+  return present({ name, type: p.Type ?? null, tier: p.Tier ?? null, dataType: p.DataType ?? null });
+}

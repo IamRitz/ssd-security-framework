@@ -26,6 +26,12 @@ import { SCOPES, githubPlan, exitCodeOf as planExitCodeOf } from './plan.mjs';
 import { PLAN_ID, PlanRecordError } from './record.mjs';
 import { githubApplyBlocks, githubApplyPreflightBlocks, githubErrorBlocks, githubErrorReport, githubPlanBlocks } from './report.mjs';
 import { readSecret as readSecretInput } from './secret-input.mjs';
+import { discoverRepositoryIdentity } from './repository-identity.mjs';
+
+// Phase 3D: the read-only GitHub identity lookup `aws … --scope
+// break-glass-repo` needs. The top-level dispatcher hands it to the aws side
+// as a plain function, so onboarding/aws never imports GitHub code.
+export const repositoryIdentity = (slug, context = {}) => discoverRepositoryIdentity({ slug, exec: context.ghExec, env: context.env ?? process.env });
 
 export const GITHUB_USAGE = `ssd-onboard github — GitHub configuration for the configured repository (Phase 2E)
 
