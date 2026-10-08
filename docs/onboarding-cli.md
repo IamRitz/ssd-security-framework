@@ -1227,6 +1227,19 @@ break-glass`. They are driven by a separate operator configuration, never by
 `.ssd/onboarding.yml`, and Phase 1 still generates nothing for break-glass. See
 [break-glass-provisioning.md](break-glass-provisioning.md).
 
+Phase 3D adds two more break-glass scopes, each with its own operator-owned
+file and the same plan → apply → verify path:
+
+```
+ssd-onboard aws plan|verify --scope break-glass-governance --environment <env> --operator-config <f> --policy-config <f>
+ssd-onboard aws plan|verify --scope break-glass-repo       --environment <env> --operator-config <f> --repository-config <f>
+ssd-onboard aws apply --plan-id <id> --account <id> --region <r> --operator-config <f> (--policy-config | --repository-config) <f>
+```
+
+`break-glass-governance` holds the environment's allowed framework commits;
+`break-glass-repo` holds one repository's invoker role and approver parameter.
+See [break-glass-repositories.md](break-glass-repositories.md).
+
 ## OIDC: generated callers hold no token
 
 Generated source callers use **`_source-scan.yml`**, the OIDC-free source

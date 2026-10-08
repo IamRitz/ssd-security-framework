@@ -237,7 +237,7 @@ break-glass:
 
 | Input | Default | Meaning |
 | --- | --- | --- |
-| `toolkit_ref` | `v1` | Framework ref. The **repository is fixed** (no `toolkit_repository`, no `toolkit_path`): this job holds credentials, so its validation code cannot be repointed or vendored. |
+| `toolkit_ref` | `v1` | **Ignored; not authoritative** (Phase 3D). Kept for v1 compatibility only: the job always checks the toolkit out at its own commit, `job_workflow_sha`, and a different value only produces a notice. The **repository is fixed** too (no `toolkit_repository`, no `toolkit_path`): this job holds credentials, so its validation code cannot be repointed or vendored. |
 | `gate_mode` | required | The source `gate_mode` output. Anything but `enforce` is refused. |
 | `expected_gate_digest` | required | The source `gate_digest` output. The downloaded evidence must hash to exactly this. |
 | `lambda_function` / `lambda_role_arn` / `aws_region` | `''` | Production broker and invoker role. |
@@ -253,7 +253,15 @@ credential: the Lambda transport authenticates through OIDC, not a secret.
 Step order — asserted by `test/break-glass-oidc-boundary.test.js`, including
 mutation cases that reorder it:
 
-1. check out **this framework** (never the consumer), set up Node;
+0. **bind to its own commit** (`bind-framework-commit`, Phase 3D), before any
+   checkout or framework script: inline shell mints a GitHub OIDC token for the
+   audience `ssd-framework-binding` (accepted by nothing, masked, never
+   written), requires `job_workflow_ref` to name this repository and exactly
+   `.github/workflows/_break-glass-lambda.yml`, and outputs `job_workflow_sha`
+   ([break-glass-repositories.md](break-glass-repositories.md#1-the-workflow-runs-its-own-commit-and-nothing-else));
+1. check out **this framework** (never the consumer) at exactly that
+   `job_workflow_sha`, and require the checkout's `HEAD` to equal it (never
+   `toolkit_ref`), set up Node;
 2. download `security-gate-results` from **this run** (no `run-id` override);
 3. `break-glass-evidence.mjs` (framework code) re-derives, from the evidence:
    run binding (`provenance.repository` / `commitSha` / `runId` must equal this
@@ -267,9 +275,15 @@ mutation cases that reorder it:
    call carries its own freshly minted GitHub OIDC token for the audience
    `ssd-break-glass` (`identityToken`, beside the payload, never in argv, an
    output or an artifact). The broker derives the repository, PR and run from
-   that token and accepts each token once. A request needs a `pull_request` run
-   and a caller that pins this workflow by **exact SHA**; a `@v1` tag pin is
-   refused by the hardened broker. Contract:
+   that token and accepts each token once. A request needs a `pull_request` run,
+   and the token's `job_workflow_sha` must be in the environment's allowed set
+   (Phase 3D). The caller may spell the ref as a SHA, tag or branch: `@v1` is
+   accepted only while it resolves to an admitted commit, and pinning an exact
+   SHA stays the recommended hardening. Only this workflow may file: the
+   hardened broker refuses every other `job_workflow_ref` path, including
+   `_source-security.yml`, and supports the Lambda transport only. The broker
+   re-checks the commit on every status poll, so a commit removed while CI
+   polls fails the poll and the BLOCK stands. Contract:
    [break-glass-setup.md § Who is asking](break-glass-setup.md#who-is-asking-verified-github-identity);
 6. always: record `break-glass-result.json`, notify, upload `break-glass-results`, enforce.
 

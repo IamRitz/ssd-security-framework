@@ -45,8 +45,9 @@ caller to grant OIDC — even a repository with break-glass disabled. So:
 ### Lambda break-glass (`_break-glass-lambda.yml`)
 
 The credential-bearing job runs **no consumer code**: it never checks out the
-consumer repository, and before the OIDC step it only uses pinned actions and
-framework scripts. In order:
+consumer repository, and before the role-assumption step it only uses pinned
+actions, its inline binding step and framework scripts at its own commit. In
+order:
 
 1. Download **this run's** `security-gate-results` artifact.
 2. Re-derive from that evidence, in framework code: the run it belongs to
@@ -69,7 +70,8 @@ that duplicate is deliberate (fail-safe) until something can observe delivery.
 
 Before any of that, the job binds itself to its own commit: its first step
 reads `job_workflow_sha` from an OIDC token and checks the framework out at
-exactly that commit, whatever `toolkit_ref` says (Phase 3D,
+exactly that commit, whatever `toolkit_ref` says. `toolkit_ref` is not
+authoritative here; `job_workflow_sha` is (Phase 3D,
 [break-glass-repositories.md](break-glass-repositories.md#1-the-workflow-runs-its-own-commit-and-nothing-else)).
 
 The invoker role's trust does **not** name this workflow: AWS role trust is
@@ -107,7 +109,7 @@ the control and reordering it would not fail anything at runtime.
 
 ## Transports
 
-| | `lambda` (recommended) | `http` (legacy) |
+| | `lambda` (the hardened production path) | `http` (legacy) |
 | --- | --- | --- |
 | Auth | GitHub OIDC → scoped invoker role | HMAC shared secret |
 | Repository secret | **none** | `break_glass_shared_secret` |
@@ -269,11 +271,20 @@ What the broker then does with it:
 - **The framework commit is checked on `notify`, on every `status`, and again
   when an approver clicks** (against the stored request's commit). Removing a
   commit from the allowed set therefore also revokes its pending requests: a
-  click gets `revoked` and claims nothing. A policy that cannot be read admits
-  nothing.
+  click gets `revoked` and claims nothing, and the filing run's next status
+  poll is refused, so its BLOCK stands. A commit that is not admitted is
+  `403 framework_rejected: framework_sha_not_allowed`; a policy that is
+  absent, malformed, unreadable or slower than 2 s admits nothing
+  (`503 framework_policy_unavailable: <state>`).
+- **Both functions know their environment.** `BREAK_GLASS_ENVIRONMENT`
+  (`production` or `synthetic`) selects the allowed-commit parameter on both
+  functions and the approver parameters on the interaction function. Missing
+  or invalid admits nothing and authorizes nobody.
 - **Secrets are read only when needed.** The CI broker reads its Slack
   credential when it posts, so a request refused for its identity or commit
-  reads no secret.
+  reads no secret. A successful read is cached for the warm container; a
+  failed or empty one is not. The interaction function reads its secrets at
+  start-up.
 - **Refusals are logged with** the rejection code, any verified ids and what
   the payload claimed, so abuse is investigable. Tokens are never logged,
   stored or echoed.
@@ -363,8 +374,9 @@ One SSM parameter per repository, named by its immutable GitHub
 ```
 
 `<environment>` is `production` or `synthetic`. It comes from the interaction
-function's `BREAK_GLASS_ENVIRONMENT`, so the two stacks never read each other's
-lists. The value is a JSON array of Slack user IDs (`U…` or `W…`), at most 50,
+function's `BREAK_GLASS_ENVIRONMENT` (the CI function has it too, for the
+allowed-commit parameter, but never reads approvers), so the two stacks never
+read each other's lists. The value is a JSON array of Slack user IDs (`U…` or `W…`), at most 50,
 with no duplicates.
 
 | Parameter | Result |
@@ -397,9 +409,10 @@ Creating, owning and verifying the approver parameters, one per repository
 alongside its invoker role, is Phase 3D
 ([break-glass-repositories.md](break-glass-repositories.md#approver-parameter-ssdbreak-glassenvapproversrepository_id)).
 
-**`[]` is a valid value, not an error.** It is how a repository is offboarded:
-every ssd-onboard resource is retained, so the list is emptied before anything
-is removed. `aws verify` reports `[]` as "enabled but not operationally ready"
+**`[]` is a valid value, not an error.** It means nobody is authorized, and
+it is the safe state for a repository whose resources are retained: every
+ssd-onboard resource is retained, so offboarding empties the list before
+anything is removed. `aws verify` reports `[]` as "enabled but not operationally ready"
 (a WARN), and it always authorizes nobody.
 
 ## A repository with no Slack

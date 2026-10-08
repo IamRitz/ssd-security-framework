@@ -1,17 +1,23 @@
 # Break-glass repositories and framework governance (Phase 3D)
 
-**Status: Phase 3D contract — implementation in progress.** This page
-specifies Phase 3D; the runtime code, templates and checks that implement it
-follow in this pull request, and none of it exists on `main` yet. The live
-evidence is recorded in [§ Live validation](#live-validation-synthetic-only)
-when that work lands.
+**Status: Phase 3D implemented; live synthetic validation pending.** The
+workflow binding, the broker's framework-commit check, the shared-stack
+changes, and the governance and per-repository stacks (with their `aws plan`,
+`aws apply` and `aws verify` scopes) are implemented in this pull request. None
+of it is on `main` yet. No live evidence has been recorded yet:
+[§ Live validation evidence](#live-validation-evidence-to-be-filled) is a set of
+empty slots until the synthetic run is done.
 Production is not touched in 3D: no production stack is planned, applied or
 verified (an `aws plan` already creates a placeholder stack).
 
-Phase 3C provisioned the two shared broker stacks
-([break-glass-provisioning.md](break-glass-provisioning.md)). Phase 3D adds
-what lets a **repository** use one of them, and what decides which
-**framework code** may file a request:
+| Phase | Owns |
+| --- | --- |
+| 3C | the two shared broker stacks, `ssd-break-glass-<env>` ([break-glass-provisioning.md](break-glass-provisioning.md)) |
+| **3D** (this page) | the governance stack per environment, and the per-repository invoker role and approver parameter; the workflow's self-binding and the broker's framework-commit check that make the governance stack meaningful |
+| 3E | end-to-end validation of the synthetic workflow contract: the positive approval path, the negative, race and timeout cases, and everything that needs a live Slack interaction ([below](#not-in-phase-3d)) |
+
+Phase 3D adds what lets a **repository** use one of the 3C stacks, and what
+decides which **framework code** may file a request:
 
 | Stack (`<env>` = production or synthetic) | Holds | One per |
 | --- | --- | --- |
@@ -63,10 +69,14 @@ Then:
 
 6. the framework is checked out **only** at that output;
 7. the checkout's `HEAD` must equal it, or the job fails;
-8. `inputs.toolkit_ref` selects nothing. It stays an input for v1
-   compatibility; when it differs from `job_workflow_sha`, the job emits a
-   notice and carries on;
+8. `inputs.toolkit_ref` selects nothing: it is **not authoritative**. It
+   stays an input for v1 compatibility; when it differs from
+   `job_workflow_sha`, the job emits a notice and carries on;
 9. no later step uses `toolkit_ref` for anything security-relevant.
+
+`job_workflow_sha` is therefore the one authority for which framework commit
+ran: the binding step reads it, the checkout is pinned to it, and the broker
+checks the same claim in its own verified token (§ 3).
 
 The step order is the control, and `test/break-glass-oidc-boundary.test.js`
 asserts it.
@@ -77,8 +87,10 @@ The legacy `_source-security.yml` `source-gate` job also holds
 `id-token: write`, but it checks out the consumer repository and accepts a
 caller-chosen `toolkit_repository` and `toolkit_path`. Code its caller controls
 can run there, so no commit of it can vouch for a request. The broker refuses
-it (`job_workflow_path_not_allowed`). Its `http` transport never reached the
-Lambda broker, and hardened production supports the **Lambda transport only**
+it (`job_workflow_path_not_allowed`): the broker's allowed path list holds
+exactly `.github/workflows/_break-glass-lambda.yml`. Its `http` transport never
+reached the Lambda broker, and hardened production supports the **Lambda
+transport only**
 ([break-glass-setup.md § Transports](break-glass-setup.md#transports)).
 
 ### 3. The broker admits commits per environment
@@ -114,10 +126,18 @@ requests. A policy that cannot be read (SSM refused, failed or slower than
 `503 framework_policy_unavailable: <state>`. Each refusal is logged with the
 commit, `repository_id` and run, never the token.
 
+Both functions select their parameters from `BREAK_GLASS_ENVIRONMENT`
+(`production` or `synthetic`), which 3D adds to the CI function (the
+interaction function has had it since 3B). Missing or any other value is
+`misconfigured`: SSM is not called, no commit is admitted and nobody is
+authorized.
+
 The CI broker reads its Slack credential only when it posts. Identity and
 commit checks therefore never read a secret, and a refused request touches
 none. A successful secret read is cached for the warm container; a failed one
-is not.
+(including a secret with no value) is not, so the next post reads again. The
+interaction function still reads its secrets at start-up: it must verify every
+Slack signature first.
 
 ## The allowed-commit parameter
 
@@ -147,6 +167,21 @@ listed commit that:
 - for **production only**, is not an ancestor of `refs/remotes/origin/main`.
   The plan records the `origin/main` commit it checked against.
 
+**What authorizes a production commit is the explicit list, not its
+ancestry.** A production commit is admitted only when it is named in
+production's policy file, reviewed and applied. Ancestry of `origin/main` is a
+guard on that admission, not a proof of review: it shows the commit is in
+the merged history, but not that anyone reviewed it, or that it is the commit
+anyone intended to admit. Every commit of `main` is an ancestor of
+`origin/main`; production admits none of them unless the list names it.
+
+The ancestry check runs at plan time and in `aws verify`, against the checkout's
+`refs/remotes/origin/main` as last fetched (nothing is fetched). `aws apply`
+does not re-run it: apply executes the reviewed change set, and requires the
+policy file to be unchanged since the plan. Whether apply should repeat the
+check is an open item for the pre-production review
+([break-glass-provisioning.md](break-glass-provisioning.md#pre-production-gate-after-3d-and-3e)).
+
 **Synthetic is deliberately broader:** a candidate commit that is not yet
 merged may be admitted to synthetic, explicitly, to test it live. It is never
 thereby admitted to production: the two environments have separate
@@ -159,7 +194,7 @@ parameters, separate configuration files and separate readers.
 | CloudFormation, run by the scoped deployer through `aws plan` / `aws apply` | writes |
 | the bootstrap admin | only a reviewed emergency revoke (`"shas": []`), which `aws verify` then reports as drift |
 | this environment's CI and interaction execution roles | `ssm:GetParameter` on this exact ARN, nothing else |
-| invoker roles, consumer repositories, the other environment's roles | nothing |
+| invoker roles, consumer repositories, the other environment's roles | nothing (the invoker roles' denial is proven by the repository stack's verify, [below](#verification)) |
 
 To revoke a commit, remove it from the configuration and apply. Deleting the
 stack does not revoke anything (Retain): empty the list first.
@@ -190,11 +225,14 @@ Trust, identical for production and synthetic in 3D:
 
 - `<subject>` is GitHub's default `repo:<owner>/<repo>:pull_request`, with
   `<owner>/<repo>` exactly as the GitHub API's `full_name` spells it.
-- A **customized** subject (for example the immutable
-  `repo:<owner>@<owner_id>/<repo>@<repo_id>:…` form) is used only when the
-  repository's OIDC customization is confirmed live **and** the subject GitHub
-  actually emits is proven from a recorded run ([below](#repository-configuration)).
-  A subject is never inferred or constructed from owner and repository ids.
+- **Customized OIDC subjects are not supported in Phase 3D.** A repository
+  whose subject is customized (`use_default: false`, for example the immutable
+  `repo:<owner>@<owner_id>/<repo>@<repo_id>:…` form) fails closed: `aws plan`
+  blocks (`oidc-subject-customized`), `aws verify` fails, and the
+  configuration file has no key to supply a subject. A subject is never
+  inferred or constructed from owner and repository ids. Supporting one, from
+  a subject proven by a recorded run, is future work
+  ([below](#not-in-phase-3d)).
 - There is no `ref:refs/heads/*` subject (the broker refuses every non-PR
   event), no `job_workflow_ref` condition, and no `StringLike`.
 - `MaxSessionDuration` is 3600.
@@ -232,8 +270,10 @@ identity and by approvers keyed on `repository_id`.
 broker's own parser (`broker/authorize/approvers.mjs`): at most 50 Slack user
 ids (`U…`/`W…`), no duplicates.
 
-**`[]` is valid** and authorizes nobody. It is how a repository is offboarded:
-set `[]`, apply, and only then remove anything (Retain keeps the parameter).
+**`[]` is valid** and means **nobody is authorized**. It is the safe state of
+a repository whose resources are retained but which may no longer be
+approved for, and so it is how a repository is offboarded: set `[]`, apply,
+and only then remove anything (Retain keeps the parameter).
 Missing, `[]`, malformed and unreadable all authorize nobody, at click time
 ([break-glass-setup.md § Authorization](break-glass-setup.md#authorization-is-per-repository-and-fail-closed)).
 `aws verify` reports `[]` as a WARN, "enabled but not operationally ready",
@@ -271,15 +311,12 @@ environments:                     # at least one; an absent environment is not o
     approvers: ["U0123456789"]
   production:
     approvers: []                 # valid: nobody
-# Only for a repository whose OIDC subject is customized:
-# oidc:
-#   subject: <the exact subject GitHub emits for pull_request runs>
-#   observedRunId: "<id of the run that recorded it>"
 ```
 
 Everything else is derived: stack, role, policy and parameter names, the CI
-function ARN and the OIDC provider ARN. Unknown keys and credential-shaped
-values refuse the file.
+function ARN, the OIDC provider ARN and the OIDC subject. Unknown keys and
+credential-shaped values refuse the file. An `oidc` key is refused with its
+own message: this version has no customized-subject override.
 
 `aws plan --scope break-glass-repo` blocks unless:
 
@@ -288,10 +325,12 @@ values refuse the file.
 - the environment's shared stack is settled and owned;
 - the account's GitHub OIDC provider exists with client id `sts.amazonaws.com`
   (read-only; this plan never creates it);
-- `gh api repos/<slug>` returns this `id` and a matching `full_name`;
+- `gh api repos/<slug>` returns this `id` and a `full_name` equal to the slug
+  ignoring case (a case difference is a WARN; the subject uses GitHub's
+  spelling). GitHub is read before AWS;
 - `gh api repos/<slug>/actions/oidc/customization/sub` reports the default
-  subject, **or** it reports a customization and `oidc.subject` equals the
-  subject printed by the recorded run `oidc.observedRunId` of that repository;
+  subject (`use_default: true`). A customization, or an answer that cannot be
+  read, blocks;
 - the role and the parameter are absent or already this stack's own resources.
   A resource that merely has the name is never adopted.
 
@@ -320,11 +359,30 @@ ssd-onboard aws apply  --plan-id <id> --account <id> --region <r> --operator-con
 ssd-onboard aws verify --scope break-glass-governance|break-glass-repo --environment <env> --operator-config break-glass.yml (--policy-config | --repository-config) <file>
 ```
 
-A plan is applied only with the files it was made from, unchanged.
+A plan is applied only with the files it was made from, unchanged: a
+governance plan with its `--policy-config`, a repository plan with its
+`--repository-config`, and either with its `--operator-config`. Apply derives
+the stack from the plan (for a repository, from the `repository_id`), never
+from a flag. `--region` and `--json` work as for `--scope break-glass`
+([break-glass-provisioning.md § Commands](break-glass-provisioning.md#commands)).
+
+Order of first use in an environment: the shared stack (3C, updated with the
+3D artifact), then the governance stack, then each repository's stack. A
+repository plan blocks until the environment's shared stack is settled. Until
+the governance stack lists a commit, the broker admits nothing.
 
 ## Verification
 
 Effective access comes from `iam simulate-principal-policy`, as in 3C.
+
+| Scope | Checks |
+| --- | --- |
+| `break-glass-governance` | `bg.gov.stack`, `bg.gov.parameter`, `bg.gov.parser`, `bg.gov.admission`, the execution roles' read and write probes, `bg.gov.other-writers` (always NOT VERIFIED) |
+| `break-glass-repo` | `bg.repo.github`, `bg.repo.stack`, `bg.repo.role`, `bg.repo.trust`, `bg.repo.permissions` and the invoker role's simulated access, `bg.repo.approvers` |
+| `break-glass` (3C, extended) | the 3C checks, with `BREAK_GLASS_ENVIRONMENT` now expected on the CI function and the governance reads in both roles' required and negative access |
+
+`bg.repo.github` reports an unreadable GitHub answer as NOT VERIFIED and a
+wrong id, slug or a customized subject as FAIL.
 
 **Invoker role.** Required: `lambda:InvokeFunction` on this environment's CI
 broker. Each of these must be denied:
@@ -350,11 +408,15 @@ WARN. This environment's interaction role may read it; the other
 environment's may not; the CI role may not.
 
 **Allowed-commit parameter.** Owned; `String`/`Standard`; byte-equal to the
-configuration and accepted by the broker's parser; every commit meets the
-admission rules. This environment's CI and interaction roles may read it; the
-other environment's roles, the invoker roles and the execution roles may not
-write it. Which other principals could write it cannot be enumerated from IAM,
-and is reported as NOT VERIFIED.
+configuration and accepted by the broker's parser; every **live** commit meets
+the admission rules (production: ancestry against this checkout's
+`origin/main`). This environment's CI and interaction roles may read it; the
+other environment's roles may neither read nor write it; no execution role may
+write it. The invoker roles' denial (read and write) is proven by each
+repository's verify, not here. Which other principals could write it cannot be
+enumerated from IAM, and is reported as NOT VERIFIED. The bootstrap admin's
+emergency `"shas": []` is reported as drift (FAIL): it admits nothing, but it
+is not the reviewed configuration.
 
 **Shared stacks.** The 3C checks, plus: both execution roles read their own
 allowed-commit parameter and not the other environment's, and the CI function
@@ -384,11 +446,50 @@ so no probe needs Slack:
 Approver clicks, the click-time revoke, and the race and timeout suite need
 Slack and move to Phase 3E.
 
+## Live validation evidence (to be filled)
+
+> **Nothing below has been run yet.** Each slot is filled from the synthetic
+> run itself (command output, plan ids, run URLs), never from expectation. An
+> empty slot means "not yet proven", not "passed".
+
+| # | Evidence | Result |
+| --- | --- | --- |
+| E1 | **Artifact coordinates** of the 3D broker build: bucket, key, `VersionId`, full-object SHA-256, the broker tree it was built from, and the `framework.ref` of the operator config | _TBD_ |
+| E2 | **Governance stack** (synthetic): policy file digest and listed commits, plan id, `origin/main` recorded, apply result, `aws verify --scope break-glass-governance` outcome and counts | _TBD_ |
+| E3 | **Shared-stack update** (synthetic): plan id, change-set summary (modify only: both functions, both role policies; no replacement), apply result, live `CodeSha256` = E1, `BREAK_GLASS_ENVIRONMENT` on the CI function, `aws verify --scope break-glass` outcome and counts | _TBD_ |
+| E4 | **Repository stack** (synthetic, scratch repository): slug, `repository_id`, `use_default: true` as read, plan id, apply result, `aws verify --scope break-glass-repo` outcome and counts (`approvers: []` WARN expected only if configured so) | _TBD_ |
+| E5 | **OIDC probes**: run URLs proving step 2 (invoke allowed, `token_missing`, own token refused, negative actions AccessDenied) and step 3 (`push`, `workflow_dispatch` and a second repository cannot assume the role) | _TBD_ |
+| E6 | **Allowed / disallowed SHA**: run at an admitted commit reaching `502 slack_post_failed` with the request rolled back, and the `toolkit_ref` notice; run at a commit not admitted refused `framework_sha_not_allowed` with no replay record or request written | _TBD_ |
+| E7 | **Final verify results**: governance, shared and repository verifies re-run after all probes, with outcome and PASS / WARN / NOT VERIFIED / FAIL counts | _TBD_ |
+
 ## Not in Phase 3D
 
 - Production stacks of any kind (pre-production gate,
   [break-glass-provisioning.md](break-glass-provisioning.md#pre-production-gate-after-3d-and-3e)).
 - Secret values and Slack configuration.
-- The synthetic workflow contract and the `verify-live` suite (3E).
+- **Phase 3E:** the synthetic workflow contract and end-to-end validation:
+  the positive approval path to an overridden BLOCK; denial, timeout and an
+  invalid broker response leaving the BLOCK; the concurrent-click race and a
+  repeated click; the click-time revoke and a revoke during polling; approver
+  changes at click time; Slack signature, replay and status-binding refusals;
+  and the ported `verify-live` suite.
+- **Open Phase 3E security item: synthetic environment binding.** Today a
+  synthetic request is kept away from the production broker by the client
+  alone: `_break-glass-lambda.yml` routes synthetic evidence to the synthetic
+  function and role, and refuses identifiers equal to the production ones.
+  That comparison is between identifiers the **caller supplies**, so on its
+  own it does not establish which environment the receiving broker serves; a
+  misconfigured caller can route a synthetic request to the production broker
+  (or the reverse). This is an environment-isolation and misrouting defence,
+  not an approval bypass: approvers still decide, and the decision stays bound
+  to the gate digest. Phase 3E must add **broker-side environment binding**
+  (the bound framework derives the request's environment from validated
+  evidence, and the broker refuses one that is not its own
+  `BREAK_GLASS_ENVIRONMENT`) before production readiness. Production stays
+  untouched until that is complete.
+- **Customized OIDC subjects** (future work). Supporting one needs the
+  subject GitHub emits to be proven from a recorded run of that repository,
+  and trust and verify built from that proven subject. Until then such a
+  repository cannot be onboarded.
 - Generated break-glass callers: Phase 1 still generates none
   ([architecture B.8](onboarding-architecture.md#b8-break-glass-is-not-generated-choice-b)).

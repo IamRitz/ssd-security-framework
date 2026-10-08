@@ -48,7 +48,15 @@ Both functions ship the same bundle and differ by handler
   self-invocation guarded by a one-shot `sideEffectsAt` conditional write.
 - **Secrets.** Slack bot token, Slack signing secret and the GitHub credential
   that posts the audit comment, each readable only by the execution role that
-  needs it. GitHub Actions holds no secret for this path.
+  needs it. GitHub Actions holds no secret for this path. The CI function
+  reads its secrets lazily, only when it posts (`lazySecret` in
+  `lambda/runtime.mjs`); the interaction function reads them at start-up.
+- **Framework commit (Phase 3D).** Only `_break-glass-lambda.yml` may file,
+  and its verified `job_workflow_sha` must be in
+  `/ssd/break-glass/<BREAK_GLASS_ENVIRONMENT>/governance/allowed-framework-shas`,
+  checked on notify, every status call and every click
+  (`identity/framework-policy.mjs`;
+  [docs/break-glass-repositories.md](../docs/break-glass-repositories.md)).
 - **Dependencies.** Node builtins only, plus the AWS SDK v3 clients the Lambda
   Node.js runtime provides (loaded lazily in `lambda/runtime.mjs`); nothing is
   bundled.

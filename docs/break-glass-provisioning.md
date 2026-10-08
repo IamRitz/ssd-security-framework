@@ -113,7 +113,10 @@ synthetic workflow contract (3E). See
 `ssm:GetParameter` on exactly
 `parameter/ssd/break-glass/<env>/governance/allowed-framework-shas` for **both**
 execution roles, and `BREAK_GLASS_ENVIRONMENT=<env>` on the CI function. It
-adds no wildcard.
+adds no wildcard. `aws verify --scope break-glass` then expects that variable
+on the CI function, requires both reads (simulated ALLOW), and requires DENY
+for the other environment's allowed-commit parameter, for any write to its own,
+and for a sibling under `governance/`.
 
 `dynamodb:PutItem` on the CI role covers both the pending request and the
 one-shot OIDC replay record (`consumeTokenId`, key `oidc-jti:<sha256>`).
@@ -357,12 +360,24 @@ landed:
    ([onboarding.md § 3.3](onboarding.md#33-the-slack-app-org)).
 4. **Repository approver parameters onboarded** (Phase 3D), one per repository,
    before its first request. Until then nobody is authorized for it.
-5. **The production allowed-commit set applied** (Phase 3D): every listed
-   commit is an ancestor of the framework's `main` and binds its own toolkit.
-   Until then the production broker admits no request.
+5. **The production allowed-commit set applied** (Phase 3D): each commit is
+   admitted explicitly, by name, in production's reviewed policy file. That
+   explicit list is the authorization. Admission also requires that the commit
+   binds its own toolkit and, at plan time, is an ancestor of the framework's
+   `origin/main`; ancestry is a guard on admission, not proof that the commit
+   was reviewed. Until the set is applied the production broker admits no
+   request. **Open item for this review:** `aws apply` does not re-run the
+   ancestry check (it applies the reviewed change set, with the policy file
+   unchanged); decide whether it must
+   ([break-glass-repositories.md § The allowed-commit parameter](break-glass-repositories.md#the-allowed-commit-parameter)).
 6. **Production invoker roles planned, applied and verified** (Phase 3D), one
    per onboarded repository. Phase 3D itself validates these stacks on
    synthetic only.
+7. **Broker-side environment binding** (Phase 3E): the broker refuses a
+   request whose framework-derived environment is not its own. Until then,
+   synthetic isolation rests on caller-supplied identifiers, which guard
+   against misrouting only as far as the caller configures them honestly
+   ([break-glass-repositories.md § Not in Phase 3D](break-glass-repositories.md#not-in-phase-3d)).
 
 ## Residual limitations
 
