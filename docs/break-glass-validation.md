@@ -102,12 +102,23 @@ the synthetic interaction Function URL. It is not part of the broker, never
 runs in CI, and never targets production:
 
 - it requires `--environment synthetic` and refuses anything else;
-- it reads the Function URL of `ssd-break-glass-synthetic-interactions` from
-  AWS and refuses unless `--function-url` equals it;
+- before sending anything it reads AWS (read-only, the break-glass read
+  allowlist): the caller must be the configured account and not root,
+  `ssd-break-glass-synthetic-interactions` must carry
+  `BREAK_GLASS_ENVIRONMENT=synthetic`, and its Function URL must equal
+  `--function-url`;
 - it reads the signing secret from stdin only; never from argv, a file name
   or the environment, and never prints or writes it;
+- its clicks carry no `response_url`, so the broker sends no reply anywhere;
 - it prints one JSON evidence document per run (outcomes from the broker's
-  `x-break-glass-outcome` header, never the secret).
+  `x-break-glass-outcome` header, never the secret). Exit 0 PASS, 1 FAIL or
+  refused, 2 usage.
+
+```
+node tools/break-glass-live.mjs <click|race|repeat|signature> --environment synthetic \
+  --operator-config break-glass.yml --function-url <url> --request-id <uuid> \
+  (--user <U…> [--action approve|deny] | --users <U…>,<U…>) [--region <r>] < signing-secret
+```
 
 | Scenario | Sends | Expected |
 | --- | --- | --- |

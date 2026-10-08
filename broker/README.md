@@ -26,7 +26,8 @@ Deliberately **not** imported:
 - `infra/deploy.sh`: imperative provisioning that adopts resources by name.
   Shared break-glass infrastructure is provisioned by reviewed CloudFormation
   in Phase 3C (architecture E.4);
-- `infra/verify-live.mjs`: ported in Phase 3E, against the synthetic stack only.
+- `infra/verify-live.mjs`: replaced in Phase 3E by `tools/break-glass-live.mjs`,
+  which targets the synthetic stack only.
 
 ## Architecture
 
