@@ -237,4 +237,3 @@ export async function awsVerifyBreakGlassRepository({ operator, repository: conf
   ];
   return report({ target, checks, calls, sections });
 }
-
