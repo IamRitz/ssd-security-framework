@@ -472,7 +472,8 @@ Slack and move to Phase 3E.
   invalid broker response leaving the BLOCK; the concurrent-click race and a
   repeated click; the click-time revoke and a revoke during polling; approver
   changes at click time; Slack signature, replay and status-binding refusals;
-  and the ported `verify-live` suite.
+  and the ported `verify-live` suite
+  ([break-glass-validation.md](break-glass-validation.md)).
 - **Open Phase 3E security item: synthetic environment binding.** Today a
   synthetic request is kept away from the production broker by the client
   alone: `_break-glass-lambda.yml` routes synthetic evidence to the synthetic
